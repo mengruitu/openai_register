@@ -1,0 +1,7 @@
+[cfmail≤‚ ‘] π≤–Ë≤‚ ‘ 1 ∏ˆ≈‰÷√: us-node-1
+
+[cfmail≤‚ ‘] ø™ º≤‚ ‘≈‰÷√: us-node-1
+[cfmail≤‚ ‘] worker_domain=apimail.iemail.online email_domain=mail.iemail.online
+[cfmail≤‚ ‘]  ß∞‹£∫us-node-1 ≤‚ ‘“Ï≥£: Failed to perform, curl: (7) Failed to connect to apimail.iemail.online port 443 after 2029 ms: Could not connect to server. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+
+[cfmail≤‚ ‘] ≤‚ ‘ÕÍ≥…£∫≥…π¶ 0 / 1£¨ ß∞‹ 1

@@ -28,5 +28,6 @@ Thumbs.db
 # 日志
 *.log
 
-# 配置文件
+# 配置文件（实际配置不入库，仅保留 .example 示例）
 cfmail_accounts.json
+monitor_config.json

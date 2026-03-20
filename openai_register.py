@@ -2484,8 +2484,83 @@ def run_monitor_loop(args: argparse.Namespace) -> None:
         time.sleep(sleep_seconds)
 
 
+def _load_config_file(config_path: str) -> dict:
+    """加载 JSON 配置文件，返回配置字典。文件不存在则返回空字典。"""
+    if not config_path or not os.path.isfile(config_path):
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        # 过滤掉以 _ 开头的注释字段
+        return {k: v for k, v in data.items() if not k.startswith("_")}
+    except Exception as exc:
+        print(f"[警告] 读取配置文件 {config_path} 失败: {exc}")
+        return {}
+
+
+# 配置文件中的 key 到 argparse dest 的映射
+_CONFIG_KEY_MAP = {
+    "proxy": "proxy",
+    "mail_provider": "mail_provider",
+    "cfmail_profile": "cfmail_profile",
+    "cfmail_config": "cfmail_config",
+    "cfmail_worker_domain": "cfmail_worker_domain",
+    "cfmail_email_domain": "cfmail_email_domain",
+    "cfmail_admin_password": "cfmail_admin_password",
+    "cfmail_profile_name": "cfmail_profile_name",
+    "mailtm_api_base": "mailtm_api_base",
+    "token_dir": "token_dir",
+    "active_token_dir": "active_token_dir",
+    "active_min_count": "active_min_count",
+    "pool_min_count": "pool_min_count",
+    "usage_threshold": "usage_threshold",
+    "request_interval": "request_interval",
+    "curl_timeout": "curl_timeout",
+    "monitor_interval": "monitor_interval",
+    "register_batch_size": "register_batch_size",
+    "dingtalk_webhook": "dingtalk_webhook",
+    "dingtalk_summary_interval": "dingtalk_summary_interval",
+    "sleep_min": "sleep_min",
+    "sleep_max": "sleep_max",
+}
+
+# 布尔型参数（配置文件里 true/false）
+_CONFIG_BOOL_KEYS = {
+    "monitor", "monitor_once", "register_only",
+    "auto_continue_non_us", "once", "test_cfmail",
+}
+
+DEFAULT_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "monitor_config.json")
+
+
+def _apply_config_to_args(args: argparse.Namespace, config: dict) -> None:
+    """将配置文件中的值填入 args，仅当命令行未显式指定时生效。"""
+    for config_key, arg_dest in _CONFIG_KEY_MAP.items():
+        if config_key not in config:
+            continue
+        # 仅当 argparse 使用了默认值时才覆盖（命令行显式指定的优先）
+        current_val = getattr(args, arg_dest, None)
+        default_val = getattr(args, f"_default_{arg_dest}", current_val)
+        if current_val == default_val:
+            setattr(args, arg_dest, config[config_key])
+
+    for bool_key in _CONFIG_BOOL_KEYS:
+        if bool_key not in config:
+            continue
+        current_val = getattr(args, bool_key, False)
+        if not current_val:
+            setattr(args, bool_key, bool(config[bool_key]))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="OpenAI 自动注册与账号巡检脚本")
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"JSON 配置文件路径，默认 {DEFAULT_CONFIG_PATH}",
+    )
     parser.add_argument(
         "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
     )
@@ -2626,6 +2701,17 @@ def main() -> None:
         help="仅测试 cfmail 配置是否可创建邮箱并可轮询，不执行注册",
     )
     args = parser.parse_args()
+
+    # 保存 argparse 的默认值，用于判断命令行是否显式传参
+    for action in parser._actions:
+        if hasattr(action, "dest") and action.dest != "help":
+            setattr(args, f"_default_{action.dest}", action.default)
+
+    # 加载配置文件（命令行参数优先于配置文件）
+    config = _load_config_file(args.config)
+    if config:
+        print(f"[信息] 已加载配置文件: {args.config}")
+        _apply_config_to_args(args, config)
 
     sleep_min = max(1, args.sleep_min)
     sleep_max = max(sleep_min, args.sleep_max)
