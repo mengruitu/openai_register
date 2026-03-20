@@ -149,7 +149,7 @@ python /root/openai_register.py --mail-provider tempmaillol
 默认配置文件：
 
 ```text
-/root/cfmail_accounts.json
+<脚本所在目录>/cfmail_accounts.json
 ```
 
 ### 7.1 支持的配置格式
@@ -427,7 +427,7 @@ https://cloudflare.com/cdn-cgi/trace
 原因：
 
 - 默认邮箱服务是 `cfmail`
-- 但 `/root/cfmail_accounts.json` 中没有有效配置
+- 但脚本同目录下的 `cfmail_accounts.json` 中没有有效配置
 
 解决：
 
@@ -483,7 +483,7 @@ python /root/openai_register.py --mail-provider tempmaillol
 如果你是长期维护 Token 池，推荐：
 
 ```bash
-python /root/openai_register.py \
+python /openai_register.py \
   --monitor \
   --mail-provider cfmail \
   --active-min-count 20 \

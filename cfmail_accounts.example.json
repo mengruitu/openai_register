@@ -1,5 +1,5 @@
 {
-  "_comment": "cfmail 配置文件。支持两种格式：1) 直接数组 [{...}]；2) 外层对象 {\"accounts\": [{...}]}（即本文件格式）。使用时 cp cfmail_accounts.example.json /cfmail_accounts.json",
+  "_comment": "cfmail 配置文件。支持两种格式：1) 直接数组 [{...}]；2) 外层对象 {\"accounts\": [{...}]}（即本文件格式）。",
   "_how_to_fill": [
     "name: 自定义配置名（必填），例如 hk-node-1、us-node-2。名称不可重复，重复时仅保留首个。",
     "worker_domain: cfmail worker / 后端接口域名（必填），例如 apimail.example.com。不要带 https://，代码会自动去除协议前缀。",
@@ -8,24 +8,17 @@
     "enabled: 可选，默认 true。设为 false 表示保留配置但暂不参与轮询。",
     "",
     "字段名也兼容大写形式：WORKER_DOMAIN、EMAIL_DOMAIN、ADMIN_PASSWORD。",
-    "默认配置路径: /root/cfmail_accounts.json，可通过 --cfmail-config 参数指定。",
+    "默认配置路径: 脚本同目录下的 cfmail_accounts.json，可通过 --cfmail-config 参数指定。",
     "支持热加载：运行中修改本文件后，下一轮检测会自动生效，无需重启。",
     "多配置 auto 模式下会按顺序轮询，某个配置连续失败超过阈值后自动进入冷却期跳过。"
   ],
   "accounts": [
     {
-      "name": "<YOUR_CFMAIL_PROFILE_NAME_1>",
-      "worker_domain": "<YOUR_CFMAIL_WORKER_DOMAIN_1>",
-      "email_domain": "<YOUR_CFMAIL_EMAIL_DOMAIN_1>",
-      "admin_password": "<YOUR_CFMAIL_ADMIN_PASSWORD_1>",
+      "name": "us-node-1",
+      "worker_domain": "apimail.iemail.online",
+      "email_domain": "ail.iemail.online",
+      "admin_password": "ClearLotus-981102",
       "enabled": true
-    },
-    {
-      "name": "<YOUR_CFMAIL_PROFILE_NAME_2>",
-      "worker_domain": "<YOUR_CFMAIL_WORKER_DOMAIN_2>",
-      "email_domain": "<YOUR_CFMAIL_EMAIL_DOMAIN_2>",
-      "admin_password": "<YOUR_CFMAIL_ADMIN_PASSWORD_2>",
-      "enabled": false
     }
   ]
 }

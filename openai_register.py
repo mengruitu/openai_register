@@ -40,8 +40,11 @@ MAILTM_BASE = "https://api.mail.tm"
 TEMPMAILLOL_BASE = "https://api.tempmail.lol/v2"
 TEMPMAILIO_API = "https://api.internal.temp-mail.io/api/v3/email"
 DROPMAIL_API = "https://dropmail.me/api/graphql"
+# 脚本所在目录，作为默认路径的基准
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # 自建 cfmail 的真实配置统一放在 cfmail_accounts.json 中
-DEFAULT_CFMAIL_CONFIG_PATH = "/root/cfmail_accounts.json"
+DEFAULT_CFMAIL_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "cfmail_accounts.json")
 DEFAULT_CFMAIL_ACCOUNTS = []
 DEFAULT_CFMAIL_PROFILE_NAME = (
     str(DEFAULT_CFMAIL_ACCOUNTS[0].get("name") or "").strip()
@@ -63,8 +66,8 @@ DEFAULT_CFMAIL_ADMIN_PASSWORD = (
     if DEFAULT_CFMAIL_ACCOUNTS
     else ""
 )
-DEFAULT_ACTIVE_TOKEN_DIR = "/home/cpa/CLIProxyAPI/auths/auths"
-DEFAULT_TOKEN_OUTPUT_DIR = "/home/cpa/CLIProxyAPI/auths/auths_pool"
+DEFAULT_ACTIVE_TOKEN_DIR = os.path.join(_SCRIPT_DIR, "auths")
+DEFAULT_TOKEN_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "auths_pool")
 DEFAULT_MIN_ACTIVE_COUNT = 20
 DEFAULT_MIN_POOL_COUNT = 50
 DEFAULT_USAGE_THRESHOLD = 90
