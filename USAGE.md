@@ -485,7 +485,6 @@ python /root/openai_register.py --mail-provider tempmaillol
 ```bash
 python /root/openai_register.py \
   --monitor \
-  --proxy http://127.0.0.1:7890 \
   --mail-provider cfmail \
   --active-min-count 20 \
   --pool-min-count 50 \
