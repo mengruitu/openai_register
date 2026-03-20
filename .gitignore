@@ -27,3 +27,6 @@ Thumbs.db
 
 # 日志
 *.log
+
+# 配置文件
+cfmail_accounts.json
