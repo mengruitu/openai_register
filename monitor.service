@@ -1,0 +1,24 @@
+[Unit]
+# openai_register 持续巡检 / 自动补号服务
+Description=openai_register monitor service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+# 如需代理、阈值、自定义配置文件，请直接在这里追加参数
+# 可追加 --dingtalk-webhook <URL> 设置钉钉通知
+ExecStart=/root/venv-zhuce/bin/python /root/openai_register.py --monitor --monitor-interval 900 --dingtalk-summary-interval 10800
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/openai_register.log
+StandardError=append:/root/openai_register.log
+Environment=LANG=C
+Environment=LC_ALL=C
+# 如果你把 webhook 放在环境文件里，可取消下面这一行注释并改成实际路径
+# EnvironmentFile=/etc/default/monitor
+
+[Install]
+WantedBy=multi-user.target
