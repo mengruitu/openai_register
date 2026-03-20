@@ -14,10 +14,10 @@
   ],
   "accounts": [
     {
-      "name": "us-node-1",
-      "worker_domain": "apimail.iemail.online",
-      "email_domain": "ail.iemail.online",
-      "admin_password": "ClearLotus-981102",
+      "name": "",
+      "worker_domain": "",
+      "email_domain": "",
+      "admin_password": "",
       "enabled": true
     }
   ]
