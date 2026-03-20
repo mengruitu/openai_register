@@ -7,18 +7,28 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root
+WorkingDirectory=/data/openai_register
 # 如需代理、阈值、自定义配置文件，请直接在这里追加参数
 # 可追加 --dingtalk-webhook <URL> 设置钉钉通知
-ExecStart=/root/venv-zhuce/bin/python /root/openai_register.py --monitor --monitor-interval 900 --dingtalk-summary-interval 10800
+ExecStart=/data/openai_register/.venv/bin/python /data/openai_register/openai_register.py \
+    --monitor \
+    --mail-provider cfmail \
+    --active-min-count 20 \
+    --pool-min-count 50 \
+    --usage-threshold 90 \
+    --monitor-interval 900 \
+    --register-batch-size 3 \
+    --dingtalk-summary-interval 10800
 Restart=always
 RestartSec=10
-StandardOutput=append:/root/openai_register.log
-StandardError=append:/root/openai_register.log
+# 日志由 journald 管理，自动轮转，无需手动处理日志文件
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openai-register
 Environment=LANG=C
 Environment=LC_ALL=C
-# 如果你把 webhook 放在环境文件里，可取消下面这一行注释并改成实际路径
-# EnvironmentFile=/etc/default/monitor
+# 如果你把 webhook 放在环境文件里，可取消下面这一行注释
+# EnvironmentFile=/data/openai_register/monitor.env
 
 [Install]
 WantedBy=multi-user.target
