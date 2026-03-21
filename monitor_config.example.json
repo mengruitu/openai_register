@@ -39,6 +39,7 @@
 
     "_section_notify": "===== 通知配置 =====",
     "dingtalk_webhook": "",
+    "dingtalk_fallback_interval": 900,
 
     "_section_proxy": "===== 代理配置 =====",
     "proxy": "",

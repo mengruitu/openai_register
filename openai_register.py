@@ -4,10 +4,7 @@
 支持多种临时邮箱服务，自动完成注册流程并维护双目录 Token 池。
 """
 import argparse
-import base64
 import builtins
-import concurrent.futures
-import hashlib
 import json
 import math
 import os
@@ -20,56 +17,90 @@ import sys
 import threading
 import time
 import traceback
-import uuid
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from curl_cffi import requests
+from register_auth import (
+    bootstrap_web_signup_start_url,
+    extract_continue_url_from_response as _extract_continue_url_from_response,
+    generate_oauth_url,
+    oauth_authorize_url as _oauth_authorize_url,
+    post_email_otp_validate as _post_email_otp_validate,
+    prime_oauth_session as _prime_oauth_session,
+    request_sentinel_header as _request_sentinel_token,
+    response_text_preview as _response_text_preview,
+    submit_callback_url,
+    try_token_via_existing_session as _try_token_via_existing_session,
+    try_token_via_password_login as _try_token_via_password_login,
+    try_token_via_workspace_select as _try_token_via_workspace_select,
+)
+from register_cfmail import (
+    CfmailAccount,
+    DEFAULT_CFMAIL_ACCOUNTS,
+    DEFAULT_CFMAIL_ADMIN_PASSWORD,
+    DEFAULT_CFMAIL_CONFIG_PATH,
+    DEFAULT_CFMAIL_COOLDOWN_SECONDS,
+    DEFAULT_CFMAIL_EMAIL_DOMAIN,
+    DEFAULT_CFMAIL_FAIL_THRESHOLD,
+    DEFAULT_CFMAIL_PROFILE_NAME,
+    DEFAULT_CFMAIL_WORKER_DOMAIN,
+    build_cfmail_accounts as _build_cfmail_accounts,
+    cfmail_account_names as _cfmail_account_names,
+    cfmail_headers as _cfmail_headers,
+    configure_cfmail_runtime,
+    create_cfmail_mailbox as _create_cfmail_mailbox,
+    get_cfmail_accounts,
+    list_cfmail_message_ids as _list_cfmail_message_ids,
+    load_cfmail_accounts_from_file as _load_cfmail_accounts_from_file,
+    normalize_host as _normalize_host,
+    poll_cfmail_oai_code as _poll_cfmail_oai_code,
+    prune_cfmail_failure_state as _prune_cfmail_failure_state,
+    record_cfmail_failure as _record_cfmail_failure,
+    record_cfmail_success as _record_cfmail_success,
+    reload_cfmail_accounts_if_needed as _reload_cfmail_accounts_if_needed,
+    run_cfmail_self_test,
+    select_cfmail_account as _select_cfmail_account,
+)
+from register_mailboxes import (
+    MAILTM_BASE,
+    TEMPMAILIO_API,
+    TEMPMAILLOL_BASE,
+    DROPMAIL_API,
+    TempMailbox,
+    create_dropmail_mailbox,
+    create_hydra_mailbox,
+    create_tempmaillol_mailbox,
+    create_tempmailio_mailbox,
+    list_dropmail_message_ids,
+    list_hydra_message_ids,
+    list_tempmailio_message_ids,
+    list_tempmaillol_message_ids,
+    poll_dropmail_oai_code,
+    poll_hydra_oai_code,
+    poll_tempmailio_oai_code,
+    poll_tempmaillol_oai_code,
+)
+from register_notifications import (
+    notify_fallback_provider_usage,
+)
+from register_runtime import (
+    DEFAULT_TOKEN_CHECK_WORKERS,
+    log_info,
+    run_monitor_loop,
+    worker,
+)
 
-# 线程锁，用于串行化输出文件写入
-output_lock = threading.Lock()
-_token_usage_cache_lock = threading.Lock()
 builtins.yasal_bypass_ip_choice = True
-TOKEN_USAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ==========================================
-# 临时邮箱 API (仅保留最坚挺的 Mail.tm)
+# 临时邮箱 API
 # ==========================================
-
-MAILTM_BASE = "https://api.mail.tm"
-TEMPMAILLOL_BASE = "https://api.tempmail.lol/v2"
-TEMPMAILIO_API = "https://api.internal.temp-mail.io/api/v3/email"
-DROPMAIL_API = "https://dropmail.me/api/graphql"
 # 脚本所在目录，作为默认路径的基准
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 自建 cfmail 的真实配置统一放在 cfmail_accounts.json 中
-DEFAULT_CFMAIL_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "cfmail_accounts.json")
-DEFAULT_CFMAIL_ACCOUNTS = []
-DEFAULT_CFMAIL_PROFILE_NAME = (
-    str(DEFAULT_CFMAIL_ACCOUNTS[0].get("name") or "").strip()
-    if DEFAULT_CFMAIL_ACCOUNTS
-    else "default"
-)
-DEFAULT_CFMAIL_WORKER_DOMAIN = (
-    str(DEFAULT_CFMAIL_ACCOUNTS[0].get("worker_domain") or "").strip()
-    if DEFAULT_CFMAIL_ACCOUNTS
-    else ""
-)
-DEFAULT_CFMAIL_EMAIL_DOMAIN = (
-    str(DEFAULT_CFMAIL_ACCOUNTS[0].get("email_domain") or "").strip()
-    if DEFAULT_CFMAIL_ACCOUNTS
-    else ""
-)
-DEFAULT_CFMAIL_ADMIN_PASSWORD = (
-    str(DEFAULT_CFMAIL_ACCOUNTS[0].get("admin_password") or "").strip()
-    if DEFAULT_CFMAIL_ACCOUNTS
-    else ""
-)
 DEFAULT_ACTIVE_TOKEN_DIR = os.path.join(_SCRIPT_DIR, "auths")
 DEFAULT_TOKEN_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "auths_pool")
 DEFAULT_MIN_ACTIVE_COUNT = 20
@@ -78,94 +109,16 @@ DEFAULT_USAGE_THRESHOLD = 90
 DEFAULT_CHECK_INTERVAL_SECONDS = 900
 DEFAULT_DINGTALK_SUMMARY_INTERVAL_SECONDS = 10800
 DEFAULT_REQUEST_INTERVAL_SECONDS = 2
-DEFAULT_TOKEN_CHECK_WORKERS = 6
-TOKEN_USAGE_CACHE_TTL_SECONDS = 180
 DEFAULT_REGISTER_BATCH_SIZE = 3
 DEFAULT_REGISTER_OPENAI_CONCURRENCY = 3
 DEFAULT_REGISTER_START_DELAY_SECONDS = 1.0
-DEFAULT_CFMAIL_FAIL_THRESHOLD = 3
-DEFAULT_CFMAIL_COOLDOWN_SECONDS = 300
 DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 10
 # 请改成你的钉钉机器人地址
 DEFAULT_DINGTALK_WEBHOOK = ""
-RETRYABLE_GATEWAY_STATUSES = {502, 503, 504}
-EMAIL_OTP_VALIDATE_MAX_ATTEMPTS = 3
-EMAIL_OTP_VALIDATE_RETRY_DELAY_SECONDS = 2
-SENTINEL_FRAME_URL = (
-    "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
-)
-SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
-SENTINEL_POW_PREFIX = "gAAAAAB"
-SENTINEL_POW_SUFFIX = "~S"
-SENTINEL_POW_MAX_ATTEMPTS = 500000
-SENTINEL_DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-)
-SENTINEL_DEFAULT_JS_HEAP_SIZE_LIMIT = 4294705152
-SENTINEL_DEFAULT_SCREEN_SUM = 3000
-SENTINEL_DEFAULT_LANGUAGE = "en-US"
-SENTINEL_DEFAULT_LANGUAGES = "en-US,en"
-SENTINEL_DEFAULT_HARDWARE_CONCURRENCY = 8
-SENTINEL_MINUS_SIGN = "\u2212"
-SENTINEL_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-SENTINEL_MONTH_NAMES = (
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-)
-
-
-@dataclass(frozen=True)
-class TempMailbox:
-    email: str
-    provider: str
-    token: str = ""
-    api_base: str = ""
-    login: str = ""
-    domain: str = ""
-    sid_token: str = ""
-    password: str = ""
-    config_name: str = ""
-
-
-@dataclass(frozen=True)
-class CfmailAccount:
-    name: str
-    worker_domain: str
-    email_domain: str
-    admin_password: str
-
-
-@dataclass(frozen=True)
-class MonitorCycleResult:
-    completed_at: datetime
-    active_count: int
-    pool_count: int
-    active_target: int
-    pool_target: int
-    active_shortage: int
-    pool_shortage: int
-    attempted_replenish: bool
-    register_target: int
-    replenished_count: int
-    deleted_count: int
-    active_deleted_count: int
-    pool_deleted_count: int
-    moved_to_active_count: int
-    active_check_failed: int
-    pool_check_failed: int
-
-
+DEFAULT_CFMAIL_FALLBACK_PROVIDER = "tempmaillol"
+DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
+CREATE_ACCOUNT_MAX_ATTEMPTS = 2
+CREATE_ACCOUNT_RETRY_DELAY_SECONDS = 2
 def _random_name_part(min_length: int = 4, max_length: int = 9) -> str:
     length = random.randint(min_length, max_length)
     letters = string.ascii_lowercase
@@ -191,349 +144,6 @@ def _build_random_signup_profile() -> Dict[str, str]:
     }
 
 
-def _load_cfmail_accounts_from_file(
-    config_path: str, *, silent: bool = False
-) -> List[Dict[str, Any]]:
-    # 配置文件支持两种格式：
-    # 1. 直接是数组 [ {...}, {...} ]
-    # 2. 外层包一层对象 { "accounts": [ {...} ] }
-    path = str(config_path or "").strip()
-    if not path or not os.path.exists(path):
-        return []
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        if not silent:
-            print(f"[警告] 读取 cfmail 配置文件失败: {path}，错误: {e}")
-        return []
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        accounts = data.get("accounts")
-        if isinstance(accounts, list):
-            return accounts
-
-    if not silent:
-        print(f"[警告] cfmail 配置文件格式无效: {path}")
-    return []
-
-
-def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if use_json:
-        headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def _normalize_host(value: str) -> str:
-    value = str(value or "").strip()
-    if value.startswith("https://"):
-        value = value[len("https://") :]
-    elif value.startswith("http://"):
-        value = value[len("http://") :]
-    return value.strip().strip("/")
-
-
-def _normalize_cfmail_account(raw: Dict[str, Any]) -> Optional[CfmailAccount]:
-    if not isinstance(raw, dict):
-        return None
-
-    if not raw.get("enabled", True):
-        return None
-
-    name = str(raw.get("name") or "").strip()
-    worker_domain = _normalize_host(
-        raw.get("worker_domain") or raw.get("WORKER_DOMAIN") or ""
-    )
-    email_domain = _normalize_host(
-        raw.get("email_domain") or raw.get("EMAIL_DOMAIN") or ""
-    )
-    admin_password = str(
-        raw.get("admin_password") or raw.get("ADMIN_PASSWORD") or ""
-    ).strip()
-
-    if not name or not worker_domain or not email_domain or not admin_password:
-        return None
-
-    return CfmailAccount(
-        name=name,
-        worker_domain=worker_domain,
-        email_domain=email_domain,
-        admin_password=admin_password,
-    )
-
-
-def _build_cfmail_accounts(raw_accounts: List[Dict[str, Any]]) -> List[CfmailAccount]:
-    accounts: List[CfmailAccount] = []
-    seen_names: Set[str] = set()
-
-    for item in raw_accounts:
-        account = _normalize_cfmail_account(item)
-        if not account:
-            continue
-
-        key = account.name.lower()
-        if key in seen_names:
-            continue
-
-        seen_names.add(key)
-        accounts.append(account)
-
-    env_worker_domain = _normalize_host(os.getenv("CFMAIL_WORKER_DOMAIN", ""))
-    env_email_domain = _normalize_host(os.getenv("CFMAIL_EMAIL_DOMAIN", ""))
-    env_admin_password = str(os.getenv("CFMAIL_ADMIN_PASSWORD", "")).strip()
-    env_profile_name = (
-        str(os.getenv("CFMAIL_PROFILE_NAME", DEFAULT_CFMAIL_PROFILE_NAME)).strip()
-        or DEFAULT_CFMAIL_PROFILE_NAME
-    )
-
-    if env_worker_domain and env_email_domain and env_admin_password:
-        env_account = CfmailAccount(
-            name=env_profile_name,
-            worker_domain=env_worker_domain,
-            email_domain=env_email_domain,
-            admin_password=env_admin_password,
-        )
-        env_key = env_account.name.lower()
-        accounts = [acc for acc in accounts if acc.name.lower() != env_key]
-        accounts.insert(0, env_account)
-
-    return accounts
-
-
-def _cfmail_account_names(accounts: Optional[List[CfmailAccount]] = None) -> str:
-    items = accounts if accounts is not None else CFMAIL_ACCOUNTS
-    return ", ".join(account.name for account in items) if items else "无"
-
-
-def _refresh_cfmail_globals() -> None:
-    globals()["CFMAIL_WORKER_DOMAIN"] = (
-        CFMAIL_ACCOUNTS[0].worker_domain if CFMAIL_ACCOUNTS else ""
-    )
-    globals()["CFMAIL_EMAIL_DOMAIN"] = (
-        CFMAIL_ACCOUNTS[0].email_domain if CFMAIL_ACCOUNTS else ""
-    )
-    globals()["CFMAIL_ADMIN_PASSWORD"] = (
-        CFMAIL_ACCOUNTS[0].admin_password if CFMAIL_ACCOUNTS else ""
-    )
-
-
-def _prune_cfmail_failure_state(accounts: Optional[List[CfmailAccount]] = None) -> None:
-    items = accounts if accounts is not None else CFMAIL_ACCOUNTS
-    valid_keys = {account.name.lower() for account in items}
-    with _cfmail_failure_lock:
-        for key in list(CFMAIL_FAILURE_STATE.keys()):
-            if key not in valid_keys:
-                CFMAIL_FAILURE_STATE.pop(key, None)
-
-
-def _cfmail_skip_remaining_seconds(account_name: str) -> int:
-    key = str(account_name or "").strip().lower()
-    if not key:
-        return 0
-
-    with _cfmail_failure_lock:
-        state = CFMAIL_FAILURE_STATE.get(key) or {}
-        cooldown_until = float(state.get("cooldown_until") or 0)
-
-    remaining = int(math.ceil(cooldown_until - time.time()))
-    return max(0, remaining)
-
-
-def _record_cfmail_success(account_name: str) -> None:
-    key = str(account_name or "").strip().lower()
-    if not key:
-        return
-
-    with _cfmail_failure_lock:
-        state = CFMAIL_FAILURE_STATE.setdefault(key, {"name": account_name})
-        state["name"] = account_name
-        state["consecutive_failures"] = 0
-        state["cooldown_until"] = 0
-        state["last_error"] = ""
-        state["last_success_at"] = time.time()
-
-
-def _record_cfmail_failure(account_name: str, reason: str = "") -> None:
-    # 当某个 cfmail 配置连续失败达到阈值后，临时加入冷却期，
-    # 自动轮询模式会先跳过它，避免一直撞同一个坏配置。
-    key = str(account_name or "").strip().lower()
-    if not key:
-        return
-
-    now = time.time()
-    cooldown_seconds = max(0, int(CFMAIL_COOLDOWN_SECONDS))
-    fail_threshold = max(1, int(CFMAIL_FAIL_THRESHOLD))
-
-    with _cfmail_failure_lock:
-        state = CFMAIL_FAILURE_STATE.setdefault(key, {"name": account_name})
-        state["name"] = account_name
-        state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
-        state["last_error"] = str(reason or "").strip()[:300]
-        state["last_failed_at"] = now
-
-        if state["consecutive_failures"] >= fail_threshold:
-            state["cooldown_until"] = max(
-                float(state.get("cooldown_until") or 0),
-                now + cooldown_seconds,
-            )
-            state["consecutive_failures"] = 0
-            cooldown_until = state["cooldown_until"]
-        else:
-            cooldown_until = float(state.get("cooldown_until") or 0)
-
-    if cooldown_until > now:
-        remaining = int(math.ceil(cooldown_until - now))
-        print(
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置 {account_name} 连续失败达到阈值，已自动跳过 {remaining} 秒"
-        )
-
-
-def _reload_cfmail_accounts_if_needed(force: bool = False) -> bool:
-    global CFMAIL_CONFIG_MTIME
-
-    if not CFMAIL_HOT_RELOAD_ENABLED:
-        return False
-
-    config_path = str(CFMAIL_CONFIG_PATH or "").strip()
-    if not config_path:
-        return False
-
-    try:
-        mtime = os.path.getmtime(config_path)
-    except OSError:
-        return False
-
-    # 通过 mtime 判断 JSON 是否变化。变化后热加载，无需重启脚本。
-    with _cfmail_reload_lock:
-        if not force and CFMAIL_CONFIG_MTIME == mtime:
-            return False
-
-        raw_accounts = _load_cfmail_accounts_from_file(config_path)
-        new_accounts = _build_cfmail_accounts(raw_accounts)
-        if not new_accounts:
-            print(
-                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置文件热加载失败：{config_path} 中没有可用配置，保留当前配置"
-            )
-            CFMAIL_CONFIG_MTIME = mtime
-            return False
-
-        old_names = _cfmail_account_names()
-        _set_cfmail_accounts(new_accounts)
-        _prune_cfmail_failure_state(new_accounts)
-        CFMAIL_CONFIG_MTIME = mtime
-        new_names = _cfmail_account_names()
-        if force or old_names != new_names:
-            print(
-                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [信息] cfmail 配置已热加载：{new_names}"
-            )
-        return True
-
-
-_cfmail_account_lock = threading.Lock()
-_cfmail_account_index = 0
-_cfmail_reload_lock = threading.Lock()
-_cfmail_failure_lock = threading.Lock()
-CFMAIL_CONFIG_PATH = (
-    str(os.getenv("CFMAIL_CONFIG_PATH", DEFAULT_CFMAIL_CONFIG_PATH)).strip()
-    or DEFAULT_CFMAIL_CONFIG_PATH
-)
-CFMAIL_ACCOUNTS = _build_cfmail_accounts(
-    _load_cfmail_accounts_from_file(CFMAIL_CONFIG_PATH, silent=True)
-    or DEFAULT_CFMAIL_ACCOUNTS
-)
-CFMAIL_PROFILE_MODE = "auto"
-CFMAIL_HOT_RELOAD_ENABLED = True
-CFMAIL_CONFIG_MTIME = (
-    os.path.getmtime(CFMAIL_CONFIG_PATH) if os.path.exists(CFMAIL_CONFIG_PATH) else None
-)
-# cfmail 失败熔断参数：
-# - 连续失败达到阈值后，临时跳过该配置一段时间
-# - 只影响 auto 轮询，不影响手动指定 --cfmail-profile
-CFMAIL_FAIL_THRESHOLD = DEFAULT_CFMAIL_FAIL_THRESHOLD
-CFMAIL_COOLDOWN_SECONDS = DEFAULT_CFMAIL_COOLDOWN_SECONDS
-CFMAIL_FAILURE_STATE: Dict[str, Dict[str, Any]] = {}
-
-CFMAIL_WORKER_DOMAIN = _normalize_host(
-    os.getenv("CFMAIL_WORKER_DOMAIN", DEFAULT_CFMAIL_WORKER_DOMAIN)
-)
-CFMAIL_EMAIL_DOMAIN = _normalize_host(
-    os.getenv("CFMAIL_EMAIL_DOMAIN", DEFAULT_CFMAIL_EMAIL_DOMAIN)
-)
-CFMAIL_ADMIN_PASSWORD = os.getenv(
-    "CFMAIL_ADMIN_PASSWORD", DEFAULT_CFMAIL_ADMIN_PASSWORD
-).strip()
-
-if CFMAIL_ACCOUNTS:
-    _refresh_cfmail_globals()
-
-
-def _set_cfmail_accounts(accounts: List[CfmailAccount]) -> None:
-    global CFMAIL_ACCOUNTS, _cfmail_account_index
-    CFMAIL_ACCOUNTS = accounts
-    _cfmail_account_index = 0
-    _refresh_cfmail_globals()
-
-
-def _select_cfmail_account(profile_name: str = "auto") -> Optional[CfmailAccount]:
-    global _cfmail_account_index
-    accounts = CFMAIL_ACCOUNTS
-    if not accounts:
-        return None
-
-    selected_name = str(profile_name or "auto").strip()
-    if selected_name and selected_name.lower() != "auto":
-        selected_key = selected_name.lower()
-        for account in accounts:
-            if account.name.lower() == selected_key:
-                remaining = _cfmail_skip_remaining_seconds(account.name)
-                if remaining > 0:
-                    print(
-                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置 {account.name} 当前仍在冷却中，剩余 {remaining} 秒；因你已手动指定，仍继续尝试"
-                    )
-                return account
-        return None
-
-    # auto 模式下按顺序轮询账号；若某个配置处于冷却期，则自动跳过。
-    with _cfmail_account_lock:
-        start_index = _cfmail_account_index % len(accounts)
-        skipped_accounts = []
-
-        for offset in range(len(accounts)):
-            index = (start_index + offset) % len(accounts)
-            account = accounts[index]
-            remaining = _cfmail_skip_remaining_seconds(account.name)
-            if remaining > 0:
-                skipped_accounts.append((account.name, remaining))
-                continue
-
-            _cfmail_account_index = (index + 1) % len(accounts)
-            return account
-
-    if skipped_accounts:
-        skip_desc = ", ".join(
-            f"{name}({remaining}s)" for name, remaining in skipped_accounts
-        )
-        print(
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] 所有 cfmail 配置当前都在冷却中，暂不分配邮箱：{skip_desc}"
-        )
-    return None
-
-
-def _cfmail_headers(*, jwt: str = "", use_json: bool = False) -> Dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if use_json:
-        headers["Content-Type"] = "application/json"
-    if jwt:
-        headers["Authorization"] = f"Bearer {jwt}"
-    return headers
-
 
 def _build_request_proxies(proxy: Optional[str]) -> Any:
     if not proxy:
@@ -541,363 +151,72 @@ def _build_request_proxies(proxy: Optional[str]) -> Any:
     return {"http": proxy, "https": proxy}
 
 
-def _test_single_cfmail_account(
-    account: CfmailAccount, proxy: Optional[str] = None
-) -> bool:
-    proxies = _build_request_proxies(proxy)
-    print(f"\n[cfmail测试] 开始测试配置: {account.name}")
-    print(
-        f"[cfmail测试] worker_domain={account.worker_domain} email_domain={account.email_domain}"
-    )
-
-    try:
-        local = f"codextest{secrets.token_hex(4)}"
-        create_resp = requests.post(
-            f"https://{account.worker_domain}/admin/new_address",
-            headers={
-                "x-admin-auth": account.admin_password,
-                **_cfmail_headers(use_json=True),
-            },
-            json={
-                "enablePrefix": True,
-                "name": local,
-                "domain": account.email_domain,
-            },
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=20,
-        )
-        if create_resp.status_code != 200:
-            print(
-                f"[cfmail测试] 失败：创建邮箱返回 {create_resp.status_code}，响应={create_resp.text[:300]}"
-            )
-            return False
-
-        data = create_resp.json() if create_resp.content else {}
-        address = str(data.get("address") or "").strip()
-        jwt = str(data.get("jwt") or "").strip()
-        if not address or not jwt:
-            print(f"[cfmail测试] 失败：创建邮箱成功但返回 address/jwt 不完整")
-            return False
-
-        print(f"[cfmail测试] 创建成功: {address}")
-
-        poll_resp = requests.get(
-            f"https://{account.worker_domain}/api/mails",
-            params={"limit": 5, "offset": 0},
-            headers=_cfmail_headers(jwt=jwt, use_json=True),
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=20,
-        )
-        if poll_resp.status_code != 200:
-            print(
-                f"[cfmail测试] 失败：轮询接口返回 {poll_resp.status_code}，响应={poll_resp.text[:300]}"
-            )
-            return False
-
-        poll_data = poll_resp.json() if poll_resp.content else {}
-        count = poll_data.get("count", 0) if isinstance(poll_data, dict) else 0
-        print(f"[cfmail测试] 轮询成功: count={count}")
-        return True
-    except Exception as e:
-        print(f"[cfmail测试] 失败：{account.name} 测试异常: {e}")
-        return False
-
-
-def run_cfmail_self_test(
-    accounts: List[CfmailAccount],
+def _post_create_account_with_retry(
+    session: Any,
     *,
-    proxy: Optional[str] = None,
-    profile_name: str = "auto",
-) -> bool:
-    if not accounts:
-        print("[cfmail测试] 未找到可用的 cfmail 配置")
-        return False
-
-    selected_accounts = accounts
-    selected_name = str(profile_name or "auto").strip()
-    if selected_name and selected_name.lower() != "auto":
-        selected_accounts = [
-            account
-            for account in accounts
-            if account.name.lower() == selected_name.lower()
-        ]
-        if not selected_accounts:
-            print(
-                f"[cfmail测试] 未找到指定配置: {selected_name}；当前可用配置: {_cfmail_account_names(accounts)}"
-            )
-            return False
-
-    print(
-        f"[cfmail测试] 共需测试 {len(selected_accounts)} 个配置: {_cfmail_account_names(selected_accounts)}"
-    )
-    passed = 0
-    for account in selected_accounts:
-        if _test_single_cfmail_account(account, proxy):
-            passed += 1
-
-    print(
-        f"\n[cfmail测试] 测试完成：成功 {passed} / {len(selected_accounts)}，失败 {len(selected_accounts) - passed}"
-    )
-    return passed == len(selected_accounts)
-
-
-def _hydra_domains(api_base: str, proxies: Any = None) -> List[str]:
-    resp = requests.get(
-        f"{api_base}/domains",
-        headers=_mailtm_headers(),
-        proxies=proxies,
-        impersonate="chrome",
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"获取域名失败，状态码: {resp.status_code}")
-
-    data = resp.json()
-    domains = []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = data.get("hydra:member") or data.get("items") or []
-    else:
-        items = []
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        domain = str(item.get("domain") or "").strip()
-        is_active = item.get("isActive", True)
-        is_private = item.get("isPrivate", False)
-        if domain and is_active and not is_private:
-            domains.append(domain)
-
-    return domains
-
-
-def _create_hydra_mailbox(
-    *,
-    api_base: str,
-    provider_name: str,
-    provider_key: str,
-    proxies: Any = None,
+    create_account_body: str,
+    did: str,
+    proxies: Any,
+    impersonate: str,
     thread_id: int,
-) -> Optional[TempMailbox]:
-    try:
-        domains = _hydra_domains(api_base, proxies)
-        if not domains:
-            print(f"[线程 {thread_id}] [警告] {provider_name} 没有可用域名")
-            return None
+    max_attempts: int = CREATE_ACCOUNT_MAX_ATTEMPTS,
+    retry_delay_seconds: int = CREATE_ACCOUNT_RETRY_DELAY_SECONDS,
+) -> Optional[Any]:
+    attempts = max(1, int(max_attempts))
+    delay_seconds = max(0, int(retry_delay_seconds))
+    last_resp = None
 
-        for _ in range(5):
-            local = f"oc{secrets.token_hex(5)}"
-            domain = random.choice(domains)
-            email = f"{local}@{domain}"
-            password = secrets.token_urlsafe(18)
-
-            create_resp = requests.post(
-                f"{api_base}/accounts",
-                headers=_mailtm_headers(use_json=True),
-                json={"address": email, "password": password},
+    for attempt in range(1, attempts + 1):
+        try:
+            create_account_sentinel = _request_sentinel_token(
+                did=did,
                 proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
+                impersonate=impersonate,
+                thread_id=thread_id,
+                flow="oauth_create_account",
             )
+            if not create_account_sentinel:
+                return None
 
-            if create_resp.status_code not in (200, 201):
+            last_resp = session.post(
+                "https://auth.openai.com/api/accounts/create_account",
+                headers={
+                    "referer": "https://auth.openai.com/about-you",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "openai-sentinel-token": create_account_sentinel,
+                },
+                data=create_account_body,
+            )
+        except Exception as exc:
+            if attempt < attempts:
+                print(
+                    f"[线程 {thread_id}] [警告] create_account 请求异常，"
+                    f"第 {attempt}/{attempts} 次尝试失败: {exc}；"
+                    f"{delay_seconds} 秒后重试"
+                )
+                time.sleep(delay_seconds)
                 continue
+            print(f"[线程 {thread_id}] [错误] create_account 请求异常: {exc}")
+            return None
 
-            token_resp = requests.post(
-                f"{api_base}/token",
-                headers=_mailtm_headers(use_json=True),
-                json={"address": email, "password": password},
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
+        status_code = getattr(last_resp, "status_code", 0)
+        if status_code == 200:
+            return last_resp
 
-            if token_resp.status_code == 200:
-                token = str(token_resp.json().get("token") or "").strip()
-                if token:
-                    return TempMailbox(
-                        email=email,
-                        provider=provider_key,
-                        token=token,
-                        api_base=api_base,
-                        password=password,
-                    )
-
-        print(
-            f"[线程 {thread_id}] [警告] {provider_name} 邮箱创建成功但获取 Token 失败"
-        )
-        return None
-    except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 {provider_name} API 出错: {e}")
-        return None
-
-
-def _create_tempmailio_mailbox(
-    proxies: Any = None, thread_id: int = 0
-) -> Optional[TempMailbox]:
-    try:
-        resp = requests.post(
-            f"{TEMPMAILIO_API}/new",
-            json={"min_name_length": 10, "max_name_length": 10},
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            email = data.get("email")
-            token = data.get("token")
-            if email:
-                return TempMailbox(
-                    email=email,
-                    provider="tempmailio",
-                    token=token,
-                )
-        print(f"[线程 {thread_id}] [警告] temp-mail.io 邮箱初始化失败")
-        return None
-    except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 temp-mail.io API 出错: {e}")
-        return None
-
-
-def _create_tempmaillol_mailbox(
-    proxies: Any = None, thread_id: int = 0
-) -> Optional[TempMailbox]:
-    try:
-        resp = requests.post(
-            f"{TEMPMAILLOL_BASE}/inbox/create",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json={},
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code not in (200, 201):
+        if status_code in (408, 425, 429, 500, 502, 503, 504) and attempt < attempts:
+            preview = _response_text_preview(last_resp)
             print(
-                f"[线程 {thread_id}] [警告] Tempmail.lol 邮箱初始化失败，状态码: {resp.status_code}"
+                f"[线程 {thread_id}] [警告] create_account 遇到临时错误，"
+                f"状态码: {status_code}，第 {attempt}/{attempts} 次尝试；"
+                f"{delay_seconds} 秒后重试。响应摘要: {preview}"
             )
-            return None
+            time.sleep(delay_seconds)
+            continue
 
-        data = resp.json()
-        email = str(data.get("address") or "").strip()
-        token = str(data.get("token") or "").strip()
-        if not email or not token:
-            print(f"[线程 {thread_id}] [警告] Tempmail.lol 返回数据不完整")
-            return None
+        return last_resp
 
-        return TempMailbox(
-            email=email,
-            provider="tempmaillol",
-            token=token,
-        )
-    except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 Tempmail.lol API 出错: {e}")
-        return None
-
-
-def _create_dropmail_mailbox(
-    proxies: Any = None, thread_id: int = 0
-) -> Optional[TempMailbox]:
-    try:
-        query = """
-        mutation {
-            introduceSession {
-                id, addresses { address }
-            }
-        }
-        """
-        resp = requests.post(
-            DROPMAIL_API,
-            json={"query": query},
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json().get("data", {}).get("introduceSession", {})
-            session_id = data.get("id")
-            addrs = data.get("addresses", [])
-            if session_id and addrs:
-                email = addrs[0].get("address")
-                return TempMailbox(
-                    email=email,
-                    provider="dropmail",
-                    sid_token=session_id,
-                )
-        print(f"[线程 {thread_id}] [警告] Dropmail 邮箱初始化失败")
-        return None
-    except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 Dropmail API 出错: {e}")
-        return None
-
-
-def _create_cfmail_mailbox(
-    proxies: Any = None, thread_id: int = 0
-) -> Optional[TempMailbox]:
-    # 每次创建 cfmail 邮箱前先尝试热加载配置，这样改 JSON 后下轮可直接生效。
-    _reload_cfmail_accounts_if_needed()
-    selected_account = _select_cfmail_account(CFMAIL_PROFILE_MODE)
-    if not selected_account:
-        print(
-            f"[线程 {thread_id}] [错误] 自建邮箱配置不可用，请检查 {CFMAIL_CONFIG_PATH} 或 --cfmail-profile 参数；当前可用配置: {_cfmail_account_names()}"
-        )
-        return None
-
-    try:
-        local = f"oc{secrets.token_hex(5)}"
-        worker_domain = selected_account.worker_domain
-        resp = requests.post(
-            f"https://{worker_domain}/admin/new_address",
-            headers={
-                "x-admin-auth": selected_account.admin_password,
-                **_cfmail_headers(use_json=True),
-            },
-            json={
-                "enablePrefix": True,
-                "name": local,
-                "domain": selected_account.email_domain,
-            },
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            print(
-                f"[线程 {thread_id}] [警告] 自建邮箱[{selected_account.name}]创建失败，状态码: {resp.status_code}，响应: {resp.text[:300]}"
-            )
-            _record_cfmail_failure(
-                selected_account.name,
-                f"new_address status={resp.status_code}",
-            )
-            return None
-
-        data = resp.json()
-        email = str(data.get("address") or "").strip()
-        jwt = str(data.get("jwt") or "").strip()
-        if not email or not jwt:
-            print(f"[线程 {thread_id}] [警告] 自建邮箱[{selected_account.name}]返回数据不完整")
-            _record_cfmail_failure(selected_account.name, "new_address incomplete data")
-            return None
-
-        return TempMailbox(
-            email=email,
-            provider="cfmail",
-            token=jwt,
-            api_base=f"https://{selected_account.worker_domain}",
-            domain=selected_account.email_domain,
-            config_name=selected_account.name,
-        )
-    except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求自建邮箱[{selected_account.name}] API 出错: {e}")
-        _record_cfmail_failure(selected_account.name, f"new_address exception: {e}")
-        return None
+    return last_resp
 
 
 def get_temp_mailbox(
@@ -908,7 +227,7 @@ def get_temp_mailbox(
 ) -> Optional[TempMailbox]:
     mailbox = None
     if provider_key == "mailtm":
-        mailbox = _create_hydra_mailbox(
+        mailbox = create_hydra_mailbox(
             api_base=mailtm_base,
             provider_name="Mail.tm",
             provider_key="mailtm",
@@ -916,11 +235,11 @@ def get_temp_mailbox(
             thread_id=thread_id,
         )
     elif provider_key == "tempmaillol":
-        mailbox = _create_tempmaillol_mailbox(proxies=proxies, thread_id=thread_id)
+        mailbox = create_tempmaillol_mailbox(proxies=proxies, thread_id=thread_id)
     elif provider_key == "tempmailio":
-        mailbox = _create_tempmailio_mailbox(proxies=proxies, thread_id=thread_id)
+        mailbox = create_tempmailio_mailbox(proxies=proxies, thread_id=thread_id)
     elif provider_key == "dropmail":
-        mailbox = _create_dropmail_mailbox(proxies=proxies, thread_id=thread_id)
+        mailbox = create_dropmail_mailbox(proxies=proxies, thread_id=thread_id)
     elif provider_key == "cfmail":
         mailbox = _create_cfmail_mailbox(proxies=proxies, thread_id=thread_id)
     else:
@@ -940,189 +259,6 @@ def get_temp_mailbox(
         f"[线程 {thread_id}] [错误] 临时邮箱服务不可用或创建失败: {provider_key}"
     )
     return None
-
-
-def _normalize_message_ids(message_ids: Optional[Set[str]] = None) -> Set[str]:
-    if not message_ids:
-        return set()
-    normalized: Set[str] = set()
-    for item in message_ids:
-        value = str(item or "").strip()
-        if value:
-            normalized.add(value)
-    return normalized
-
-
-def _normalize_code_values(code_values: Optional[Set[str]] = None) -> Set[str]:
-    if not code_values:
-        return set()
-    normalized: Set[str] = set()
-    for item in code_values:
-        value = str(item or "").strip()
-        if value:
-            normalized.add(value)
-    return normalized
-
-
-def _list_hydra_message_ids(
-    *, api_base: str, token: str, proxies: Any = None
-) -> Set[str]:
-    try:
-        resp = requests.get(
-            f"{api_base}/messages",
-            headers=_mailtm_headers(token=token),
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return set()
-        data = resp.json()
-        if isinstance(data, list):
-            messages = data
-        elif isinstance(data, dict):
-            messages = data.get("hydra:member") or data.get("messages") or []
-        else:
-            messages = []
-        return _normalize_message_ids(
-            {
-                str((msg or {}).get("id") or "").strip()
-                for msg in messages
-                if isinstance(msg, dict)
-            }
-        )
-    except Exception:
-        return set()
-
-
-def _list_tempmailio_message_ids(*, email: str, proxies: Any = None) -> Set[str]:
-    try:
-        resp = requests.get(
-            f"{TEMPMAILIO_API}/{email}/messages",
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return set()
-        messages = resp.json()
-        if not isinstance(messages, list):
-            return set()
-        return _normalize_message_ids(
-            {
-                str((msg or {}).get("id") or "").strip()
-                for msg in messages
-                if isinstance(msg, dict)
-            }
-        )
-    except Exception:
-        return set()
-
-
-def _list_tempmaillol_message_ids(*, token: str, proxies: Any = None) -> Set[str]:
-    try:
-        resp = requests.get(
-            f"{TEMPMAILLOL_BASE}/inbox",
-            params={"token": token},
-            headers={"Accept": "application/json"},
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return set()
-        data = resp.json()
-        email_list = data.get("emails", []) if isinstance(data, dict) else []
-        if not isinstance(email_list, list):
-            return set()
-        return _normalize_message_ids(
-            {
-                str(
-                    (msg or {}).get("id")
-                    or (msg or {}).get("date")
-                    or ""
-                ).strip()
-                for msg in email_list
-                if isinstance(msg, dict)
-            }
-        )
-    except Exception:
-        return set()
-
-
-def _list_dropmail_message_ids(*, sid_token: str, proxies: Any = None) -> Set[str]:
-    query = """
-    query ($id: ID!) {
-        session(id: $id) {
-            mails { id }
-        }
-    }
-    """
-    try:
-        resp = requests.post(
-            DROPMAIL_API,
-            json={"query": query, "variables": {"id": sid_token}},
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return set()
-        data = resp.json().get("data", {}).get("session", {}) or {}
-        messages = data.get("mails", [])
-        if not isinstance(messages, list):
-            return set()
-        return _normalize_message_ids(
-            {
-                str((msg or {}).get("id") or "").strip()
-                for msg in messages
-                if isinstance(msg, dict)
-            }
-        )
-    except Exception:
-        return set()
-
-
-def _list_cfmail_message_ids(
-    *, api_base: str, token: str, email: str, proxies: Any = None
-) -> Set[str]:
-    api_base = str(api_base or "").strip()
-    if not api_base:
-        worker_domain = _normalize_host(CFMAIL_WORKER_DOMAIN)
-        api_base = f"https://{worker_domain}" if worker_domain else ""
-    if not api_base:
-        return set()
-
-    try:
-        resp = requests.get(
-            f"{api_base}/api/mails",
-            params={"limit": 20, "offset": 0},
-            headers=_cfmail_headers(jwt=token, use_json=True),
-            proxies=proxies,
-            impersonate="chrome",
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return set()
-        data = resp.json() if resp.content else {}
-        messages = data.get("results", []) if isinstance(data, dict) else []
-        if not isinstance(messages, list):
-            return set()
-        return _normalize_message_ids(
-            {
-                str((msg.get("id") or msg.get("createdAt") or "")).strip()
-                for msg in messages
-                if isinstance(msg, dict)
-                and (
-                    not str(msg.get("address") or "").strip()
-                    or str(msg.get("address") or "").strip().lower() == email.strip().lower()
-                )
-            }
-        )
-    except Exception:
-        return set()
-
-
 def get_mailbox_message_snapshot(
     mailbox: TempMailbox, thread_id: int, proxies: Any = None
 ) -> Set[str]:
@@ -1135,17 +271,17 @@ def get_mailbox_message_snapshot(
                 proxies=proxies,
             )
         if mailbox.provider == "mailtm":
-            return _list_hydra_message_ids(
+            return list_hydra_message_ids(
                 api_base=mailbox.api_base,
                 token=mailbox.token,
                 proxies=proxies,
             )
         if mailbox.provider == "tempmailio":
-            return _list_tempmailio_message_ids(email=mailbox.email, proxies=proxies)
+            return list_tempmailio_message_ids(email=mailbox.email, proxies=proxies)
         if mailbox.provider == "tempmaillol":
-            return _list_tempmaillol_message_ids(token=mailbox.token, proxies=proxies)
+            return list_tempmaillol_message_ids(token=mailbox.token, proxies=proxies)
         if mailbox.provider == "dropmail":
-            return _list_dropmail_message_ids(
+            return list_dropmail_message_ids(
                 sid_token=mailbox.sid_token,
                 proxies=proxies,
             )
@@ -1153,383 +289,6 @@ def get_mailbox_message_snapshot(
         print(f"[线程 {thread_id}] [警告] 获取邮箱快照失败: {exc}")
 
     return set()
-
-
-def _poll_hydra_oai_code(
-    *,
-    api_base: str,
-    token: str,
-    email: str,
-    thread_id: int,
-    proxies: Any = None,
-    skip_message_ids: Optional[Set[str]] = None,
-    skip_codes: Optional[Set[str]] = None,
-) -> str:
-    url_list = f"{api_base}/messages"
-    regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
-    ignored_codes = _normalize_code_values(skip_codes)
-
-    print(
-        f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
-    )
-
-    for _ in range(40):
-        print(".", end="", flush=True)
-        try:
-            resp = requests.get(
-                url_list,
-                headers=_mailtm_headers(token=token),
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                time.sleep(3)
-                continue
-
-            data = resp.json()
-            if isinstance(data, list):
-                messages = data
-            elif isinstance(data, dict):
-                messages = data.get("hydra:member") or data.get("messages") or []
-            else:
-                messages = []
-
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-                msg_id = str(msg.get("id") or "").strip()
-                if not msg_id or msg_id in seen_ids:
-                    continue
-                seen_ids.add(msg_id)
-
-                read_resp = requests.get(
-                    f"{api_base}/messages/{msg_id}",
-                    headers=_mailtm_headers(token=token),
-                    proxies=proxies,
-                    impersonate="chrome",
-                    timeout=15,
-                )
-                if read_resp.status_code != 200:
-                    continue
-
-                mail_data = read_resp.json()
-                sender = str(
-                    ((mail_data.get("from") or {}).get("address") or "")
-                ).lower()
-                subject = str(mail_data.get("subject") or "")
-                intro = str(mail_data.get("intro") or "")
-                text = str(mail_data.get("text") or "")
-                html = mail_data.get("html") or ""
-                if isinstance(html, list):
-                    html = "\n".join(str(x) for x in html)
-                content = "\n".join([subject, intro, text, str(html)])
-
-                if "openai" not in sender and "openai" not in content.lower():
-                    continue
-
-                m = re.search(regex, content)
-                if m:
-                    code = m.group(1)
-                    if code in ignored_codes:
-                        continue
-                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
-                    return code
-        except Exception:
-            pass
-
-        time.sleep(3)
-
-    print(
-        f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码"
-    )
-    return ""
-
-
-def _poll_tempmailio_oai_code(
-    *,
-    email: str,
-    thread_id: int,
-    proxies: Any = None,
-    skip_message_ids: Optional[Set[str]] = None,
-    skip_codes: Optional[Set[str]] = None,
-) -> str:
-    regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
-    ignored_codes = _normalize_code_values(skip_codes)
-
-    print(
-        f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
-    )
-
-    for _ in range(40):
-        print(".", end="", flush=True)
-        try:
-            resp = requests.get(
-                f"{TEMPMAILIO_API}/{email}/messages",
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                messages = resp.json()
-                for msg in messages:
-                    msg_id = msg.get("id")
-                    if not msg_id or msg_id in seen_ids:
-                        continue
-                    seen_ids.add(msg_id)
-
-                    sender = str(msg.get("from") or "").lower()
-                    subject = str(msg.get("subject") or "")
-                    body = str(msg.get("body_text") or "")
-                    content = "\n".join([subject, body])
-
-                    if "openai" not in sender and "openai" not in content.lower():
-                        continue
-
-                    m = re.search(regex, content)
-                    if m:
-                        code = m.group(1)
-                        if code in ignored_codes:
-                            continue
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
-                        return code
-        except Exception:
-            pass
-        time.sleep(3)
-
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
-    return ""
-
-
-def _poll_tempmaillol_oai_code(
-    *,
-    token: str,
-    email: str,
-    thread_id: int,
-    proxies: Any = None,
-    skip_message_ids: Optional[Set[str]] = None,
-    skip_codes: Optional[Set[str]] = None,
-) -> str:
-    regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
-    ignored_codes = _normalize_code_values(skip_codes)
-
-    print(
-        f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
-    )
-
-    for _ in range(40):
-        print(".", end="", flush=True)
-        try:
-            resp = requests.get(
-                f"{TEMPMAILLOL_BASE}/inbox",
-                params={"token": token},
-                headers={"Accept": "application/json"},
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                time.sleep(3)
-                continue
-
-            data = resp.json()
-            if data is None or (isinstance(data, dict) and not data):
-                print(f"\n[线程 {thread_id}] [警告] 邮箱已过期")
-                return ""
-
-            email_list = data.get("emails", []) if isinstance(data, dict) else []
-            if not isinstance(email_list, list):
-                time.sleep(3)
-                continue
-
-            for msg in email_list:
-                if not isinstance(msg, dict):
-                    continue
-
-                msg_id = str(msg.get("id") or msg.get("date") or "").strip()
-                if not msg_id or msg_id in seen_ids:
-                    continue
-                seen_ids.add(msg_id)
-
-                sender = str(msg.get("from") or "").lower()
-                subject = str(msg.get("subject") or "")
-                body = str(msg.get("body") or "")
-                html = str(msg.get("html") or "")
-                content = "\n".join([sender, subject, body, html])
-
-                if "openai" not in sender and "openai" not in content.lower():
-                    continue
-
-                m = re.search(regex, content)
-                if m:
-                    code = m.group(1)
-                    if code in ignored_codes:
-                        continue
-                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
-                    return code
-        except Exception:
-            pass
-
-        time.sleep(3)
-
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
-    return ""
-
-
-def _poll_dropmail_oai_code(
-    *,
-    sid_token: str,
-    email: str,
-    thread_id: int,
-    proxies: Any = None,
-    skip_message_ids: Optional[Set[str]] = None,
-    skip_codes: Optional[Set[str]] = None,
-) -> str:
-    regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
-    ignored_codes = _normalize_code_values(skip_codes)
-    query = """
-    query ($id: ID!) {
-        session(id: $id) {
-            mails { id, rawSize, text }
-        }
-    }
-    """
-
-    print(
-        f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
-    )
-
-    for _ in range(40):
-        print(".", end="", flush=True)
-        try:
-            resp = requests.post(
-                DROPMAIL_API,
-                json={"query": query, "variables": {"id": sid_token}},
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json().get("data", {}).get("session", {}) or {}
-                messages = data.get("mails", [])
-                for msg in messages:
-                    msg_id = msg.get("id")
-                    if not msg_id or msg_id in seen_ids:
-                        continue
-                    seen_ids.add(msg_id)
-
-                    text = str(msg.get("text") or "")
-                    content = text
-
-                    if "openai" not in content.lower():
-                        continue
-
-                    m = re.search(regex, content)
-                    if m:
-                        code = m.group(1)
-                        if code in ignored_codes:
-                            continue
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
-                        return code
-        except Exception:
-            pass
-        time.sleep(3)
-
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
-    return ""
-
-
-def _poll_cfmail_oai_code(
-    *,
-    api_base: str,
-    token: str,
-    email: str,
-    thread_id: int,
-    proxies: Any = None,
-    skip_message_ids: Optional[Set[str]] = None,
-    skip_codes: Optional[Set[str]] = None,
-) -> str:
-    api_base = str(api_base or "").strip()
-    if not api_base:
-        worker_domain = _normalize_host(CFMAIL_WORKER_DOMAIN)
-        api_base = f"https://{worker_domain}" if worker_domain else ""
-    if not api_base:
-        print(f"[线程 {thread_id}] [错误] 自建邮箱 api_base 为空，无法轮询邮件")
-        return ""
-    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
-    ignored_codes = _normalize_code_values(skip_codes)
-
-    print(
-        f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
-    )
-
-    for _ in range(40):
-        print(".", end="", flush=True)
-        try:
-            resp = requests.get(
-                f"{api_base}/api/mails",
-                params={"limit": 10, "offset": 0},
-                headers=_cfmail_headers(jwt=token, use_json=True),
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                time.sleep(3)
-                continue
-
-            data = resp.json() if resp.content else {}
-            messages = data.get("results", []) if isinstance(data, dict) else []
-            if not isinstance(messages, list):
-                time.sleep(3)
-                continue
-
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-
-                msg_id = str(msg.get("id") or msg.get("createdAt") or "").strip()
-                if not msg_id or msg_id in seen_ids:
-                    continue
-                seen_ids.add(msg_id)
-
-                recipient = str(msg.get("address") or "").strip().lower()
-                raw = str(msg.get("raw") or "")
-                metadata = msg.get("metadata") or {}
-                metadata_text = json.dumps(metadata, ensure_ascii=False)
-                content = "\n".join([recipient, raw, metadata_text])
-
-                if recipient and recipient != email.strip().lower():
-                    continue
-                if "openai" not in content.lower():
-                    continue
-
-                patterns = [
-                    r"Subject:\s*Your ChatGPT code is\s*(\d{6})",
-                    r"Your ChatGPT code is\s*(\d{6})",
-                    r"temporary verification code to continue:\s*(\d{6})",
-                ]
-                for pattern in patterns:
-                    m = re.search(pattern, content, re.I | re.S)
-                    if m:
-                        code = m.group(1)
-                        if code in ignored_codes:
-                            continue
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
-                        return code
-        except Exception:
-            pass
-
-        time.sleep(3)
-
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
-    return ""
-
-
 def get_oai_code(
     mailbox: TempMailbox,
     thread_id: int,
@@ -1558,7 +317,7 @@ def get_oai_code(
                 f"[线程 {thread_id}] [错误] {mailbox.provider} token 为空，无法读取邮件"
             )
             return ""
-        return _poll_hydra_oai_code(
+        return poll_hydra_oai_code(
             api_base=mailbox.api_base,
             token=mailbox.token,
             email=mailbox.email,
@@ -1568,7 +327,7 @@ def get_oai_code(
             skip_codes=skip_codes,
         )
     if mailbox.provider == "tempmailio":
-        return _poll_tempmailio_oai_code(
+        return poll_tempmailio_oai_code(
             email=mailbox.email,
             thread_id=thread_id,
             proxies=proxies,
@@ -1581,7 +340,7 @@ def get_oai_code(
                 f"[线程 {thread_id}] [错误] {mailbox.provider} token 为空，无法读取邮件"
             )
             return ""
-        return _poll_tempmaillol_oai_code(
+        return poll_tempmaillol_oai_code(
             token=mailbox.token,
             email=mailbox.email,
             thread_id=thread_id,
@@ -1593,7 +352,7 @@ def get_oai_code(
         if not mailbox.sid_token:
             print(f"[线程 {thread_id}] [错误] {mailbox.provider} 会话标识为空，无法读取邮件")
             return ""
-        return _poll_dropmail_oai_code(
+        return poll_dropmail_oai_code(
             sid_token=mailbox.sid_token,
             email=mailbox.email,
             thread_id=thread_id,
@@ -1612,941 +371,11 @@ def get_oai_code(
 # OAuth 授权与辅助函数
 # ==========================================
 
-AUTH_URL = "https://auth.openai.com/oauth/authorize"
-TOKEN_URL = "https://auth.openai.com/oauth/token"
-CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-
-DEFAULT_REDIRECT_URI = f"http://localhost:1455/auth/callback"
-DEFAULT_SCOPE = "openid email profile offline_access"
-
-
-def _b64url_no_pad(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def _sha256_b64url_no_pad(s: str) -> str:
-    return _b64url_no_pad(hashlib.sha256(s.encode("ascii")).digest())
-
-
-def _random_state(nbytes: int = 16) -> str:
-    return secrets.token_urlsafe(nbytes)
-
-
-def _pkce_verifier() -> str:
-    return secrets.token_urlsafe(64)
-
-
-def _parse_callback_url(callback_url: str) -> Dict[str, str]:
-    candidate = callback_url.strip()
-    if not candidate:
-        return {"code": "", "state": "", "error": "", "error_description": ""}
-
-    if "://" not in candidate:
-        if candidate.startswith("?"):
-            candidate = f"http://localhost{candidate}"
-        elif any(ch in candidate for ch in "/?#") or ":" in candidate:
-            candidate = f"http://{candidate}"
-        elif "=" in candidate:
-            candidate = f"http://localhost/?{candidate}"
-
-    parsed = urllib.parse.urlparse(candidate)
-    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-    fragment = urllib.parse.parse_qs(parsed.fragment, keep_blank_values=True)
-
-    for key, values in fragment.items():
-        if key not in query or not query[key] or not (query[key][0] or "").strip():
-            query[key] = values
-
-    def get1(k: str) -> str:
-        v = query.get(k, [""])
-        return (v[0] or "").strip()
-
-    code = get1("code")
-    state = get1("state")
-    error = get1("error")
-    error_description = get1("error_description")
-
-    if code and not state and "#" in code:
-        code, state = code.split("#", 1)
-
-    if not error and error_description:
-        error, error_description = error_description, ""
-
-    return {
-        "code": code,
-        "state": state,
-        "error": error,
-        "error_description": error_description,
-    }
-
-
-def _jwt_claims_no_verify(id_token: str) -> Dict[str, Any]:
-    if not id_token or id_token.count(".") < 2:
-        return {}
-    payload_b64 = id_token.split(".")[1]
-    pad = "=" * ((4 - (len(payload_b64) % 4)) % 4)
-    try:
-        payload = base64.urlsafe_b64decode((payload_b64 + pad).encode("ascii"))
-        return json.loads(payload.decode("utf-8"))
-    except Exception:
-        return {}
-
-
-def _decode_jwt_segment(seg: str) -> Dict[str, Any]:
-    raw = (seg or "").strip()
-    if not raw:
-        return {}
-    pad = "=" * ((4 - (len(raw) % 4)) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode((raw + pad).encode("ascii"))
-        return json.loads(decoded.decode("utf-8"))
-    except Exception:
-        return {}
-
-
-def _extract_workspaces_from_auth_cookie(auth_cookie: str) -> List[Dict[str, Any]]:
-    raw = str(auth_cookie or "").strip()
-    if not raw:
-        return []
-
-    candidates = [raw]
-    if "." in raw:
-        candidates.extend(part for part in raw.split(".") if part)
-
-    seen_candidates: Set[str] = set()
-    for candidate in candidates:
-        if candidate in seen_candidates:
-            continue
-        seen_candidates.add(candidate)
-
-        data = _decode_jwt_segment(candidate)
-        if not isinstance(data, dict) or not data:
-            continue
-
-        nodes = [
-            data,
-            data.get("session"),
-            data.get("user"),
-            data.get("payload"),
-            data.get("claims"),
-        ]
-        for node in nodes:
-            if not isinstance(node, dict):
-                continue
-            workspaces = node.get("workspaces") or []
-            if isinstance(workspaces, list) and workspaces:
-                return [item for item in workspaces if isinstance(item, dict)]
-
-    return []
-
-
-def _to_int(v: Any) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _generate_password(length: int = 12) -> str:
     chars = string.ascii_letters + string.digits
     return "".join(secrets.choice(chars) for _ in range(length))
-
-
-def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
-    body = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            if resp.status != 200:
-                raise RuntimeError(
-                    f"token exchange failed: {resp.status}: {raw.decode('utf-8', 'replace')}"
-                )
-            return json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        raise RuntimeError(
-            f"token exchange failed: {exc.code}: {raw.decode('utf-8', 'replace')}"
-        ) from exc
-
-
-@dataclass(frozen=True)
-class OAuthStart:
-    auth_url: str
-    state: str
-    code_verifier: str
-    redirect_uri: str
-    scope: str
-
-
-def _build_oauth_authorize_url(
-    *,
-    state: str,
-    code_verifier: str,
-    redirect_uri: str,
-    scope: str,
-    prompt: Optional[str] = "login",
-) -> str:
-    params = {
-        "client_id": CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "scope": scope,
-        "state": state,
-        "code_challenge": _sha256_b64url_no_pad(code_verifier),
-        "code_challenge_method": "S256",
-        "id_token_add_organizations": "true",
-        "codex_cli_simplified_flow": "true",
-    }
-    prompt_value = None if prompt is None else str(prompt).strip()
-    if prompt_value:
-        params["prompt"] = prompt_value
-    return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
-
-
-def _oauth_authorize_url(oauth: OAuthStart, *, prompt: Optional[str] = "login") -> str:
-    return _build_oauth_authorize_url(
-        state=oauth.state,
-        code_verifier=oauth.code_verifier,
-        redirect_uri=oauth.redirect_uri,
-        scope=oauth.scope,
-        prompt=prompt,
-    )
-
-
-def generate_oauth_url(
-    *, redirect_uri: str = DEFAULT_REDIRECT_URI, scope: str = DEFAULT_SCOPE
-) -> OAuthStart:
-    state = _random_state()
-    code_verifier = _pkce_verifier()
-    auth_url = _build_oauth_authorize_url(
-        state=state,
-        code_verifier=code_verifier,
-        redirect_uri=redirect_uri,
-        scope=scope,
-        prompt="login",
-    )
-    return OAuthStart(
-        auth_url=auth_url,
-        state=state,
-        code_verifier=code_verifier,
-        redirect_uri=redirect_uri,
-        scope=scope,
-    )
-
-
-def submit_callback_url(
-    *,
-    callback_url: str,
-    expected_state: str,
-    code_verifier: str,
-    redirect_uri: str = DEFAULT_REDIRECT_URI,
-) -> str:
-    cb = _parse_callback_url(callback_url)
-    if cb["error"]:
-        desc = cb["error_description"]
-        raise RuntimeError(f"oauth error: {cb['error']}: {desc}".strip())
-
-    if not cb["code"]:
-        raise ValueError("callback url missing ?code=")
-    if not cb["state"]:
-        raise ValueError("callback url missing ?state=")
-    if cb["state"] != expected_state:
-        raise ValueError("state mismatch")
-
-    token_resp = _post_form(
-        TOKEN_URL,
-        {
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "code": cb["code"],
-            "redirect_uri": redirect_uri,
-            "code_verifier": code_verifier,
-        },
-    )
-
-    access_token = (token_resp.get("access_token") or "").strip()
-    refresh_token = (token_resp.get("refresh_token") or "").strip()
-    id_token = (token_resp.get("id_token") or "").strip()
-    expires_in = _to_int(token_resp.get("expires_in"))
-
-    claims = _jwt_claims_no_verify(id_token)
-    email = str(claims.get("email") or "").strip()
-    auth_claims = claims.get("https://api.openai.com/auth") or {}
-    account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
-
-    now = int(time.time())
-    expired_rfc3339 = time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + max(expires_in, 0))
-    )
-    now_rfc3339 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-
-    config = {
-        "id_token": id_token,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "account_id": account_id,
-        "last_refresh": now_rfc3339,
-        "email": email,
-        "type": "codex",
-        "expired": expired_rfc3339,
-    }
-
-    return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
-
-
-def _extract_continue_url_from_response(resp: Any) -> str:
-    base_url = str(getattr(resp, "url", "") or AUTH_URL).strip() or AUTH_URL
-    headers = getattr(resp, "headers", {}) or {}
-
-    location = str(headers.get("Location") or "").strip()
-    if location:
-        return urllib.parse.urljoin(base_url, location)
-
-    try:
-        payload = resp.json() if getattr(resp, "content", b"") else {}
-    except Exception:
-        payload = {}
-
-    if isinstance(payload, dict):
-        for key in ("continue_url", "redirect_url", "next_url", "url"):
-            candidate = str(payload.get(key) or "").strip()
-            if candidate:
-                return urllib.parse.urljoin(base_url, candidate)
-
-    text = str(getattr(resp, "text", "") or "")
-    if not text:
-        return ""
-
-    json_like_match = re.search(
-        r'"(?:continue_url|redirect_url|next_url|url)"\s*:\s*"([^"]+)"', text
-    )
-    if json_like_match:
-        candidate = json_like_match.group(1).replace("\\/", "/").strip()
-        if candidate:
-            return urllib.parse.urljoin(base_url, candidate)
-
-    callback_match = re.search(
-        r"(http://localhost:1455/auth/callback[^\"'\s<>]+)", text
-    )
-    if callback_match:
-        return callback_match.group(1).strip()
-
-    return ""
-
-
-def _response_text_preview(resp: Any, limit: int = 240) -> str:
-    text = str(getattr(resp, "text", "") or "").strip()
-    if not text:
-        return ""
-    compact = re.sub(r"\s+", " ", text)
-    if len(compact) <= limit:
-        return compact
-    return compact[: limit - 3] + "..."
-
-
-def _post_email_otp_validate(
-    session: Any,
-    *,
-    code: str,
-    thread_id: int,
-    stage_label: str,
-    max_attempts: int = EMAIL_OTP_VALIDATE_MAX_ATTEMPTS,
-    retry_delay_seconds: int = EMAIL_OTP_VALIDATE_RETRY_DELAY_SECONDS,
-) -> Optional[Any]:
-    payload = json.dumps(
-        {"code": str(code or "").strip()},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    attempts = max(1, max_attempts)
-    delay_seconds = max(0, int(retry_delay_seconds))
-    last_resp = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            last_resp = session.post(
-                "https://auth.openai.com/api/accounts/email-otp/validate",
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
-                data=payload,
-            )
-        except Exception as exc:
-            if attempt < attempts:
-                print(
-                    f"[线程 {thread_id}] [警告] {stage_label}邮箱验证码校验异常，"
-                    f"第 {attempt}/{attempts} 次尝试失败: {exc}；"
-                    f"{delay_seconds} 秒后重试"
-                )
-                time.sleep(delay_seconds)
-                continue
-            print(
-                f"[线程 {thread_id}] [错误] {stage_label}邮箱验证码校验异常: {exc}"
-            )
-            return None
-
-        status_code = getattr(last_resp, "status_code", 0)
-        if status_code == 200:
-            return last_resp
-
-        if status_code in RETRYABLE_GATEWAY_STATUSES and attempt < attempts:
-            preview = _response_text_preview(last_resp)
-            print(
-                f"[线程 {thread_id}] [警告] {stage_label}邮箱验证码校验遇到网关波动，"
-                f"状态码: {status_code}，第 {attempt}/{attempts} 次尝试；"
-                f"{delay_seconds} 秒后重试。响应摘要: {preview}"
-            )
-            time.sleep(delay_seconds)
-            continue
-
-        return last_resp
-
-    return last_resp
-
-
-def _follow_oauth_redirect_chain(
-    session: Any,
-    start_url: str,
-    oauth: OAuthStart,
-    thread_id: int,
-    *,
-    max_hops: int = 8,
-) -> Optional[str]:
-    current_url = str(start_url or "").strip()
-    if not current_url:
-        return None
-
-    try:
-        for _ in range(max_hops):
-            if "code=" in current_url and "state=" in current_url:
-                return submit_callback_url(
-                    callback_url=current_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
-
-            resp = session.get(current_url, allow_redirects=False, timeout=15)
-            next_url = _extract_continue_url_from_response(resp)
-            if not next_url:
-                break
-            if "code=" in next_url and "state=" in next_url:
-                return submit_callback_url(
-                    callback_url=next_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
-            if next_url == current_url:
-                break
-            current_url = next_url
-    except Exception as exc:
-        print(
-            f"[线程 {thread_id}] [警告] 跟随 OAuth 跳转链失败: {exc}"
-        )
-
-    return None
-
-
-def _prime_oauth_session(
-    session: Any,
-    start_url: str,
-    thread_id: int,
-    *,
-    max_hops: int = 6,
-) -> Any:
-    current_url = str(start_url or "").strip()
-    last_resp = None
-    if not current_url:
-        return None
-
-    for _ in range(max_hops):
-        last_resp = session.get(current_url, timeout=15, allow_redirects=False)
-        next_url = _extract_continue_url_from_response(last_resp)
-        if not next_url:
-            return last_resp
-
-        parsed = urllib.parse.urlparse(next_url)
-        if (
-            parsed.scheme == "http"
-            and parsed.hostname in ("localhost", "127.0.0.1")
-            and "/auth/callback" in parsed.path
-        ):
-            print(
-                f"[线程 {thread_id}] [信息] OAuth 初始化已到达本地 callback 边界，停止继续自动跳转"
-            )
-            return last_resp
-
-        current_url = next_url
-
-    return last_resp
-
-
-def _request_sentinel_token(
-    *,
-    did: str,
-    proxies: Any,
-    impersonate: str,
-    thread_id: int,
-) -> str:
-    return _request_sentinel_header(
-        did=did,
-        proxies=proxies,
-        impersonate=impersonate,
-        thread_id=thread_id,
-    )
-
-
-def _sentinel_js_now_string() -> str:
-    now = datetime.now().astimezone()
-    offset = now.strftime("%z")
-    if len(offset) == 5:
-        offset = f"{offset[:3]}:{offset[3:]}"
-    return (
-        f"{SENTINEL_WEEKDAY_NAMES[now.weekday()]} "
-        f"{SENTINEL_MONTH_NAMES[now.month - 1]} "
-        f"{now.day:02d} {now.year:04d} "
-        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d} "
-        f"GMT{offset or '+00:00'}"
-    )
-
-
-def _sentinel_b64_json(value: Any) -> str:
-    raw = json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return base64.b64encode(raw).decode("ascii")
-
-
-def _sentinel_hash_hex(value: str) -> str:
-    hashed = 2166136261
-    for ch in str(value or ""):
-        hashed ^= ord(ch)
-        hashed = (hashed * 16777619) & 0xFFFFFFFF
-    hashed ^= hashed >> 16
-    hashed = (hashed * 2246822507) & 0xFFFFFFFF
-    hashed ^= hashed >> 13
-    hashed = (hashed * 3266489909) & 0xFFFFFFFF
-    hashed ^= hashed >> 16
-    return f"{hashed & 0xFFFFFFFF:08x}"
-
-
-def _sentinel_query_keys_signature() -> str:
-    return ",".join(
-        urllib.parse.parse_qs(
-            urllib.parse.urlparse(SENTINEL_FRAME_URL).query,
-            keep_blank_values=True,
-        ).keys()
-    )
-
-
-def _sentinel_random_choice(values: List[str], default: str = "") -> str:
-    if not values:
-        return default
-    return random.choice(values)
-
-
-def _build_sentinel_pow_fingerprint() -> List[Any]:
-    navigator_values = {
-        "vendor": "Google Inc.",
-        "platform": "Win32",
-        "languages": SENTINEL_DEFAULT_LANGUAGES,
-        "language": SENTINEL_DEFAULT_LANGUAGE,
-        "userAgent": SENTINEL_DEFAULT_USER_AGENT,
-        "hardwareConcurrency": str(SENTINEL_DEFAULT_HARDWARE_CONCURRENCY),
-    }
-    nav_key = _sentinel_random_choice(list(navigator_values.keys()), "userAgent")
-    script_sources = [SENTINEL_SDK_URL, SENTINEL_FRAME_URL]
-    document_keys = ["visibilityState", "readyState", "documentURI", "location"]
-    window_keys = ["location", "document", "navigator", "origin", "window"]
-    perf_now_ms = time.perf_counter() * 1000
-    time_origin_ms = int(time.time() * 1000 - perf_now_ms)
-    return [
-        SENTINEL_DEFAULT_SCREEN_SUM,
-        _sentinel_js_now_string(),
-        SENTINEL_DEFAULT_JS_HEAP_SIZE_LIMIT,
-        random.random(),
-        SENTINEL_DEFAULT_USER_AGENT,
-        _sentinel_random_choice(script_sources, SENTINEL_SDK_URL),
-        _sentinel_random_choice(script_sources, SENTINEL_SDK_URL),
-        SENTINEL_DEFAULT_LANGUAGE,
-        SENTINEL_DEFAULT_LANGUAGES,
-        random.random(),
-        (
-            f"{nav_key}{SENTINEL_MINUS_SIGN}"
-            f"{navigator_values.get(nav_key, SENTINEL_DEFAULT_USER_AGENT)}"
-        ),
-        _sentinel_random_choice(document_keys, "visibilityState"),
-        _sentinel_random_choice(window_keys, "location"),
-        perf_now_ms,
-        str(uuid.uuid4()),
-        _sentinel_query_keys_signature(),
-        SENTINEL_DEFAULT_HARDWARE_CONCURRENCY,
-        time_origin_ms,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ]
-
-
-def _solve_sentinel_pow(*, seed: str, difficulty: str, thread_id: int) -> str:
-    seed_text = str(seed or "").strip()
-    target = str(difficulty or "").strip().lower()
-    if not seed_text or not target:
-        return ""
-
-    started_at = time.perf_counter()
-    fingerprint = _build_sentinel_pow_fingerprint()
-    prefix_len = len(target)
-
-    for attempt in range(SENTINEL_POW_MAX_ATTEMPTS):
-        candidate = list(fingerprint)
-        candidate[3] = attempt
-        candidate[9] = round((time.perf_counter() - started_at) * 1000)
-        encoded = _sentinel_b64_json(candidate)
-        if _sentinel_hash_hex(seed_text + encoded)[:prefix_len] <= target:
-            elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-            print(
-                f"[线程 {thread_id}] [信息] Sentinel POW 求解成功，难度={target}，"
-                f"尝试 {attempt + 1} 次，耗时 {elapsed_ms} ms"
-            )
-            return f"{SENTINEL_POW_PREFIX}{encoded}{SENTINEL_POW_SUFFIX}"
-
-    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-    print(
-        f"[线程 {thread_id}] [错误] Sentinel POW 求解失败，难度={target}，"
-        f"已尝试 {SENTINEL_POW_MAX_ATTEMPTS} 次，耗时 {elapsed_ms} ms"
-    )
-    return ""
-
-
-def _request_sentinel_header(
-    *,
-    did: str,
-    proxies: Any,
-    impersonate: str,
-    thread_id: int,
-) -> str:
-    device_id = str(did or "").strip()
-    if not device_id:
-        print(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
-        return ""
-
-    body = json.dumps(
-        {"p": "", "id": device_id, "flow": "authorize_continue"},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    resp = requests.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        headers={
-            "origin": "https://sentinel.openai.com",
-            "referer": SENTINEL_FRAME_URL,
-            "content-type": "text/plain;charset=UTF-8",
-        },
-        data=body,
-        proxies=proxies,
-        impersonate=impersonate,
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        print(
-            f"[线程 {thread_id}] [错误] Sentinel 请求失败，状态码: {resp.status_code}"
-        )
-        return ""
-
-    try:
-        sentinel_payload = resp.json() if resp.content else {}
-    except Exception as exc:
-        print(
-            f"[线程 {thread_id}] [错误] Sentinel 响应解析失败: {exc}"
-        )
-        return ""
-
-    token = str((sentinel_payload or {}).get("token") or "").strip()
-    if not token:
-        print(f"[线程 {thread_id}] [错误] Sentinel 响应里缺少 token")
-        return ""
-
-    proof = ""
-    pow_config = (
-        sentinel_payload.get("proofofwork")
-        if isinstance(sentinel_payload, dict)
-        else {}
-    )
-    if isinstance(pow_config, dict) and pow_config.get("required"):
-        difficulty = str(pow_config.get("difficulty") or "").strip().lower()
-        print(
-            f"[线程 {thread_id}] [信息] Sentinel 要求 POW，开始求解，难度={difficulty or 'unknown'}"
-        )
-        proof = _solve_sentinel_pow(
-            seed=str(pow_config.get("seed") or ""),
-            difficulty=difficulty,
-            thread_id=thread_id,
-        )
-        if not proof:
-            return ""
-
-    return json.dumps(
-        {
-            "p": proof,
-            "t": "",
-            "c": token,
-            "id": device_id,
-            "flow": "authorize_continue",
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def _try_token_via_existing_session(
-    session: Any,
-    oauth: OAuthStart,
-    thread_id: int,
-) -> Optional[str]:
-    print(f"[线程 {thread_id}] [信息] 尝试复用当前 session 免密获取 token")
-    return _follow_oauth_redirect_chain(
-        session,
-        _oauth_authorize_url(oauth, prompt=None),
-        oauth,
-        thread_id,
-    )
-
-
-def _try_token_via_workspace_select(
-    session: Any,
-    oauth: OAuthStart,
-    auth_cookie: str,
-    thread_id: int,
-) -> Optional[str]:
-    workspaces = _extract_workspaces_from_auth_cookie(auth_cookie)
-    if not workspaces:
-        print(
-            f"[线程 {thread_id}] [警告] 授权 Cookie 存在，但暂未解析到 workspace"
-        )
-        return None
-
-    selected_workspace = workspaces[0] or {}
-    workspace_id = str(selected_workspace.get("id") or "").strip()
-    if not workspace_id:
-        print(f"[线程 {thread_id}] [警告] workspace 信息存在，但无法解析 workspace_id")
-        return None
-
-    workspace_kind = str(selected_workspace.get("kind") or "").strip() or "unknown"
-    workspace_name = str(selected_workspace.get("name") or "").strip() or "(null)"
-    print(
-        f"[线程 {thread_id}] [信息] 已解析 workspace: count={len(workspaces)}, "
-        f"id={workspace_id}, kind={workspace_kind}, name={workspace_name}"
-    )
-
-    select_resp = session.post(
-        "https://auth.openai.com/api/accounts/workspace/select",
-        headers={
-            "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            "content-type": "application/json",
-        },
-        json={"workspace_id": workspace_id},
-    )
-    if select_resp.status_code != 200:
-        print(
-            f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}"
-        )
-        return None
-
-    continue_url = _extract_continue_url_from_response(select_resp)
-    if not continue_url:
-        print(
-            f"[线程 {thread_id}] [警告] workspace/select 响应里缺少 continue_url"
-        )
-        return None
-
-    print(f"[线程 {thread_id}] [信息] 已获取 workspace，继续跟随授权跳转链")
-    return _follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
-
-
-def _try_token_via_password_login(
-    *,
-    email: str,
-    password: str,
-    mailbox: Optional[TempMailbox] = None,
-    used_codes: Optional[Set[str]] = None,
-    oauth: OAuthStart,
-    proxies: Any,
-    impersonate: str,
-    thread_id: int,
-) -> Optional[str]:
-    account = str(email or "").strip()
-    pwd = str(password or "").strip()
-    if not account or not pwd:
-        return None
-
-    print(f"[线程 {thread_id}] [信息] 当前 session 未拿到 token，尝试账号密码重新登录")
-    login_session = requests.Session(proxies=proxies, impersonate=impersonate)
-    ignored_codes = _normalize_code_values(used_codes)
-
-    try:
-        _prime_oauth_session(
-            login_session,
-            _oauth_authorize_url(oauth, prompt="login"),
-            thread_id,
-        )
-        did = login_session.cookies.get("oai-did")
-        sentinel_header = _request_sentinel_token(
-            did=did,
-            proxies=proxies,
-            impersonate=impersonate,
-            thread_id=thread_id,
-        )
-        if not sentinel_header:
-            return None
-
-        continue_resp = login_session.post(
-            "https://auth.openai.com/api/accounts/authorize/continue",
-            headers={
-                "referer": "https://auth.openai.com/sign-in",
-                "accept": "application/json",
-                "content-type": "application/json",
-                "openai-sentinel-token": sentinel_header,
-            },
-            data=json.dumps(
-                {
-                    "username": {"value": account, "kind": "email"},
-                    "screen_hint": "login",
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        )
-        if continue_resp.status_code not in (200, 204):
-            print(
-                f"[线程 {thread_id}] [警告] 账号密码登录预处理失败，状态码: {continue_resp.status_code}"
-            )
-            return None
-
-        existing_message_ids = get_mailbox_message_snapshot(mailbox, thread_id, proxies)
-        login_resp = login_session.post(
-            "https://auth.openai.com/api/accounts/password/verify",
-            headers={
-                "referer": "https://auth.openai.com/log-in/password",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-            data=json.dumps(
-                {"password": pwd},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        )
-        if login_resp.status_code != 200:
-            print(
-                f"[线程 {thread_id}] [警告] 账号密码登录失败，状态码: {login_resp.status_code}"
-            )
-            return None
-
-        try:
-            login_payload = login_resp.json() if login_resp.content else {}
-        except Exception:
-            login_payload = {}
-
-        login_page = login_payload.get("page") or {}
-        page_type = str(login_page.get("type") or "").strip()
-        continue_url = _extract_continue_url_from_response(login_resp)
-
-        if page_type == "email_otp_verification":
-            if not mailbox:
-                print(
-                    f"[线程 {thread_id}] [警告] 密码登录后需要邮箱验证码，但当前没有可用邮箱上下文"
-                )
-                return None
-
-            print(
-                f"[线程 {thread_id}] [信息] OpenAI 已自动发送登录验证码邮件，开始等待新邮件"
-            )
-            login_otp_resp = None
-            for otp_attempt in range(2):
-                login_code = get_oai_code(
-                    mailbox,
-                    thread_id,
-                    proxies,
-                    skip_message_ids=existing_message_ids,
-                    skip_codes=ignored_codes,
-                )
-                if not login_code:
-                    print(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
-                    return None
-
-                login_otp_resp = _post_email_otp_validate(
-                    login_session,
-                    code=login_code,
-                    thread_id=thread_id,
-                    stage_label="登录阶段",
-                )
-                if login_otp_resp and login_otp_resp.status_code == 200:
-                    continue_url = _extract_continue_url_from_response(login_otp_resp)
-                    break
-
-                status_code = getattr(login_otp_resp, "status_code", "unknown")
-                if status_code not in RETRYABLE_GATEWAY_STATUSES:
-                    ignored_codes.add(login_code)
-                print(
-                    f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {status_code}"
-                )
-                if status_code == 401 and otp_attempt == 0:
-                    print(f"[线程 {thread_id}] [信息] 登录验证码可能命中旧邮件，准备重新等待新验证码")
-                    time.sleep(2)
-                    continue
-                return None
-
-            if not login_otp_resp or login_otp_resp.status_code != 200:
-                return None
-
-        auth_cookie = login_session.cookies.get("oai-client-auth-session")
-        if auth_cookie:
-            token_json = _try_token_via_workspace_select(
-                login_session, oauth, auth_cookie, thread_id
-            )
-            if token_json:
-                return token_json
-
-        if continue_url:
-            token_json = _follow_oauth_redirect_chain(
-                login_session, continue_url, oauth, thread_id
-            )
-            if token_json:
-                return token_json
-
-        auth_cookie = login_session.cookies.get("oai-client-auth-session")
-        if auth_cookie:
-            token_json = _try_token_via_workspace_select(
-                login_session, oauth, auth_cookie, thread_id
-            )
-            if token_json:
-                return token_json
-
-        return _try_token_via_existing_session(login_session, oauth, thread_id)
-    except Exception as exc:
-        print(
-            f"[线程 {thread_id}] [警告] 账号密码登录兜底失败: {exc}"
-        )
-        return None
 
 
 # ==========================================
@@ -2659,16 +488,22 @@ def run(
     )
 
     oauth = generate_oauth_url()
-    url = oauth.auth_url
 
     try:
-        resp = _prime_oauth_session(s, url, thread_id)
+        signup_start_url = bootstrap_web_signup_start_url(s, thread_id)
+        if not signup_start_url:
+            return None
+
+        resp = _prime_oauth_session(s, signup_start_url, thread_id)
         did = s.cookies.get("oai-did")
         print(
             f"[线程 {thread_id}] [信息] 已获取 Device ID: {did}"
         )
 
-        signup_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"signup"}}'
+        signup_body = (
+            f'{{"username":{{"value":"{email}","kind":"email"}},'
+            f'"screen_hint":"login_or_signup"}}'
+        )
         sentinel = _request_sentinel_token(
             did=did,
             proxies=proxies,
@@ -2681,7 +516,7 @@ def run(
         signup_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
             headers={
-                "referer": "https://auth.openai.com/create-account",
+                "referer": "https://auth.openai.com/log-in-or-create-account",
                 "accept": "application/json",
                 "content-type": "application/json",
                 "openai-sentinel-token": sentinel,
@@ -2778,22 +613,25 @@ def run(
         print(
             f"[线程 {thread_id}] [信息] 本次注册资料: name={signup_profile['name']}, birthdate={signup_profile['birthdate']}"
         )
-        create_account_resp = s.post(
-            "https://auth.openai.com/api/accounts/create_account",
-            headers={
-                "referer": "https://auth.openai.com/about-you",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-            data=create_account_body,
+        create_account_resp = _post_create_account_with_retry(
+            s,
+            create_account_body=create_account_body,
+            did=did,
+            proxies=proxies,
+            impersonate=current_impersonate,
+            thread_id=thread_id,
         )
-        create_account_status = create_account_resp.status_code
+        create_account_status = getattr(create_account_resp, "status_code", 0)
         print(
             f"[线程 {thread_id}] [信息] 创建账户接口状态码: {create_account_status}"
         )
 
-        if create_account_status != 200:
-            err_msg = create_account_resp.text
+        if not create_account_resp or create_account_status != 200:
+            err_msg = (
+                _response_text_preview(create_account_resp, limit=1200)
+                if create_account_resp
+                else ""
+            )
             print(
                 f"[线程 {thread_id}] [错误] 创建账户失败: {err_msg}"
             )
@@ -2832,6 +670,8 @@ def run(
                 proxies=proxies,
                 impersonate=current_impersonate,
                 thread_id=thread_id,
+                get_oai_code_fn=get_oai_code,
+                get_mailbox_message_snapshot_fn=get_mailbox_message_snapshot,
             )
 
         if not token_json:
@@ -2869,870 +709,56 @@ def run(
         return None
 
 
-# ==========================================
-# 多线程并发执行逻辑
-# ==========================================
-
-
-def _safe_token_filename(email: str, thread_id: int) -> str:
-    raw = (email or "").strip().lower()
-    if not raw:
-        return f"unknown_{thread_id}_{int(time.time())}.json"
-
-    # 保留常见邮箱文件名字符，其他字符替换为下划线。
-    safe = re.sub(r"[^0-9a-zA-Z@._-]", "_", raw).strip("._")
-    if not safe:
-        safe = f"unknown_{thread_id}_{int(time.time())}"
-    return f"{safe}.json"
-
-
-def _build_token_output_path(token_dir: str, email: str, thread_id: int) -> str:
-    base_name = _safe_token_filename(email, thread_id)
-    return _build_unique_path(token_dir, base_name)
-
-
-def _build_unique_path(directory: str, base_name: str) -> str:
-    path = os.path.join(directory, base_name)
-    if not os.path.exists(path):
-        return path
-
-    stem, ext = os.path.splitext(base_name)
-    return os.path.join(
-        directory,
-        f"{stem}_{int(time.time())}_{random.randint(1000, 9999)}{ext}",
-    )
-
-
-def log_info(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [信息] {message}")
-
-
-def log_warn(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] {message}")
-
-
-def log_error(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [错误] {message}")
-
-
-def list_json_files(directory: str) -> List[str]:
-    if not os.path.isdir(directory):
-        return []
-
-    files = []
-    for name in os.listdir(directory):
-        path = os.path.join(directory, name)
-        if name.endswith(".json") and os.path.isfile(path):
-            files.append(path)
-    return files
-
-
-def count_json_files(directory: str) -> int:
-    return len(list_json_files(directory))
-
-
-def _token_usage_file_signature(file_path: str) -> Tuple[int, int]:
-    stat = os.stat(file_path)
-    return int(stat.st_mtime_ns), int(stat.st_size)
-
-
-def _get_cached_used_percent(
-    file_path: str,
-) -> Tuple[bool, Optional[int], Optional[Tuple[int, int]]]:
-    now = time.time()
-    try:
-        signature = _token_usage_file_signature(file_path)
-    except OSError as exc:
-        log_error(f"读取 {os.path.basename(file_path)} 失败: {exc}")
-        return True, None, None
-
-    with _token_usage_cache_lock:
-        cached = TOKEN_USAGE_CACHE.get(file_path)
-        if (
-            cached
-            and cached.get("signature") == signature
-            and now - float(cached.get("checked_at") or 0) <= TOKEN_USAGE_CACHE_TTL_SECONDS
-        ):
-            return True, cached.get("used_percent"), signature
-
-    return False, None, signature
-
-
-def _store_cached_used_percent(
-    file_path: str,
-    signature: Optional[Tuple[int, int]],
-    used_percent: Optional[int],
-) -> None:
-    if signature is None:
-        return
-
-    now = time.time()
-    with _token_usage_cache_lock:
-        TOKEN_USAGE_CACHE[file_path] = {
-            "signature": signature,
-            "used_percent": used_percent,
-            "checked_at": now,
-        }
-        if len(TOKEN_USAGE_CACHE) > 2048:
-            expire_before = now - (TOKEN_USAGE_CACHE_TTL_SECONDS * 2)
-            for cached_path, cached in list(TOKEN_USAGE_CACHE.items()):
-                if float(cached.get("checked_at") or 0) < expire_before:
-                    TOKEN_USAGE_CACHE.pop(cached_path, None)
-
-
-def _collect_used_percent_results(
-    file_paths: List[str],
-    timeout: int,
-    request_interval: int,
-    max_workers: int,
-) -> Dict[str, Optional[int]]:
-    files = [path for path in file_paths if path]
-    if not files:
-        return {}
-
-    worker_count = max(1, int(max_workers or 1))
-    results: Dict[str, Optional[int]] = {}
-
-    if worker_count == 1 or len(files) == 1:
-        for index, file_path in enumerate(files):
-            results[file_path] = get_used_percent(file_path, timeout)
-            if request_interval > 0 and index + 1 < len(files):
-                time.sleep(request_interval)
-        return results
-
-    batch_size = min(worker_count, len(files))
-    for batch_start in range(0, len(files), batch_size):
-        batch = files[batch_start : batch_start + batch_size]
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(worker_count, len(batch))
-        ) as executor:
-            future_map = {
-                executor.submit(get_used_percent, file_path, timeout): file_path
-                for file_path in batch
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                file_path = future_map[future]
-                try:
-                    results[file_path] = future.result()
-                except Exception as exc:
-                    log_error(f"文件 {os.path.basename(file_path)} 并发额度查询异常: {exc}")
-                    results[file_path] = None
-
-        if request_interval > 0 and batch_start + batch_size < len(files):
-            time.sleep(request_interval)
-
-    return results
-
-
-def get_used_percent(file_path: str, timeout: int) -> Optional[int]:
-    has_cached, cached_value, signature = _get_cached_used_percent(file_path)
-    if has_cached:
-        return cached_value
-
-    result: Optional[int] = None
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as exc:
-        log_error(f"读取 {os.path.basename(file_path)} 失败: {exc}")
-        _store_cached_used_percent(file_path, signature, None)
-        return None
-
-    access_token = str(data.get("access_token") or "").strip()
-    account_id = str(data.get("account_id") or "").strip()
-    if not access_token or not account_id:
-        log_error(f"文件 {os.path.basename(file_path)} 缺少 access_token 或 account_id")
-        _store_cached_used_percent(file_path, signature, None)
-        return None
-
-    try:
-        resp = requests.get(
-            "https://chatgpt.com/backend-api/wham/usage",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-                "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-                "Chatgpt-Account-Id": account_id,
-            },
-            impersonate="chrome",
-            timeout=timeout,
-        )
-        if resp.status_code != 200:
-            log_error(
-                f"文件 {os.path.basename(file_path)} 额度查询失败，状态码: {resp.status_code}"
-            )
-        else:
-            payload = resp.json()
-            used_percent = (
-                ((payload or {}).get("rate_limit") or {}).get("primary_window") or {}
-            ).get("used_percent")
-            if used_percent is None:
-                log_error(f"文件 {os.path.basename(file_path)} 额度结果缺少 used_percent")
-            else:
-                result = int(float(used_percent))
-    except Exception as exc:
-        log_error(f"文件 {os.path.basename(file_path)} 额度查询异常: {exc}")
-        result = None
-
-    _store_cached_used_percent(file_path, signature, result)
-    return result
-
-
-def persist_registration_result(
-    token_json: str, password: str, thread_id: int, token_dir: str
-) -> Tuple[str, str]:
-    try:
-        token_data = json.loads(token_json)
-        raw_email = str(token_data.get("email") or "unknown")
-        refresh_token = str(token_data.get("refresh_token") or "")
-    except Exception:
-        raw_email = "unknown"
-        refresh_token = ""
-
-    os.makedirs(token_dir, exist_ok=True)
-    file_name = _build_token_output_path(token_dir, raw_email, thread_id)
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(token_json)
-
-    os.makedirs("output", exist_ok=True)
-    with output_lock:
-        with open("output/accounts.txt", "a", encoding="utf-8") as f:
-            f.write(f"{raw_email}----{password}----{refresh_token}\n")
-
-    return file_name, raw_email
-
-
-def _cleanup_tokens_in_dir(
-    directory: str,
-    label: str,
-    usage_threshold: int,
-    request_interval: int,
-    curl_timeout: int,
-    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
-) -> Tuple[int, int, int]:
-    """清理指定目录中的失效 Token 文件。
-
-    :param directory: 要清理的目录路径
-    :param label: 日志标签（如 "A" 或 "B"）
-    :param usage_threshold: 已用比例阈值
-    :param request_interval: 每次请求间隔秒数
-    :param curl_timeout: 额度查询超时秒数
-    :return: (kept_count, deleted_count, check_failed)
-    """
-    deleted_count = 0
-    kept_count = 0
-    check_failed = 0
-
-    file_paths = list_json_files(directory)
-    usage_results = _collect_used_percent_results(
-        file_paths,
-        curl_timeout,
-        request_interval,
-        token_check_workers,
-    )
-
-    for file_path in file_paths:
-        used_percent = usage_results.get(file_path)
-        if used_percent is None:
-            log_warn(f"删除 {label} 中的 {os.path.basename(file_path)}，额度查询失败")
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
-            check_failed += 1
-        elif used_percent >= usage_threshold:
-            log_info(
-                f"删除 {label} 中的 {os.path.basename(file_path)}，已用比例 {used_percent}% >= {usage_threshold}%"
-            )
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
-        else:
-            kept_count += 1
-            log_info(
-                f"保留 {label} 中的 {os.path.basename(file_path)}，已用比例 {used_percent}%"
-            )
-
-    return kept_count, deleted_count, check_failed
-
-
-def cleanup_active_tokens(
-    active_dir: str,
-    usage_threshold: int,
-    request_interval: int,
-    curl_timeout: int,
-    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
-) -> Tuple[int, int, int]:
-    return _cleanup_tokens_in_dir(
-        active_dir,
-        "A",
-        usage_threshold,
-        request_interval,
-        curl_timeout,
-        token_check_workers,
-    )
-
-
-def cleanup_pool_tokens(
-    pool_dir: str,
-    usage_threshold: int,
-    request_interval: int,
-    curl_timeout: int,
-    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
-) -> Tuple[int, int, int]:
-    return _cleanup_tokens_in_dir(
-        pool_dir,
-        "B",
-        usage_threshold,
-        request_interval,
-        curl_timeout,
-        token_check_workers,
-    )
-
-
-def move_pool_tokens_to_active(
-    active_dir: str,
-    pool_dir: str,
-    active_target: int,
-    usage_threshold: int,
-    request_interval: int,
-    curl_timeout: int,
-    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
-) -> Tuple[int, int]:
-    current_active = count_json_files(active_dir)
-    needed = max(active_target - current_active, 0)
-    if needed <= 0:
-        return 0, 0
-
-    moved_count = 0
-    deleted_count = 0
-    pool_files = list_json_files(pool_dir)
-    random.shuffle(pool_files)
-    usage_results = _collect_used_percent_results(
-        pool_files,
-        curl_timeout,
-        request_interval,
-        token_check_workers,
-    )
-
-    for file_path in pool_files:
-        if moved_count >= needed:
-            break
-
-        used_percent = usage_results.get(file_path)
-        if used_percent is None:
-            log_warn(f"删除 B 中的 {os.path.basename(file_path)}，额度查询失败")
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
-        elif used_percent >= usage_threshold:
-            log_info(
-                f"删除 B 中的 {os.path.basename(file_path)}，已用比例 {used_percent}% >= {usage_threshold}%"
-            )
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
-        else:
-            destination = _build_unique_path(active_dir, os.path.basename(file_path))
-            os.replace(file_path, destination)
-            moved_count += 1
-            log_info(
-                f"从 B 补充到 A: {os.path.basename(destination)}，已补 {moved_count}/{needed}"
-            )
-
-    return moved_count, deleted_count
-
-
-def register_single_account(
+def _provider_fallback_chain(provider_key: str) -> List[str]:
+    primary = str(provider_key or "").strip().lower()
+    chain: List[str] = []
+    if primary:
+        chain.append(primary)
+    if primary == "cfmail" and DEFAULT_CFMAIL_FALLBACK_PROVIDER not in chain:
+        chain.append(DEFAULT_CFMAIL_FALLBACK_PROVIDER)
+    return chain
+
+
+def run_with_fallback(
     proxy: Optional[str],
     provider_key: str,
     thread_id: int,
     mailtm_base: str,
-    token_dir: str,
-) -> bool:
-    try:
-        result = run(proxy, provider_key, thread_id, mailtm_base)
-        if not result:
-            log_warn(f"补号任务 #{thread_id} 失败")
-            return False
+    *,
+    dingtalk_webhook: str = "",
+    dingtalk_fallback_interval_seconds: int = DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
+) -> Tuple[Optional[Tuple[str, str]], str]:
+    provider_chain = _provider_fallback_chain(provider_key)
+    last_used_provider = str(provider_key or "").strip().lower()
 
-        token_json, password = result
-        file_name, raw_email = persist_registration_result(
-            token_json, password, thread_id, token_dir
-        )
-        log_info(f"补号成功: {raw_email} -> {file_name}")
-        return True
-    except Exception as exc:
-        log_error(f"补号任务 #{thread_id} 异常: {exc}")
-        return False
-
-
-def register_accounts(
-    target_count: int,
-    proxy: Optional[str],
-    provider_key: str,
-    mailtm_base: str,
-    token_dir: str,
-    batch_size: int,
-    register_openai_concurrency: int,
-    register_start_delay_seconds: float,
-    auto_continue_non_us: bool,
-) -> int:
-    if target_count <= 0:
-        return 0
-
-    if auto_continue_non_us and builtins.yasal_bypass_ip_choice is None:
-        builtins.yasal_bypass_ip_choice = True
-
-    success_count = 0
-    attempts = 0
-    batch_size = max(1, batch_size)
-    register_openai_concurrency = max(1, register_openai_concurrency)
-    register_start_delay_seconds = max(0.0, float(register_start_delay_seconds))
-    max_attempts = max(target_count * 4, target_count + batch_size)
-
-    while success_count < target_count and attempts < max_attempts:
-        current_batch_size = min(
-            batch_size,
-            register_openai_concurrency,
-            target_count - success_count,
-            max_attempts - attempts,
-        )
-        batch_results: List[bool] = []
-        batch_results_lock = threading.Lock()
-        threads = []
-
-        for index in range(current_batch_size):
-            current_thread_id = attempts + index + 1
-
-            def _task(tid: int = current_thread_id) -> None:
-                is_success = register_single_account(
-                    proxy,
-                    provider_key,
-                    tid,
-                    mailtm_base,
-                    token_dir,
-                )
-                with batch_results_lock:
-                    batch_results.append(is_success)
-
-            thread = threading.Thread(target=_task)
-            thread.daemon = True
-            thread.start()
-            threads.append(thread)
-            if register_start_delay_seconds > 0 and index + 1 < current_batch_size:
-                time.sleep(register_start_delay_seconds)
-
-        for thread in threads:
-            thread.join()
-
-        attempts += current_batch_size
-        batch_success = sum(1 for item in batch_results if item)
-        success_count += batch_success
-        log_info(
-            f"补号批次完成：本批成功 {batch_success} 个，累计成功 {success_count}/{target_count}"
-        )
-
-        if batch_success == 0 and success_count < target_count:
-            time.sleep(10)
-
-    if success_count < target_count:
-        log_warn(f"目标补号 {target_count} 个，实际仅补充成功 {success_count} 个")
-
-    return success_count
-
-
-def build_monitor_dingtalk_message(
-    result: MonitorCycleResult,
-) -> str:
-    status_text = _monitor_status_text(
-        result.active_count,
-        result.pool_count,
-        result.active_target,
-        result.pool_target,
-    )
-    replenish_text = (
-        f"已触发，成功 {result.replenished_count}/{result.register_target}"
-        if result.attempted_replenish
-        else "未触发"
-    )
-    return (
-        "授权池巡检\n"
-        f"主机：{socket.gethostname()}\n"
-        f"时间：{result.completed_at.strftime('%m-%d %H:%M:%S')}\n"
-        f"状态：{status_text}\n"
-        f"A目录：{result.active_count}/{result.active_target}（缺 {result.active_shortage}）\n"
-        f"B目录：{result.pool_count}/{result.pool_target}（缺 {result.pool_shortage}）\n"
-        f"补号：{replenish_text}\n"
-        f"B->A：{result.moved_to_active_count}\n"
-        f"删除：A {result.active_deleted_count}，B {result.pool_deleted_count}，合计 {result.deleted_count}\n"
-        f"查询失败：A {result.active_check_failed}，B {result.pool_check_failed}"
-    )
-
-
-def _monitor_status_text(
-    active_count: int,
-    pool_count: int,
-    active_target: int,
-    pool_target: int,
-) -> str:
-    return "达标" if active_count >= active_target and pool_count >= pool_target else "未达标"
-
-
-def build_monitor_summary_message(results: List[MonitorCycleResult]) -> str:
-    if not results:
-        return ""
-
-    if len(results) == 1:
-        return build_monitor_dingtalk_message(results[0])
-
-    first_result = results[0]
-    last_result = results[-1]
-    total_replenished = sum(item.replenished_count for item in results)
-    total_register_target = sum(item.register_target for item in results if item.attempted_replenish)
-    total_deleted = sum(item.deleted_count for item in results)
-    total_active_deleted = sum(item.active_deleted_count for item in results)
-    total_pool_deleted = sum(item.pool_deleted_count for item in results)
-    total_moved_to_active = sum(item.moved_to_active_count for item in results)
-    total_active_check_failed = sum(item.active_check_failed for item in results)
-    total_pool_check_failed = sum(item.pool_check_failed for item in results)
-    replenish_rounds = sum(1 for item in results if item.attempted_replenish)
-    unmet_rounds = sum(
-        1
-        for item in results
-        if item.active_count < item.active_target or item.pool_count < item.pool_target
-    )
-    min_active = min(item.active_count for item in results)
-    min_pool = min(item.pool_count for item in results)
-    max_active = max(item.active_count for item in results)
-    max_pool = max(item.pool_count for item in results)
-    latest_status = _monitor_status_text(
-        last_result.active_count,
-        last_result.pool_count,
-        last_result.active_target,
-        last_result.pool_target,
-    )
-
-    return (
-        "授权池汇总\n"
-        f"主机：{socket.gethostname()}\n"
-        f"周期：{first_result.completed_at.strftime('%m-%d %H:%M')} ~ {last_result.completed_at.strftime('%m-%d %H:%M')}\n"
-        f"巡检轮次：{len(results)}\n"
-        f"最新状态：{latest_status}\n"
-        f"最新库存：A {last_result.active_count}/{last_result.active_target}（缺 {last_result.active_shortage}），"
-        f"B {last_result.pool_count}/{last_result.pool_target}（缺 {last_result.pool_shortage}）\n"
-        f"库存区间：A {min_active} ~ {max_active}，B {min_pool} ~ {max_pool}\n"
-        f"补号轮次：{replenish_rounds}，补号结果：成功 {total_replenished}/{total_register_target}\n"
-        f"B->A 合计：{total_moved_to_active}\n"
-        f"删除统计：A {total_active_deleted}，B {total_pool_deleted}，合计 {total_deleted}\n"
-        f"查询失败：A {total_active_check_failed}，B {total_pool_check_failed}\n"
-        f"未达标轮次：{unmet_rounds}"
-    )
- 
-
-def send_dingtalk_alert(webhook: str, message: str) -> None:
-    if not webhook:
-        return
-
-    payload = {
-        "msgtype": "text",
-        "text": {"content": f"CLI变动\n{message}"},
-    }
-    try:
-        resp = requests.post(
-            webhook,
-            json=payload,
-            impersonate="chrome",
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            log_error(f"发送钉钉提醒失败，状态码: {resp.status_code}")
-    except Exception as exc:
-        log_error(f"发送钉钉提醒异常: {exc}")
-
-
-def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
-    # 巡检模式单轮逻辑：
-    # 1. 清理 A 目录失效账号
-    # 2. 清理 B 目录失效账号
-    # 3. 尝试从 B 目录补到 A
-    # 4. 若 A/B 总量仍不足，再触发注册补号
-    os.makedirs(args.active_token_dir, exist_ok=True)
-    os.makedirs(args.token_dir, exist_ok=True)
-
-    log_info("========== 开始执行账号检测 ==========")
-    kept_count, deleted_count, check_failed = cleanup_active_tokens(
-        args.active_token_dir,
-        args.usage_threshold,
-        args.request_interval,
-        args.curl_timeout,
-        args.token_check_workers,
-    )
-    log_info(
-        f"A 清理完成：保留 {kept_count}，删除 {deleted_count}，查询失败 {check_failed}"
-    )
-
-    pool_kept_count, pool_deleted_count, pool_check_failed = cleanup_pool_tokens(
-        args.token_dir,
-        args.usage_threshold,
-        args.request_interval,
-        args.curl_timeout,
-        args.token_check_workers,
-    )
-    log_info(
-        f"B 清理完成：保留 {pool_kept_count}，删除 {pool_deleted_count}，查询失败 {pool_check_failed}"
-    )
-
-    moved_before_register, deleted_from_pool_before = move_pool_tokens_to_active(
-        args.active_token_dir,
-        args.token_dir,
-        args.active_min_count,
-        args.usage_threshold,
-        args.request_interval,
-        args.curl_timeout,
-        args.token_check_workers,
-    )
-    if moved_before_register > 0:
-        log_info(f"首次从 B 补充到 A 共 {moved_before_register} 个")
-    else:
-        log_info("首次从 B 补充到 A：本轮无需补充或 B 中无可补账号")
-
-    active_count = count_json_files(args.active_token_dir)
-    pool_count = count_json_files(args.token_dir)
-    active_shortage = max(args.active_min_count - active_count, 0)
-    pool_shortage = max(args.pool_min_count - pool_count, 0)
-    register_target = active_shortage + pool_shortage
-    log_info(
-        f"当前库存统计：A={active_count}/{args.active_min_count}（缺 {active_shortage}），"
-        f"B={pool_count}/{args.pool_min_count}（缺 {pool_shortage}）"
-    )
-    replenished_count = 0
-    replenished_to_active = 0
-    replenished_to_pool = 0
-    moved_after_register = 0
-    deleted_from_pool_after = 0
-
-    if register_target > 0:
-        log_warn(
-            f"检测到库存不足：A={active_count}/{args.active_min_count}，B={pool_count}/{args.pool_min_count}，准备补号 {register_target} 个"
-        )
-        if active_shortage > 0:
-            log_info(
-                f"A 目录存在缺口，优先直补 A：计划补 {active_shortage} 个到 {args.active_token_dir}"
-            )
-            replenished_to_active = register_accounts(
-                active_shortage,
-                args.proxy,
-                args.mail_provider,
-                args.mailtm_api_base,
-                args.active_token_dir,
-                args.register_batch_size,
-                args.register_openai_concurrency,
-                args.register_start_delay_seconds,
-                args.auto_continue_non_us,
-            )
-            replenished_count += replenished_to_active
-            log_info(
-                f"A 直补完成：计划补 {active_shortage} 个，实际成功 {replenished_to_active} 个"
-            )
-            active_count = count_json_files(args.active_token_dir)
-            pool_count = count_json_files(args.token_dir)
-
-        remaining_active_shortage = max(args.active_min_count - active_count, 0)
-        remaining_pool_shortage = max(args.pool_min_count - pool_count, 0)
-        remaining_register_target = remaining_active_shortage + remaining_pool_shortage
-        if remaining_register_target > 0:
-            log_info(
-                f"继续补充 B 目录：A 剩余缺口 {remaining_active_shortage}，"
-                f"B 剩余缺口 {remaining_pool_shortage}，计划补 {remaining_register_target} 个到 {args.token_dir}"
-            )
-            replenished_to_pool = register_accounts(
-                remaining_register_target,
-                args.proxy,
-                args.mail_provider,
-                args.mailtm_api_base,
-                args.token_dir,
-                args.register_batch_size,
-                args.register_openai_concurrency,
-                args.register_start_delay_seconds,
-                args.auto_continue_non_us,
-            )
-            replenished_count += replenished_to_pool
-
-        log_info(
-            f"注册补号完成：总计划补 {register_target} 个，"
-            f"A 直补成功 {replenished_to_active} 个，"
-            f"B 补号成功 {replenished_to_pool} 个，"
-            f"总成功 {replenished_count} 个"
-        )
-        if replenished_count > 0:
-            moved_after_register, deleted_from_pool_after = move_pool_tokens_to_active(
-                args.active_token_dir,
-                args.token_dir,
-                args.active_min_count,
-                args.usage_threshold,
-                args.request_interval,
-                args.curl_timeout,
-                args.token_check_workers,
-            )
-            if moved_after_register > 0:
-                log_info(f"补号后再次从 B 补充到 A 共 {moved_after_register} 个")
-            else:
-                log_info("补号后再次从 B 补充到 A：A 已达标或新号暂未补入 A")
-    else:
-        log_info(
-            f"A/B 均已达标：A={active_count}/{args.active_min_count}，B={pool_count}/{args.pool_min_count}，本轮不补号"
-        )
-
-    final_active_count = count_json_files(args.active_token_dir)
-    final_pool_count = count_json_files(args.token_dir)
-    final_active_shortage = max(args.active_min_count - final_active_count, 0)
-    final_pool_shortage = max(args.pool_min_count - final_pool_count, 0)
-    total_deleted_count = (
-        deleted_count
-        + pool_deleted_count
-        + deleted_from_pool_before
-        + deleted_from_pool_after
-    )
-    log_info(
-        f"本轮汇总：删 A={deleted_count}，删 B={pool_deleted_count + deleted_from_pool_before + deleted_from_pool_after}，"
-        f"B→A={moved_before_register + moved_after_register}，注册成功={replenished_count}"
-    )
-    log_info(
-        f"检测结束：A={final_active_count}/{args.active_min_count}（缺 {final_active_shortage}），"
-        f"B={final_pool_count}/{args.pool_min_count}（缺 {final_pool_shortage}），补号={replenished_count}"
-    )
-    log_info("========== 账号检测执行完成 ==========")
-    return MonitorCycleResult(
-        completed_at=datetime.now(),
-        active_count=final_active_count,
-        pool_count=final_pool_count,
-        active_target=args.active_min_count,
-        pool_target=args.pool_min_count,
-        active_shortage=final_active_shortage,
-        pool_shortage=final_pool_shortage,
-        attempted_replenish=register_target > 0,
-        register_target=register_target,
-        replenished_count=replenished_count,
-        deleted_count=total_deleted_count,
-        active_deleted_count=deleted_count,
-        pool_deleted_count=pool_deleted_count + deleted_from_pool_before + deleted_from_pool_after,
-        moved_to_active_count=moved_before_register + moved_after_register,
-        active_check_failed=check_failed,
-        pool_check_failed=pool_check_failed,
-    )
-
-
-def worker(
-    thread_id: int,
-    proxy: Optional[str],
-    once: bool,
-    sleep_min: int,
-    sleep_max: int,
-    failure_sleep_seconds: int,
-    provider_key: str,
-    mailtm_base: str,
-    token_dir: str,
-) -> None:
-    count = 0
-    while True:
-        if provider_key == "cfmail":
-            _reload_cfmail_accounts_if_needed()
-        count += 1
-        print(
-            f"\n[{datetime.now().strftime('%H:%M:%S')}] [线程 {thread_id}] [信息] 开始第 {count} 次任务（邮箱服务: {provider_key}）"
-        )
-
-        try:
-            result = run(proxy, provider_key, thread_id, mailtm_base)
-
-            is_success = False
-
-            if result:
-                token_json, password = result
-                file_name, raw_email = persist_registration_result(
-                    token_json,
-                    password,
-                    thread_id,
-                    token_dir,
-                )
-
-                print(
-                    f"[线程 {thread_id}] [成功] 账号信息已追加到 output/accounts.txt，Token 已保存到: {file_name}"
-                )
-                is_success = True
-            else:
-                print(
-                    f"[线程 {thread_id}] [失败] 本轮任务未成功"
-                )
-
-        except Exception as e:
-            print(f"[线程 {thread_id}] [错误] 发生未捕获异常: {e}")
-            print(f"[线程 {thread_id}] [错误] {traceback.format_exc()}")
-            is_success = False
-
-        if once:
-            break
-
-        wait_time = random.randint(sleep_min, sleep_max)
-        if not is_success:
+    for index, candidate_provider in enumerate(provider_chain):
+        last_used_provider = candidate_provider
+        if index > 0:
             print(
-                f"[线程 {thread_id}] [提示] 本轮失败，额外等待 {failure_sleep_seconds} 秒后重试"
+                f"[线程 {thread_id}] [信息] 主邮箱服务 {provider_chain[0]} 不可用，"
+                f"开始回退到 {candidate_provider}"
             )
-            wait_time += max(0, failure_sleep_seconds)
 
-        print(
-            f"[线程 {thread_id}] [信息] 等待 {wait_time} 秒后继续"
-        )
-        time.sleep(wait_time)
-
-
-def run_monitor_loop(args: argparse.Namespace) -> None:
-    pending_results: List[MonitorCycleResult] = []
-    summary_started_at = time.time()
-    while True:
-        if args.mail_provider == "cfmail":
-            _reload_cfmail_accounts_if_needed()
-        cycle_started_at = time.time()
-        try:
-            cycle_result = run_monitor_cycle(args)
-            pending_results.append(cycle_result)
-        except Exception as exc:
-            log_error(f"检测循环异常: {exc}")
-            cycle_result = None
-
-        should_send_summary = False
-        now_ts = time.time()
-        if pending_results:
-            if args.monitor_once:
-                should_send_summary = True
-            elif now_ts - summary_started_at >= args.dingtalk_summary_interval:
-                should_send_summary = True
-
-        if should_send_summary:
-            summary_message = build_monitor_summary_message(pending_results)
-            if summary_message:
-                send_dingtalk_alert(args.dingtalk_webhook, summary_message)
-                log_info(
-                    f"已发送钉钉汇总通知，共汇总 {len(pending_results)} 轮检测结果"
+        result = run(proxy, candidate_provider, thread_id, mailtm_base)
+        if result:
+            if index > 0:
+                print(
+                    f"[线程 {thread_id}] [信息] 已通过回退邮箱服务 {candidate_provider} 完成注册"
                 )
-            pending_results = []
-            summary_started_at = now_ts
+                alert_sent = notify_fallback_provider_usage(
+                    dingtalk_webhook,
+                    primary_provider=provider_chain[0],
+                    fallback_provider=candidate_provider,
+                    thread_id=thread_id,
+                    throttle_seconds=dingtalk_fallback_interval_seconds,
+                )
+                if dingtalk_webhook and alert_sent:
+                    print(
+                        f"[线程 {thread_id}] [信息] 已发送回退邮箱服务钉钉提醒：{provider_chain[0]} -> {candidate_provider}"
+                    )
+            return result, candidate_provider
 
-        if args.monitor_once:
-            break
-
-        elapsed_seconds = int(time.time() - cycle_started_at)
-        sleep_seconds = max(1, args.monitor_interval - elapsed_seconds)
-        log_info(f"等待 {sleep_seconds} 秒后进入下一轮检测")
-        time.sleep(sleep_seconds)
+    return None, last_used_provider
 
 
 def _load_config_file(config_path: str) -> dict:
@@ -3776,6 +802,7 @@ _CONFIG_KEY_MAP = {
     "register_start_delay_seconds": "register_start_delay_seconds",
     "dingtalk_webhook": "dingtalk_webhook",
     "dingtalk_summary_interval": "dingtalk_summary_interval",
+    "dingtalk_fallback_interval": "dingtalk_fallback_interval",
     "sleep_min": "sleep_min",
     "sleep_max": "sleep_max",
     "failure_sleep_seconds": "failure_sleep_seconds",
@@ -3847,7 +874,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--cfmail-config",
-        default=CFMAIL_CONFIG_PATH,
+        default=DEFAULT_CFMAIL_CONFIG_PATH,
         help="cfmail 邮箱配置 JSON 文件路径",
     )
     parser.add_argument(
@@ -3972,6 +999,12 @@ def main() -> None:
         help="钉钉汇总发送间隔秒数，默认 10800 秒（3 小时）",
     )
     parser.add_argument(
+        "--dingtalk-fallback-interval",
+        type=int,
+        default=DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
+        help="回退到保底邮箱服务时的钉钉提醒最小间隔秒数，默认 900 秒",
+    )
+    parser.add_argument(
         "--auto-continue-non-us",
         action="store_true",
         help="非 US 出口时自动继续，适合无人值守巡检",
@@ -4017,6 +1050,7 @@ def main() -> None:
     args.curl_timeout = max(1, args.curl_timeout)
     args.monitor_interval = max(1, args.monitor_interval)
     args.dingtalk_summary_interval = max(1, args.dingtalk_summary_interval)
+    args.dingtalk_fallback_interval = max(0, args.dingtalk_fallback_interval)
     args.register_batch_size = max(1, args.register_batch_size)
     args.register_openai_concurrency = max(1, args.register_openai_concurrency)
     args.register_start_delay_seconds = max(0.0, float(args.register_start_delay_seconds))
@@ -4063,20 +1097,16 @@ def main() -> None:
             _load_cfmail_accounts_from_file(args.cfmail_config) or DEFAULT_CFMAIL_ACCOUNTS
         )
 
-    _set_cfmail_accounts(configured_cfmail_accounts)
-    globals()["CFMAIL_PROFILE_MODE"] = args.cfmail_profile
-    globals()["CFMAIL_CONFIG_PATH"] = args.cfmail_config
-    globals()["CFMAIL_HOT_RELOAD_ENABLED"] = not has_cfmail_override
-    globals()["CFMAIL_FAIL_THRESHOLD"] = args.cfmail_fail_threshold
-    globals()["CFMAIL_COOLDOWN_SECONDS"] = args.cfmail_cooldown_seconds
-    globals()["CFMAIL_CONFIG_MTIME"] = (
-        os.path.getmtime(args.cfmail_config)
-        if os.path.exists(args.cfmail_config)
-        else None
+    configure_cfmail_runtime(
+        accounts=configured_cfmail_accounts,
+        profile_mode=args.cfmail_profile,
+        config_path=args.cfmail_config,
+        hot_reload_enabled=not has_cfmail_override,
+        fail_threshold=args.cfmail_fail_threshold,
+        cooldown_seconds=args.cfmail_cooldown_seconds,
     )
-    _prune_cfmail_failure_state()
 
-    if args.mail_provider == "cfmail" and not CFMAIL_ACCOUNTS:
+    if args.mail_provider == "cfmail" and not get_cfmail_accounts():
         parser.error(
             "未配置可用的 cfmail 邮箱，请先在 cfmail 配置文件中添加，或通过 --cfmail-worker-domain 等参数临时指定"
         )
@@ -4092,7 +1122,7 @@ def main() -> None:
 
     if args.test_cfmail:
         ok = run_cfmail_self_test(
-            CFMAIL_ACCOUNTS,
+            get_cfmail_accounts(),
             proxy=args.proxy,
             profile_name=args.cfmail_profile,
         )
@@ -4114,12 +1144,18 @@ def main() -> None:
         cfmail_desc = ""
         if args.mail_provider == "cfmail":
             cfmail_desc = (
-                f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，选择={args.cfmail_profile}"
+                f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，"
+                f"选择={args.cfmail_profile}，回退={DEFAULT_CFMAIL_FALLBACK_PROVIDER}，"
+                f"回退钉钉间隔={args.dingtalk_fallback_interval}秒"
             )
         log_info(
             f"巡检模式启动：A目录={args.active_token_dir}，B目录={args.token_dir}，A阈值={args.active_min_count}，B阈值={args.pool_min_count}，巡检间隔={args.monitor_interval}秒，额度查询并发={args.token_check_workers}，注册并发={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
         )
-        run_monitor_loop(args)
+        run_monitor_loop(
+            args,
+            run_with_fallback,
+            _reload_cfmail_accounts_if_needed,
+        )
         return
 
     if args.auto_continue_non_us:
@@ -4130,7 +1166,9 @@ def main() -> None:
     )
     if args.mail_provider == "cfmail":
         startup_message += (
-            f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，选择={args.cfmail_profile}"
+            f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，"
+            f"选择={args.cfmail_profile}，回退={DEFAULT_CFMAIL_FALLBACK_PROVIDER}，"
+            f"回退钉钉间隔={args.dingtalk_fallback_interval}秒"
         )
     print(startup_message)
 
@@ -4152,6 +1190,10 @@ def main() -> None:
                 provider_key,
                 args.mailtm_api_base,
                 args.token_dir,
+                run_with_fallback,
+                _reload_cfmail_accounts_if_needed,
+                args.dingtalk_webhook,
+                args.dingtalk_fallback_interval,
             ),
         )
         t.daemon = True
