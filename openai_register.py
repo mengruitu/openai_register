@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -87,6 +88,38 @@ DEFAULT_CFMAIL_COOLDOWN_SECONDS = 300
 DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 10
 # 请改成你的钉钉机器人地址
 DEFAULT_DINGTALK_WEBHOOK = ""
+SENTINEL_FRAME_URL = (
+    "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
+)
+SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+SENTINEL_POW_PREFIX = "gAAAAAB"
+SENTINEL_POW_SUFFIX = "~S"
+SENTINEL_POW_MAX_ATTEMPTS = 500000
+SENTINEL_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+)
+SENTINEL_DEFAULT_JS_HEAP_SIZE_LIMIT = 4294705152
+SENTINEL_DEFAULT_SCREEN_SUM = 3000
+SENTINEL_DEFAULT_LANGUAGE = "en-US"
+SENTINEL_DEFAULT_LANGUAGES = "en-US,en"
+SENTINEL_DEFAULT_HARDWARE_CONCURRENCY = 8
+SENTINEL_MINUS_SIGN = "\u2212"
+SENTINEL_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+SENTINEL_MONTH_NAMES = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
 
 
 @dataclass(frozen=True)
@@ -1992,6 +2025,150 @@ def _request_sentinel_token(
     impersonate: str,
     thread_id: int,
 ) -> str:
+    return _request_sentinel_header(
+        did=did,
+        proxies=proxies,
+        impersonate=impersonate,
+        thread_id=thread_id,
+    )
+
+
+def _sentinel_js_now_string() -> str:
+    now = datetime.now().astimezone()
+    offset = now.strftime("%z")
+    if len(offset) == 5:
+        offset = f"{offset[:3]}:{offset[3:]}"
+    return (
+        f"{SENTINEL_WEEKDAY_NAMES[now.weekday()]} "
+        f"{SENTINEL_MONTH_NAMES[now.month - 1]} "
+        f"{now.day:02d} {now.year:04d} "
+        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d} "
+        f"GMT{offset or '+00:00'}"
+    )
+
+
+def _sentinel_b64_json(value: Any) -> str:
+    raw = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _sentinel_hash_hex(value: str) -> str:
+    hashed = 2166136261
+    for ch in str(value or ""):
+        hashed ^= ord(ch)
+        hashed = (hashed * 16777619) & 0xFFFFFFFF
+    hashed ^= hashed >> 16
+    hashed = (hashed * 2246822507) & 0xFFFFFFFF
+    hashed ^= hashed >> 13
+    hashed = (hashed * 3266489909) & 0xFFFFFFFF
+    hashed ^= hashed >> 16
+    return f"{hashed & 0xFFFFFFFF:08x}"
+
+
+def _sentinel_query_keys_signature() -> str:
+    return ",".join(
+        urllib.parse.parse_qs(
+            urllib.parse.urlparse(SENTINEL_FRAME_URL).query,
+            keep_blank_values=True,
+        ).keys()
+    )
+
+
+def _sentinel_random_choice(values: List[str], default: str = "") -> str:
+    if not values:
+        return default
+    return random.choice(values)
+
+
+def _build_sentinel_pow_fingerprint() -> List[Any]:
+    navigator_values = {
+        "vendor": "Google Inc.",
+        "platform": "Win32",
+        "languages": SENTINEL_DEFAULT_LANGUAGES,
+        "language": SENTINEL_DEFAULT_LANGUAGE,
+        "userAgent": SENTINEL_DEFAULT_USER_AGENT,
+        "hardwareConcurrency": str(SENTINEL_DEFAULT_HARDWARE_CONCURRENCY),
+    }
+    nav_key = _sentinel_random_choice(list(navigator_values.keys()), "userAgent")
+    script_sources = [SENTINEL_SDK_URL, SENTINEL_FRAME_URL]
+    document_keys = ["visibilityState", "readyState", "documentURI", "location"]
+    window_keys = ["location", "document", "navigator", "origin", "window"]
+    perf_now_ms = time.perf_counter() * 1000
+    time_origin_ms = int(time.time() * 1000 - perf_now_ms)
+    return [
+        SENTINEL_DEFAULT_SCREEN_SUM,
+        _sentinel_js_now_string(),
+        SENTINEL_DEFAULT_JS_HEAP_SIZE_LIMIT,
+        random.random(),
+        SENTINEL_DEFAULT_USER_AGENT,
+        _sentinel_random_choice(script_sources, SENTINEL_SDK_URL),
+        _sentinel_random_choice(script_sources, SENTINEL_SDK_URL),
+        SENTINEL_DEFAULT_LANGUAGE,
+        SENTINEL_DEFAULT_LANGUAGES,
+        random.random(),
+        (
+            f"{nav_key}{SENTINEL_MINUS_SIGN}"
+            f"{navigator_values.get(nav_key, SENTINEL_DEFAULT_USER_AGENT)}"
+        ),
+        _sentinel_random_choice(document_keys, "visibilityState"),
+        _sentinel_random_choice(window_keys, "location"),
+        perf_now_ms,
+        str(uuid.uuid4()),
+        _sentinel_query_keys_signature(),
+        SENTINEL_DEFAULT_HARDWARE_CONCURRENCY,
+        time_origin_ms,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+
+
+def _solve_sentinel_pow(*, seed: str, difficulty: str, thread_id: int) -> str:
+    seed_text = str(seed or "").strip()
+    target = str(difficulty or "").strip().lower()
+    if not seed_text or not target:
+        return ""
+
+    started_at = time.perf_counter()
+    fingerprint = _build_sentinel_pow_fingerprint()
+    prefix_len = len(target)
+
+    for attempt in range(SENTINEL_POW_MAX_ATTEMPTS):
+        candidate = list(fingerprint)
+        candidate[3] = attempt
+        candidate[9] = round((time.perf_counter() - started_at) * 1000)
+        encoded = _sentinel_b64_json(candidate)
+        if _sentinel_hash_hex(seed_text + encoded)[:prefix_len] <= target:
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+            print(
+                f"[线程 {thread_id}] [信息] Sentinel POW 求解成功，难度={target}，"
+                f"尝试 {attempt + 1} 次，耗时 {elapsed_ms} ms"
+            )
+            return f"{SENTINEL_POW_PREFIX}{encoded}{SENTINEL_POW_SUFFIX}"
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    print(
+        f"[线程 {thread_id}] [错误] Sentinel POW 求解失败，难度={target}，"
+        f"已尝试 {SENTINEL_POW_MAX_ATTEMPTS} 次，耗时 {elapsed_ms} ms"
+    )
+    return ""
+
+
+def _request_sentinel_header(
+    *,
+    did: str,
+    proxies: Any,
+    impersonate: str,
+    thread_id: int,
+) -> str:
     device_id = str(did or "").strip()
     if not device_id:
         print(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
@@ -2006,7 +2183,7 @@ def _request_sentinel_token(
         "https://sentinel.openai.com/backend-api/sentinel/req",
         headers={
             "origin": "https://sentinel.openai.com",
-            "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+            "referer": SENTINEL_FRAME_URL,
             "content-type": "text/plain;charset=UTF-8",
         },
         data=body,
@@ -2020,10 +2197,49 @@ def _request_sentinel_token(
         )
         return ""
 
-    token = str((resp.json() or {}).get("token") or "").strip()
+    try:
+        sentinel_payload = resp.json() if resp.content else {}
+    except Exception as exc:
+        print(
+            f"[线程 {thread_id}] [错误] Sentinel 响应解析失败: {exc}"
+        )
+        return ""
+
+    token = str((sentinel_payload or {}).get("token") or "").strip()
     if not token:
         print(f"[线程 {thread_id}] [错误] Sentinel 响应里缺少 token")
-    return token
+        return ""
+
+    proof = ""
+    pow_config = (
+        sentinel_payload.get("proofofwork")
+        if isinstance(sentinel_payload, dict)
+        else {}
+    )
+    if isinstance(pow_config, dict) and pow_config.get("required"):
+        difficulty = str(pow_config.get("difficulty") or "").strip().lower()
+        print(
+            f"[线程 {thread_id}] [信息] Sentinel 要求 POW，开始求解，难度={difficulty or 'unknown'}"
+        )
+        proof = _solve_sentinel_pow(
+            seed=str(pow_config.get("seed") or ""),
+            difficulty=difficulty,
+            thread_id=thread_id,
+        )
+        if not proof:
+            return ""
+
+    return json.dumps(
+        {
+            "p": proof,
+            "t": "",
+            "c": token,
+            "id": device_id,
+            "flow": "authorize_continue",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _try_token_via_existing_session(
@@ -2053,10 +2269,18 @@ def _try_token_via_workspace_select(
         )
         return None
 
-    workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+    selected_workspace = workspaces[0] or {}
+    workspace_id = str(selected_workspace.get("id") or "").strip()
     if not workspace_id:
         print(f"[线程 {thread_id}] [警告] workspace 信息存在，但无法解析 workspace_id")
         return None
+
+    workspace_kind = str(selected_workspace.get("kind") or "").strip() or "unknown"
+    workspace_name = str(selected_workspace.get("name") or "").strip() or "(null)"
+    print(
+        f"[线程 {thread_id}] [信息] 已解析 workspace: count={len(workspaces)}, "
+        f"id={workspace_id}, kind={workspace_kind}, name={workspace_name}"
+    )
 
     select_resp = session.post(
         "https://auth.openai.com/api/accounts/workspace/select",
@@ -2110,13 +2334,13 @@ def _try_token_via_password_login(
             thread_id,
         )
         did = login_session.cookies.get("oai-did")
-        sentinel_token = _request_sentinel_token(
+        sentinel_header = _request_sentinel_token(
             did=did,
             proxies=proxies,
             impersonate=impersonate,
             thread_id=thread_id,
         )
-        if not sentinel_token:
+        if not sentinel_header:
             return None
 
         continue_resp = login_session.post(
@@ -2125,17 +2349,7 @@ def _try_token_via_password_login(
                 "referer": "https://auth.openai.com/sign-in",
                 "accept": "application/json",
                 "content-type": "application/json",
-                "openai-sentinel-token": json.dumps(
-                    {
-                        "p": "",
-                        "t": "",
-                        "c": sentinel_token,
-                        "id": did,
-                        "flow": "authorize_continue",
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
+                "openai-sentinel-token": sentinel_header,
             },
             data=json.dumps(
                 {
@@ -2188,7 +2402,9 @@ def _try_token_via_password_login(
                 )
                 return None
 
-            print(f"[线程 {thread_id}] [信息] 密码登录后需要邮箱验证码，开始读取登录验证码")
+            print(
+                f"[线程 {thread_id}] [信息] OpenAI 已自动发送登录验证码邮件，开始等待新邮件"
+            )
             login_otp_resp = None
             for otp_attempt in range(2):
                 login_code = get_oai_code(
@@ -2383,26 +2599,14 @@ def run(
         )
 
         signup_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"signup"}}'
-        sen_token = _request_sentinel_token(
+        sentinel = _request_sentinel_token(
             did=did,
             proxies=proxies,
             impersonate=current_impersonate,
             thread_id=thread_id,
         )
-        if not sen_token:
+        if not sentinel:
             return None
-
-        sentinel = json.dumps(
-            {
-                "p": "",
-                "t": "",
-                "c": sen_token,
-                "id": did,
-                "flow": "authorize_continue",
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
 
         signup_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
@@ -2430,6 +2634,9 @@ def run(
                 "username": email,
             }
         )
+        existing_signup_message_ids = get_mailbox_message_snapshot(
+            mailbox, thread_id, proxies
+        )
         register_resp = s.post(
             "https://auth.openai.com/api/accounts/user/register",
             headers={
@@ -2456,15 +2663,20 @@ def run(
             },
         )
         print(
-            f"[线程 {thread_id}] [信息] 验证码发送请求已提交，状态码: {otp_resp.status_code}"
+            f"[线程 {thread_id}] [信息] 注册阶段验证码发送请求已提交，状态码: {otp_resp.status_code}"
         )
         if otp_resp.status_code != 200:
             print(
-                f"[线程 {thread_id}] [错误] 发送验证码失败: {otp_resp.text}"
+                f"[线程 {thread_id}] [错误] 注册阶段发送验证码失败: {otp_resp.text}"
             )
             return None
 
-        code = get_oai_code(mailbox, thread_id, proxies)
+        code = get_oai_code(
+            mailbox,
+            thread_id,
+            proxies,
+            skip_message_ids=existing_signup_message_ids,
+        )
         if not code:
             _mark_cfmail_failure("email_code empty", affect_cooldown=True)
             return None
@@ -2482,6 +2694,15 @@ def run(
         print(
             f"[线程 {thread_id}] [信息] 验证码校验结果状态码: {code_resp.status_code}"
         )
+        if code_resp.status_code != 200:
+            print(
+                f"[线程 {thread_id}] [错误] 注册阶段邮箱验证码校验失败: {code_resp.text}"
+            )
+            _mark_cfmail_failure(
+                f"signup email otp validate status={code_resp.status_code}",
+                affect_cooldown=False,
+            )
+            return None
 
         signup_profile = _build_random_signup_profile()
         create_account_body = json.dumps(
@@ -2530,23 +2751,10 @@ def run(
             )
             return None
 
-        auth_cookie = s.cookies.get("oai-client-auth-session")
-        token_json = _try_token_via_existing_session(s, oauth, thread_id)
-
-        if not token_json and auth_cookie:
-            token_json = _try_token_via_workspace_select(
-                s, oauth, auth_cookie, thread_id
-            )
-        elif not auth_cookie:
-            print(f"[线程 {thread_id}] [警告] 当前会话中暂未拿到授权 Cookie")
-
-        if not token_json:
-            refreshed_auth_cookie = s.cookies.get("oai-client-auth-session")
-            if refreshed_auth_cookie and refreshed_auth_cookie != auth_cookie:
-                token_json = _try_token_via_workspace_select(
-                    s, oauth, refreshed_auth_cookie, thread_id
-                )
-
+        print(
+            f"[线程 {thread_id}] [信息] 注册流程已完成，当前会话可能跳到绑手机页，改用全新登录流程提取 token"
+        )
+        token_json = None
         if not token_json:
             token_json = _try_token_via_password_login(
                 email=email,
@@ -2558,6 +2766,21 @@ def run(
                 impersonate=current_impersonate,
                 thread_id=thread_id,
             )
+
+        if not token_json:
+            print(
+                f"[线程 {thread_id}] [警告] 新登录流程未拿到 token，尝试回退到当前注册会话"
+            )
+            auth_cookie = s.cookies.get("oai-client-auth-session")
+            if auth_cookie:
+                token_json = _try_token_via_workspace_select(
+                    s, oauth, auth_cookie, thread_id
+                )
+            else:
+                print(f"[线程 {thread_id}] [警告] 当前会话中暂未拿到授权 Cookie")
+
+        if not token_json:
+            token_json = _try_token_via_existing_session(s, oauth, thread_id)
 
         if token_json:
             _mark_cfmail_success()
