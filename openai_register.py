@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from curl_cffi import requests
@@ -128,6 +128,31 @@ class MonitorCycleResult:
     moved_to_active_count: int
     active_check_failed: int
     pool_check_failed: int
+
+
+def _random_name_part(min_length: int = 4, max_length: int = 9) -> str:
+    length = random.randint(min_length, max_length)
+    letters = string.ascii_lowercase
+    value = "".join(secrets.choice(letters) for _ in range(length))
+    return value.capitalize()
+
+
+def _random_profile_name() -> str:
+    return f"{_random_name_part()} {_random_name_part(5, 10)}"
+
+
+def _random_birthdate(start_year: int = 1990, end_year: int = 2005) -> str:
+    start_date = datetime(start_year, 1, 1)
+    end_date = datetime(end_year, 12, 31)
+    day_offset = random.randint(0, (end_date - start_date).days)
+    return (start_date + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+
+
+def _build_random_signup_profile() -> Dict[str, str]:
+    return {
+        "name": _random_profile_name(),
+        "birthdate": _random_birthdate(),
+    }
 
 
 def _load_cfmail_accounts_from_file(
@@ -2458,7 +2483,13 @@ def run(
             f"[线程 {thread_id}] [信息] 验证码校验结果状态码: {code_resp.status_code}"
         )
 
-        create_account_body = '{"name":"Neo","birthdate":"2000-02-20"}'
+        signup_profile = _build_random_signup_profile()
+        create_account_body = json.dumps(
+            signup_profile, ensure_ascii=False, separators=(",", ":")
+        )
+        print(
+            f"[线程 {thread_id}] [信息] 本次注册资料: name={signup_profile['name']}, birthdate={signup_profile['birthdate']}"
+        )
         create_account_resp = s.post(
             "https://auth.openai.com/api/accounts/create_account",
             headers={
