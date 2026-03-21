@@ -892,6 +892,17 @@ def _normalize_message_ids(message_ids: Optional[Set[str]] = None) -> Set[str]:
     return normalized
 
 
+def _normalize_code_values(code_values: Optional[Set[str]] = None) -> Set[str]:
+    if not code_values:
+        return set()
+    normalized: Set[str] = set()
+    for item in code_values:
+        value = str(item or "").strip()
+        if value:
+            normalized.add(value)
+    return normalized
+
+
 def _list_hydra_message_ids(
     *, api_base: str, token: str, proxies: Any = None
 ) -> Set[str]:
@@ -1091,10 +1102,12 @@ def _poll_hydra_oai_code(
     thread_id: int,
     proxies: Any = None,
     skip_message_ids: Optional[Set[str]] = None,
+    skip_codes: Optional[Set[str]] = None,
 ) -> str:
     url_list = f"{api_base}/messages"
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
+    ignored_codes = _normalize_code_values(skip_codes)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -1157,10 +1170,11 @@ def _poll_hydra_oai_code(
 
                 m = re.search(regex, content)
                 if m:
-                    print(
-                        f"\n[线程 {thread_id}] [信息] 已收到验证码: {m.group(1)}"
-                    )
-                    return m.group(1)
+                    code = m.group(1)
+                    if code in ignored_codes:
+                        continue
+                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                    return code
         except Exception:
             pass
 
@@ -1178,9 +1192,11 @@ def _poll_tempmailio_oai_code(
     thread_id: int,
     proxies: Any = None,
     skip_message_ids: Optional[Set[str]] = None,
+    skip_codes: Optional[Set[str]] = None,
 ) -> str:
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
+    ignored_codes = _normalize_code_values(skip_codes)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -1213,8 +1229,11 @@ def _poll_tempmailio_oai_code(
 
                     m = re.search(regex, content)
                     if m:
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {m.group(1)}")
-                        return m.group(1)
+                        code = m.group(1)
+                        if code in ignored_codes:
+                            continue
+                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                        return code
         except Exception:
             pass
         time.sleep(3)
@@ -1230,9 +1249,11 @@ def _poll_tempmaillol_oai_code(
     thread_id: int,
     proxies: Any = None,
     skip_message_ids: Optional[Set[str]] = None,
+    skip_codes: Optional[Set[str]] = None,
 ) -> str:
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
+    ignored_codes = _normalize_code_values(skip_codes)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -1283,8 +1304,11 @@ def _poll_tempmaillol_oai_code(
 
                 m = re.search(regex, content)
                 if m:
-                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {m.group(1)}")
-                    return m.group(1)
+                    code = m.group(1)
+                    if code in ignored_codes:
+                        continue
+                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                    return code
         except Exception:
             pass
 
@@ -1301,9 +1325,11 @@ def _poll_dropmail_oai_code(
     thread_id: int,
     proxies: Any = None,
     skip_message_ids: Optional[Set[str]] = None,
+    skip_codes: Optional[Set[str]] = None,
 ) -> str:
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
+    ignored_codes = _normalize_code_values(skip_codes)
     query = """
     query ($id: ID!) {
         session(id: $id) {
@@ -1343,8 +1369,11 @@ def _poll_dropmail_oai_code(
 
                     m = re.search(regex, content)
                     if m:
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {m.group(1)}")
-                        return m.group(1)
+                        code = m.group(1)
+                        if code in ignored_codes:
+                            continue
+                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                        return code
         except Exception:
             pass
         time.sleep(3)
@@ -1361,6 +1390,7 @@ def _poll_cfmail_oai_code(
     thread_id: int,
     proxies: Any = None,
     skip_message_ids: Optional[Set[str]] = None,
+    skip_codes: Optional[Set[str]] = None,
 ) -> str:
     api_base = str(api_base or "").strip()
     if not api_base:
@@ -1370,6 +1400,7 @@ def _poll_cfmail_oai_code(
         print(f"[线程 {thread_id}] [错误] 自建邮箱 api_base 为空，无法轮询邮件")
         return ""
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
+    ignored_codes = _normalize_code_values(skip_codes)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -1424,8 +1455,11 @@ def _poll_cfmail_oai_code(
                 for pattern in patterns:
                     m = re.search(pattern, content, re.I | re.S)
                     if m:
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {m.group(1)}")
-                        return m.group(1)
+                        code = m.group(1)
+                        if code in ignored_codes:
+                            continue
+                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                        return code
         except Exception:
             pass
 
@@ -1440,6 +1474,7 @@ def get_oai_code(
     thread_id: int,
     proxies: Any = None,
     skip_message_ids: Optional[Set[str]] = None,
+    skip_codes: Optional[Set[str]] = None,
 ) -> str:
     if mailbox.provider == "cfmail":
         if not mailbox.token:
@@ -1454,6 +1489,7 @@ def get_oai_code(
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
         )
     if mailbox.provider == "mailtm":
         if not mailbox.token:
@@ -1468,6 +1504,7 @@ def get_oai_code(
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
         )
     if mailbox.provider == "tempmailio":
         return _poll_tempmailio_oai_code(
@@ -1475,6 +1512,7 @@ def get_oai_code(
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
         )
     if mailbox.provider == "tempmaillol":
         if not mailbox.token:
@@ -1488,6 +1526,7 @@ def get_oai_code(
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
         )
     if mailbox.provider == "dropmail":
         if not mailbox.sid_token:
@@ -1499,6 +1538,7 @@ def get_oai_code(
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
         )
 
     print(
@@ -2023,6 +2063,7 @@ def _try_token_via_password_login(
     email: str,
     password: str,
     mailbox: Optional[TempMailbox] = None,
+    used_codes: Optional[Set[str]] = None,
     oauth: OAuthStart,
     proxies: Any,
     impersonate: str,
@@ -2035,6 +2076,7 @@ def _try_token_via_password_login(
 
     print(f"[线程 {thread_id}] [信息] 当前 session 未拿到 token，尝试账号密码重新登录")
     login_session = requests.Session(proxies=proxies, impersonate=impersonate)
+    ignored_codes = _normalize_code_values(used_codes)
 
     try:
         _prime_oauth_session(
@@ -2122,35 +2164,48 @@ def _try_token_via_password_login(
                 return None
 
             print(f"[线程 {thread_id}] [信息] 密码登录后需要邮箱验证码，开始读取登录验证码")
-            login_code = get_oai_code(
-                mailbox,
-                thread_id,
-                proxies,
-                skip_message_ids=existing_message_ids,
-            )
-            if not login_code:
-                print(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
-                return None
+            login_otp_resp = None
+            for otp_attempt in range(2):
+                login_code = get_oai_code(
+                    mailbox,
+                    thread_id,
+                    proxies,
+                    skip_message_ids=existing_message_ids,
+                    skip_codes=ignored_codes,
+                )
+                if not login_code:
+                    print(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
+                    return None
 
-            login_otp_resp = login_session.post(
-                "https://auth.openai.com/api/accounts/email-otp/validate",
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
-                data=json.dumps(
-                    {"code": login_code},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            )
-            if login_otp_resp.status_code != 200:
+                login_otp_resp = login_session.post(
+                    "https://auth.openai.com/api/accounts/email-otp/validate",
+                    headers={
+                        "referer": "https://auth.openai.com/email-verification",
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                    },
+                    data=json.dumps(
+                        {"code": login_code},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+                if login_otp_resp.status_code == 200:
+                    continue_url = _extract_continue_url_from_response(login_otp_resp)
+                    break
+
+                ignored_codes.add(login_code)
                 print(
                     f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {login_otp_resp.status_code}"
                 )
+                if login_otp_resp.status_code == 401 and otp_attempt == 0:
+                    print(f"[线程 {thread_id}] [信息] 登录验证码可能命中旧邮件，准备重新等待新验证码")
+                    time.sleep(2)
+                    continue
                 return None
-            continue_url = _extract_continue_url_from_response(login_otp_resp)
+
+            if not login_otp_resp or login_otp_resp.status_code != 200:
+                return None
 
         auth_cookie = login_session.cookies.get("oai-client-auth-session")
         if auth_cookie:
@@ -2466,6 +2521,7 @@ def run(
                 email=email,
                 password=password,
                 mailbox=mailbox,
+                used_codes={code},
                 oauth=oauth,
                 proxies=proxies,
                 impersonate=current_impersonate,
