@@ -88,6 +88,9 @@ DEFAULT_CFMAIL_COOLDOWN_SECONDS = 300
 DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 10
 # 请改成你的钉钉机器人地址
 DEFAULT_DINGTALK_WEBHOOK = ""
+RETRYABLE_GATEWAY_STATUSES = {502, 503, 504}
+EMAIL_OTP_VALIDATE_MAX_ATTEMPTS = 3
+EMAIL_OTP_VALIDATE_RETRY_DELAY_SECONDS = 2
 SENTINEL_FRAME_URL = (
     "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
 )
@@ -1940,6 +1943,78 @@ def _extract_continue_url_from_response(resp: Any) -> str:
     return ""
 
 
+def _response_text_preview(resp: Any, limit: int = 240) -> str:
+    text = str(getattr(resp, "text", "") or "").strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", " ", text)
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _post_email_otp_validate(
+    session: Any,
+    *,
+    code: str,
+    thread_id: int,
+    stage_label: str,
+    max_attempts: int = EMAIL_OTP_VALIDATE_MAX_ATTEMPTS,
+    retry_delay_seconds: int = EMAIL_OTP_VALIDATE_RETRY_DELAY_SECONDS,
+) -> Optional[Any]:
+    payload = json.dumps(
+        {"code": str(code or "").strip()},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    attempts = max(1, max_attempts)
+    delay_seconds = max(0, int(retry_delay_seconds))
+    last_resp = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            last_resp = session.post(
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                data=payload,
+            )
+        except Exception as exc:
+            if attempt < attempts:
+                print(
+                    f"[线程 {thread_id}] [警告] {stage_label}邮箱验证码校验异常，"
+                    f"第 {attempt}/{attempts} 次尝试失败: {exc}；"
+                    f"{delay_seconds} 秒后重试"
+                )
+                time.sleep(delay_seconds)
+                continue
+            print(
+                f"[线程 {thread_id}] [错误] {stage_label}邮箱验证码校验异常: {exc}"
+            )
+            return None
+
+        status_code = getattr(last_resp, "status_code", 0)
+        if status_code == 200:
+            return last_resp
+
+        if status_code in RETRYABLE_GATEWAY_STATUSES and attempt < attempts:
+            preview = _response_text_preview(last_resp)
+            print(
+                f"[线程 {thread_id}] [警告] {stage_label}邮箱验证码校验遇到网关波动，"
+                f"状态码: {status_code}，第 {attempt}/{attempts} 次尝试；"
+                f"{delay_seconds} 秒后重试。响应摘要: {preview}"
+            )
+            time.sleep(delay_seconds)
+            continue
+
+        return last_resp
+
+    return last_resp
+
+
 def _follow_oauth_redirect_chain(
     session: Any,
     start_url: str,
@@ -2418,28 +2493,23 @@ def _try_token_via_password_login(
                     print(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
                     return None
 
-                login_otp_resp = login_session.post(
-                    "https://auth.openai.com/api/accounts/email-otp/validate",
-                    headers={
-                        "referer": "https://auth.openai.com/email-verification",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                    },
-                    data=json.dumps(
-                        {"code": login_code},
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
+                login_otp_resp = _post_email_otp_validate(
+                    login_session,
+                    code=login_code,
+                    thread_id=thread_id,
+                    stage_label="登录阶段",
                 )
-                if login_otp_resp.status_code == 200:
+                if login_otp_resp and login_otp_resp.status_code == 200:
                     continue_url = _extract_continue_url_from_response(login_otp_resp)
                     break
 
-                ignored_codes.add(login_code)
+                status_code = getattr(login_otp_resp, "status_code", "unknown")
+                if status_code not in RETRYABLE_GATEWAY_STATUSES:
+                    ignored_codes.add(login_code)
                 print(
-                    f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {login_otp_resp.status_code}"
+                    f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {status_code}"
                 )
-                if login_otp_resp.status_code == 401 and otp_attempt == 0:
+                if status_code == 401 and otp_attempt == 0:
                     print(f"[线程 {thread_id}] [信息] 登录验证码可能命中旧邮件，准备重新等待新验证码")
                     time.sleep(2)
                     continue
@@ -2681,25 +2751,22 @@ def run(
             _mark_cfmail_failure("email_code empty", affect_cooldown=True)
             return None
 
-        code_body = f'{{"code":"{code}"}}'
-        code_resp = s.post(
-            "https://auth.openai.com/api/accounts/email-otp/validate",
-            headers={
-                "referer": "https://auth.openai.com/email-verification",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-            data=code_body,
+        code_resp = _post_email_otp_validate(
+            s,
+            code=code,
+            thread_id=thread_id,
+            stage_label="注册阶段",
         )
         print(
-            f"[线程 {thread_id}] [信息] 验证码校验结果状态码: {code_resp.status_code}"
+            f"[线程 {thread_id}] [信息] 验证码校验结果状态码: {getattr(code_resp, 'status_code', 'unknown')}"
         )
-        if code_resp.status_code != 200:
+        if not code_resp or code_resp.status_code != 200:
+            preview = _response_text_preview(code_resp) if code_resp else ""
             print(
-                f"[线程 {thread_id}] [错误] 注册阶段邮箱验证码校验失败: {code_resp.text}"
+                f"[线程 {thread_id}] [错误] 注册阶段邮箱验证码校验失败: {preview}"
             )
             _mark_cfmail_failure(
-                f"signup email otp validate status={code_resp.status_code}",
+                f"signup email otp validate status={getattr(code_resp, 'status_code', 'unknown')}",
                 affect_cooldown=False,
             )
             return None
@@ -3447,6 +3514,8 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
         f"B={pool_count}/{args.pool_min_count}（缺 {pool_shortage}）"
     )
     replenished_count = 0
+    replenished_to_active = 0
+    replenished_to_pool = 0
     moved_after_register = 0
     deleted_from_pool_after = 0
 
@@ -3454,19 +3523,54 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
         log_warn(
             f"检测到库存不足：A={active_count}/{args.active_min_count}，B={pool_count}/{args.pool_min_count}，准备补号 {register_target} 个"
         )
-        replenished_count = register_accounts(
-            register_target,
-            args.proxy,
-            args.mail_provider,
-            args.mailtm_api_base,
-            args.token_dir,
-            args.register_batch_size,
-            args.register_openai_concurrency,
-            args.register_start_delay_seconds,
-            args.auto_continue_non_us,
-        )
+        if active_shortage > 0:
+            log_info(
+                f"A 目录存在缺口，优先直补 A：计划补 {active_shortage} 个到 {args.active_token_dir}"
+            )
+            replenished_to_active = register_accounts(
+                active_shortage,
+                args.proxy,
+                args.mail_provider,
+                args.mailtm_api_base,
+                args.active_token_dir,
+                args.register_batch_size,
+                args.register_openai_concurrency,
+                args.register_start_delay_seconds,
+                args.auto_continue_non_us,
+            )
+            replenished_count += replenished_to_active
+            log_info(
+                f"A 直补完成：计划补 {active_shortage} 个，实际成功 {replenished_to_active} 个"
+            )
+            active_count = count_json_files(args.active_token_dir)
+            pool_count = count_json_files(args.token_dir)
+
+        remaining_active_shortage = max(args.active_min_count - active_count, 0)
+        remaining_pool_shortage = max(args.pool_min_count - pool_count, 0)
+        remaining_register_target = remaining_active_shortage + remaining_pool_shortage
+        if remaining_register_target > 0:
+            log_info(
+                f"继续补充 B 目录：A 剩余缺口 {remaining_active_shortage}，"
+                f"B 剩余缺口 {remaining_pool_shortage}，计划补 {remaining_register_target} 个到 {args.token_dir}"
+            )
+            replenished_to_pool = register_accounts(
+                remaining_register_target,
+                args.proxy,
+                args.mail_provider,
+                args.mailtm_api_base,
+                args.token_dir,
+                args.register_batch_size,
+                args.register_openai_concurrency,
+                args.register_start_delay_seconds,
+                args.auto_continue_non_us,
+            )
+            replenished_count += replenished_to_pool
+
         log_info(
-            f"注册补号完成：计划补 {register_target} 个，实际成功 {replenished_count} 个"
+            f"注册补号完成：总计划补 {register_target} 个，"
+            f"A 直补成功 {replenished_to_active} 个，"
+            f"B 补号成功 {replenished_to_pool} 个，"
+            f"总成功 {replenished_count} 个"
         )
         if replenished_count > 0:
             moved_after_register, deleted_from_pool_after = move_pool_tokens_to_active(
