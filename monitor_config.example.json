@@ -28,6 +28,8 @@
     "_section_register": "===== 注册配置 =====",
     "mail_provider": "cfmail",
     "register_batch_size": 3,
+    "register_openai_concurrency": 3,
+    "register_start_delay_seconds": 1.0,
 
     "_section_cfmail": "===== cfmail 配置 =====",
     "cfmail_profile": "auto",

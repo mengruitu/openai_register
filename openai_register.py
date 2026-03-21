@@ -80,6 +80,8 @@ DEFAULT_REQUEST_INTERVAL_SECONDS = 2
 DEFAULT_TOKEN_CHECK_WORKERS = 6
 TOKEN_USAGE_CACHE_TTL_SECONDS = 180
 DEFAULT_REGISTER_BATCH_SIZE = 3
+DEFAULT_REGISTER_OPENAI_CONCURRENCY = 3
+DEFAULT_REGISTER_START_DELAY_SECONDS = 1.0
 DEFAULT_CFMAIL_FAIL_THRESHOLD = 3
 DEFAULT_CFMAIL_COOLDOWN_SECONDS = 300
 DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 10
@@ -879,12 +881,220 @@ def get_temp_mailbox(
     return None
 
 
+def _normalize_message_ids(message_ids: Optional[Set[str]] = None) -> Set[str]:
+    if not message_ids:
+        return set()
+    normalized: Set[str] = set()
+    for item in message_ids:
+        value = str(item or "").strip()
+        if value:
+            normalized.add(value)
+    return normalized
+
+
+def _list_hydra_message_ids(
+    *, api_base: str, token: str, proxies: Any = None
+) -> Set[str]:
+    try:
+        resp = requests.get(
+            f"{api_base}/messages",
+            headers=_mailtm_headers(token=token),
+            proxies=proxies,
+            impersonate="chrome",
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return set()
+        data = resp.json()
+        if isinstance(data, list):
+            messages = data
+        elif isinstance(data, dict):
+            messages = data.get("hydra:member") or data.get("messages") or []
+        else:
+            messages = []
+        return _normalize_message_ids(
+            {
+                str((msg or {}).get("id") or "").strip()
+                for msg in messages
+                if isinstance(msg, dict)
+            }
+        )
+    except Exception:
+        return set()
+
+
+def _list_tempmailio_message_ids(*, email: str, proxies: Any = None) -> Set[str]:
+    try:
+        resp = requests.get(
+            f"{TEMPMAILIO_API}/{email}/messages",
+            proxies=proxies,
+            impersonate="chrome",
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return set()
+        messages = resp.json()
+        if not isinstance(messages, list):
+            return set()
+        return _normalize_message_ids(
+            {
+                str((msg or {}).get("id") or "").strip()
+                for msg in messages
+                if isinstance(msg, dict)
+            }
+        )
+    except Exception:
+        return set()
+
+
+def _list_tempmaillol_message_ids(*, token: str, proxies: Any = None) -> Set[str]:
+    try:
+        resp = requests.get(
+            f"{TEMPMAILLOL_BASE}/inbox",
+            params={"token": token},
+            headers={"Accept": "application/json"},
+            proxies=proxies,
+            impersonate="chrome",
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return set()
+        data = resp.json()
+        email_list = data.get("emails", []) if isinstance(data, dict) else []
+        if not isinstance(email_list, list):
+            return set()
+        return _normalize_message_ids(
+            {
+                str(
+                    (msg or {}).get("id")
+                    or (msg or {}).get("date")
+                    or ""
+                ).strip()
+                for msg in email_list
+                if isinstance(msg, dict)
+            }
+        )
+    except Exception:
+        return set()
+
+
+def _list_dropmail_message_ids(*, sid_token: str, proxies: Any = None) -> Set[str]:
+    query = """
+    query ($id: ID!) {
+        session(id: $id) {
+            mails { id }
+        }
+    }
+    """
+    try:
+        resp = requests.post(
+            DROPMAIL_API,
+            json={"query": query, "variables": {"id": sid_token}},
+            proxies=proxies,
+            impersonate="chrome",
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return set()
+        data = resp.json().get("data", {}).get("session", {}) or {}
+        messages = data.get("mails", [])
+        if not isinstance(messages, list):
+            return set()
+        return _normalize_message_ids(
+            {
+                str((msg or {}).get("id") or "").strip()
+                for msg in messages
+                if isinstance(msg, dict)
+            }
+        )
+    except Exception:
+        return set()
+
+
+def _list_cfmail_message_ids(
+    *, api_base: str, token: str, email: str, proxies: Any = None
+) -> Set[str]:
+    api_base = str(api_base or "").strip()
+    if not api_base:
+        worker_domain = _normalize_host(CFMAIL_WORKER_DOMAIN)
+        api_base = f"https://{worker_domain}" if worker_domain else ""
+    if not api_base:
+        return set()
+
+    try:
+        resp = requests.get(
+            f"{api_base}/api/mails",
+            params={"limit": 20, "offset": 0},
+            headers=_cfmail_headers(jwt=token, use_json=True),
+            proxies=proxies,
+            impersonate="chrome",
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return set()
+        data = resp.json() if resp.content else {}
+        messages = data.get("results", []) if isinstance(data, dict) else []
+        if not isinstance(messages, list):
+            return set()
+        return _normalize_message_ids(
+            {
+                str((msg.get("id") or msg.get("createdAt") or "")).strip()
+                for msg in messages
+                if isinstance(msg, dict)
+                and (
+                    not str(msg.get("address") or "").strip()
+                    or str(msg.get("address") or "").strip().lower() == email.strip().lower()
+                )
+            }
+        )
+    except Exception:
+        return set()
+
+
+def get_mailbox_message_snapshot(
+    mailbox: TempMailbox, thread_id: int, proxies: Any = None
+) -> Set[str]:
+    try:
+        if mailbox.provider == "cfmail":
+            return _list_cfmail_message_ids(
+                api_base=mailbox.api_base,
+                token=mailbox.token,
+                email=mailbox.email,
+                proxies=proxies,
+            )
+        if mailbox.provider == "mailtm":
+            return _list_hydra_message_ids(
+                api_base=mailbox.api_base,
+                token=mailbox.token,
+                proxies=proxies,
+            )
+        if mailbox.provider == "tempmailio":
+            return _list_tempmailio_message_ids(email=mailbox.email, proxies=proxies)
+        if mailbox.provider == "tempmaillol":
+            return _list_tempmaillol_message_ids(token=mailbox.token, proxies=proxies)
+        if mailbox.provider == "dropmail":
+            return _list_dropmail_message_ids(
+                sid_token=mailbox.sid_token,
+                proxies=proxies,
+            )
+    except Exception as exc:
+        print(f"[线程 {thread_id}] [警告] 获取邮箱快照失败: {exc}")
+
+    return set()
+
+
 def _poll_hydra_oai_code(
-    *, api_base: str, token: str, email: str, thread_id: int, proxies: Any = None
+    *,
+    api_base: str,
+    token: str,
+    email: str,
+    thread_id: int,
+    proxies: Any = None,
+    skip_message_ids: Optional[Set[str]] = None,
 ) -> str:
     url_list = f"{api_base}/messages"
     regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[str] = set()
+    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -963,10 +1173,14 @@ def _poll_hydra_oai_code(
 
 
 def _poll_tempmailio_oai_code(
-    *, email: str, thread_id: int, proxies: Any = None
+    *,
+    email: str,
+    thread_id: int,
+    proxies: Any = None,
+    skip_message_ids: Optional[Set[str]] = None,
 ) -> str:
     regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[str] = set()
+    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -1010,10 +1224,15 @@ def _poll_tempmailio_oai_code(
 
 
 def _poll_tempmaillol_oai_code(
-    *, token: str, email: str, thread_id: int, proxies: Any = None
+    *,
+    token: str,
+    email: str,
+    thread_id: int,
+    proxies: Any = None,
+    skip_message_ids: Optional[Set[str]] = None,
 ) -> str:
     regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[int] = set()
+    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -1048,10 +1267,10 @@ def _poll_tempmaillol_oai_code(
                 if not isinstance(msg, dict):
                     continue
 
-                msg_date = int(msg.get("date") or 0)
-                if not msg_date or msg_date in seen_ids:
+                msg_id = str(msg.get("id") or msg.get("date") or "").strip()
+                if not msg_id or msg_id in seen_ids:
                     continue
-                seen_ids.add(msg_date)
+                seen_ids.add(msg_id)
 
                 sender = str(msg.get("from") or "").lower()
                 subject = str(msg.get("subject") or "")
@@ -1076,10 +1295,15 @@ def _poll_tempmaillol_oai_code(
 
 
 def _poll_dropmail_oai_code(
-    *, sid_token: str, email: str, thread_id: int, proxies: Any = None
+    *,
+    sid_token: str,
+    email: str,
+    thread_id: int,
+    proxies: Any = None,
+    skip_message_ids: Optional[Set[str]] = None,
 ) -> str:
     regex = r"(?<!\d)(\d{6})(?!\d)"
-    seen_ids: Set[str] = set()
+    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     query = """
     query ($id: ID!) {
         session(id: $id) {
@@ -1130,7 +1354,13 @@ def _poll_dropmail_oai_code(
 
 
 def _poll_cfmail_oai_code(
-    *, api_base: str, token: str, email: str, thread_id: int, proxies: Any = None
+    *,
+    api_base: str,
+    token: str,
+    email: str,
+    thread_id: int,
+    proxies: Any = None,
+    skip_message_ids: Optional[Set[str]] = None,
 ) -> str:
     api_base = str(api_base or "").strip()
     if not api_base:
@@ -1139,7 +1369,7 @@ def _poll_cfmail_oai_code(
     if not api_base:
         print(f"[线程 {thread_id}] [错误] 自建邮箱 api_base 为空，无法轮询邮件")
         return ""
-    seen_ids: Set[str] = set()
+    seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
 
     print(
         f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True
@@ -1205,7 +1435,12 @@ def _poll_cfmail_oai_code(
     return ""
 
 
-def get_oai_code(mailbox: TempMailbox, thread_id: int, proxies: Any = None) -> str:
+def get_oai_code(
+    mailbox: TempMailbox,
+    thread_id: int,
+    proxies: Any = None,
+    skip_message_ids: Optional[Set[str]] = None,
+) -> str:
     if mailbox.provider == "cfmail":
         if not mailbox.token:
             print(
@@ -1218,6 +1453,7 @@ def get_oai_code(mailbox: TempMailbox, thread_id: int, proxies: Any = None) -> s
             email=mailbox.email,
             thread_id=thread_id,
             proxies=proxies,
+            skip_message_ids=skip_message_ids,
         )
     if mailbox.provider == "mailtm":
         if not mailbox.token:
@@ -1231,12 +1467,14 @@ def get_oai_code(mailbox: TempMailbox, thread_id: int, proxies: Any = None) -> s
             email=mailbox.email,
             thread_id=thread_id,
             proxies=proxies,
+            skip_message_ids=skip_message_ids,
         )
     if mailbox.provider == "tempmailio":
         return _poll_tempmailio_oai_code(
             email=mailbox.email,
             thread_id=thread_id,
             proxies=proxies,
+            skip_message_ids=skip_message_ids,
         )
     if mailbox.provider == "tempmaillol":
         if not mailbox.token:
@@ -1249,6 +1487,7 @@ def get_oai_code(mailbox: TempMailbox, thread_id: int, proxies: Any = None) -> s
             email=mailbox.email,
             thread_id=thread_id,
             proxies=proxies,
+            skip_message_ids=skip_message_ids,
         )
     if mailbox.provider == "dropmail":
         if not mailbox.sid_token:
@@ -1259,6 +1498,7 @@ def get_oai_code(mailbox: TempMailbox, thread_id: int, proxies: Any = None) -> s
             email=mailbox.email,
             thread_id=thread_id,
             proxies=proxies,
+            skip_message_ids=skip_message_ids,
         )
 
     print(
@@ -1845,6 +2085,7 @@ def _try_token_via_password_login(
             )
             return None
 
+        existing_message_ids = get_mailbox_message_snapshot(mailbox, thread_id, proxies)
         login_resp = login_session.post(
             "https://auth.openai.com/api/accounts/password/verify",
             headers={
@@ -1881,7 +2122,12 @@ def _try_token_via_password_login(
                 return None
 
             print(f"[线程 {thread_id}] [信息] 密码登录后需要邮箱验证码，开始读取登录验证码")
-            login_code = get_oai_code(mailbox, thread_id, proxies)
+            login_code = get_oai_code(
+                mailbox,
+                thread_id,
+                proxies,
+                skip_message_ids=existing_message_ids,
+            )
             if not login_code:
                 print(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
                 return None
@@ -2658,6 +2904,8 @@ def register_accounts(
     mailtm_base: str,
     token_dir: str,
     batch_size: int,
+    register_openai_concurrency: int,
+    register_start_delay_seconds: float,
     auto_continue_non_us: bool,
 ) -> int:
     if target_count <= 0:
@@ -2669,11 +2917,14 @@ def register_accounts(
     success_count = 0
     attempts = 0
     batch_size = max(1, batch_size)
+    register_openai_concurrency = max(1, register_openai_concurrency)
+    register_start_delay_seconds = max(0.0, float(register_start_delay_seconds))
     max_attempts = max(target_count * 4, target_count + batch_size)
 
     while success_count < target_count and attempts < max_attempts:
         current_batch_size = min(
             batch_size,
+            register_openai_concurrency,
             target_count - success_count,
             max_attempts - attempts,
         )
@@ -2699,6 +2950,8 @@ def register_accounts(
             thread.daemon = True
             thread.start()
             threads.append(thread)
+            if register_start_delay_seconds > 0 and index + 1 < current_batch_size:
+                time.sleep(register_start_delay_seconds)
 
         for thread in threads:
             thread.join()
@@ -2898,6 +3151,8 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
             args.mailtm_api_base,
             args.token_dir,
             args.register_batch_size,
+            args.register_openai_concurrency,
+            args.register_start_delay_seconds,
             args.auto_continue_non_us,
         )
         log_info(
@@ -3103,6 +3358,8 @@ _CONFIG_KEY_MAP = {
     "curl_timeout": "curl_timeout",
     "monitor_interval": "monitor_interval",
     "register_batch_size": "register_batch_size",
+    "register_openai_concurrency": "register_openai_concurrency",
+    "register_start_delay_seconds": "register_start_delay_seconds",
     "dingtalk_webhook": "dingtalk_webhook",
     "dingtalk_summary_interval": "dingtalk_summary_interval",
     "sleep_min": "sleep_min",
@@ -3278,6 +3535,18 @@ def main() -> None:
         help="巡检补号时每批并发注册数量",
     )
     parser.add_argument(
+        "--register-openai-concurrency",
+        type=int,
+        default=DEFAULT_REGISTER_OPENAI_CONCURRENCY,
+        help="注册流程最大并发数",
+    )
+    parser.add_argument(
+        "--register-start-delay-seconds",
+        type=float,
+        default=DEFAULT_REGISTER_START_DELAY_SECONDS,
+        help="启动下一个注册线程前的错峰等待秒数",
+    )
+    parser.add_argument(
         "--dingtalk-webhook",
         default=DEFAULT_DINGTALK_WEBHOOK,
         help="钉钉机器人 Webhook，留空则不发送提醒",
@@ -3335,6 +3604,8 @@ def main() -> None:
     args.monitor_interval = max(1, args.monitor_interval)
     args.dingtalk_summary_interval = max(1, args.dingtalk_summary_interval)
     args.register_batch_size = max(1, args.register_batch_size)
+    args.register_openai_concurrency = max(1, args.register_openai_concurrency)
+    args.register_start_delay_seconds = max(0.0, float(args.register_start_delay_seconds))
     args.cfmail_fail_threshold = max(1, args.cfmail_fail_threshold)
     args.cfmail_cooldown_seconds = max(0, args.cfmail_cooldown_seconds)
     args.cfmail_profile = str(args.cfmail_profile or "auto").strip() or "auto"
@@ -3432,7 +3703,7 @@ def main() -> None:
                 f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，选择={args.cfmail_profile}"
             )
         log_info(
-            f"巡检模式启动：A目录={args.active_token_dir}，B目录={args.token_dir}，A阈值={args.active_min_count}，B阈值={args.pool_min_count}，巡检间隔={args.monitor_interval}秒，额度查询并发={args.token_check_workers}，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
+            f"巡检模式启动：A目录={args.active_token_dir}，B目录={args.token_dir}，A阈值={args.active_min_count}，B阈值={args.pool_min_count}，巡检间隔={args.monitor_interval}秒，额度查询并发={args.token_check_workers}，注册并发={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
         )
         run_monitor_loop(args)
         return
@@ -3441,7 +3712,7 @@ def main() -> None:
         builtins.yasal_bypass_ip_choice = True
 
     startup_message = (
-        f"[信息] 脚本启动：3 线程并发，邮箱服务={args.mail_provider}，Token目录={args.token_dir}"
+        f"[信息] 脚本启动：注册并发上限={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，邮箱服务={args.mail_provider}，Token目录={args.token_dir}"
     )
     if args.mail_provider == "cfmail":
         startup_message += (
@@ -3449,10 +3720,11 @@ def main() -> None:
         )
     print(startup_message)
 
-    providers_list = [args.mail_provider, args.mail_provider, args.mail_provider]
+    worker_count = min(3, args.register_openai_concurrency)
+    providers_list = [args.mail_provider for _ in range(worker_count)]
     threads = []
 
-    for i in range(1, 4):
+    for i in range(1, worker_count + 1):
         provider_key = providers_list[i - 1]
         t = threading.Thread(
             target=worker,
@@ -3471,6 +3743,8 @@ def main() -> None:
         t.daemon = True
         t.start()
         threads.append(t)
+        if args.register_start_delay_seconds > 0 and i < worker_count:
+            time.sleep(args.register_start_delay_seconds)
 
     try:
         while True:

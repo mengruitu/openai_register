@@ -227,6 +227,8 @@ python /root/openai_register.py --test-cfmail --proxy http://127.0.0.1:7890
 - `--sleep-min`：注册循环最短等待秒数，默认 `10`
 - `--sleep-max`：注册循环最长等待秒数，默认 `30`
 - `--failure-sleep-seconds`：注册失败后额外等待秒数，默认 `10`
+- `--register-openai-concurrency`：注册流程最大并发数，默认 `3`
+- `--register-start-delay-seconds`：启动下一个注册线程前的错峰等待秒数，默认 `1.0`
 - `--register-only`：只执行注册逻辑，不做 A/B 巡检
 
 ### 巡检参数
@@ -361,9 +363,11 @@ python /root/openai_register.py --monitor --dingtalk-webhook ""
 行为：
 
 - 启动 3 个线程并发注册
+- 实际同时进行中的注册流程会受 `--register-openai-concurrency` 限制
+- 每个线程启动前会额外错峰等待 `--register-start-delay-seconds` 秒，避免集中撞风控
 - 每轮成功后保存 Token 和账号密码
 - 失败后会额外等待 `--failure-sleep-seconds` 秒再重试
-- 注册完成后会优先复用当前 session 获取 callback；若 Cookie 中能解析 workspace，则会继续走 workspace 选择；仍失败时再尝试账号密码重新登录兜底获取 token
+- 注册完成后会优先复用当前 session 获取 callback；若 Cookie 中能解析 workspace，则会继续走 workspace 选择；仍失败时再尝试账号密码重新登录，并且登录阶段只读取新收到的邮箱验证码来兜底获取 token
 - 若指定 `--once`，则每个线程执行一次后退出
 
 ### 10.2 巡检模式
