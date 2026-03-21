@@ -18,6 +18,7 @@
     "_section_intervals": "===== 时间间隔（秒） =====",
     "monitor_interval": 900,
     "request_interval": 2,
+    "token_check_workers": 6,
     "curl_timeout": 15,
     "dingtalk_summary_interval": 10800,
     "sleep_min": 10,

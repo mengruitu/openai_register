@@ -6,6 +6,7 @@
 import argparse
 import base64
 import builtins
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -30,7 +31,9 @@ from curl_cffi import requests
 
 # 线程锁，用于串行化输出文件写入
 output_lock = threading.Lock()
+_token_usage_cache_lock = threading.Lock()
 builtins.yasal_bypass_ip_choice = True
+TOKEN_USAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ==========================================
 # 临时邮箱 API (仅保留最坚挺的 Mail.tm)
@@ -74,6 +77,8 @@ DEFAULT_USAGE_THRESHOLD = 90
 DEFAULT_CHECK_INTERVAL_SECONDS = 900
 DEFAULT_DINGTALK_SUMMARY_INTERVAL_SECONDS = 10800
 DEFAULT_REQUEST_INTERVAL_SECONDS = 2
+DEFAULT_TOKEN_CHECK_WORKERS = 6
+TOKEN_USAGE_CACHE_TTL_SECONDS = 180
 DEFAULT_REGISTER_BATCH_SIZE = 3
 DEFAULT_CFMAIL_FAIL_THRESHOLD = 3
 DEFAULT_CFMAIL_COOLDOWN_SECONDS = 300
@@ -110,9 +115,17 @@ class MonitorCycleResult:
     pool_count: int
     active_target: int
     pool_target: int
+    active_shortage: int
+    pool_shortage: int
     attempted_replenish: bool
+    register_target: int
     replenished_count: int
     deleted_count: int
+    active_deleted_count: int
+    pool_deleted_count: int
+    moved_to_active_count: int
+    active_check_failed: int
+    pool_check_failed: int
 
 
 def _load_cfmail_accounts_from_file(
@@ -1633,6 +1646,40 @@ def _follow_oauth_redirect_chain(
     return None
 
 
+def _prime_oauth_session(
+    session: Any,
+    start_url: str,
+    thread_id: int,
+    *,
+    max_hops: int = 6,
+) -> Any:
+    current_url = str(start_url or "").strip()
+    last_resp = None
+    if not current_url:
+        return None
+
+    for _ in range(max_hops):
+        last_resp = session.get(current_url, timeout=15, allow_redirects=False)
+        next_url = _extract_continue_url_from_response(last_resp)
+        if not next_url:
+            return last_resp
+
+        parsed = urllib.parse.urlparse(next_url)
+        if (
+            parsed.scheme == "http"
+            and parsed.hostname in ("localhost", "127.0.0.1")
+            and "/auth/callback" in parsed.path
+        ):
+            print(
+                f"[线程 {thread_id}] [信息] OAuth 初始化已到达本地 callback 边界，停止继续自动跳转"
+            )
+            return last_resp
+
+        current_url = next_url
+
+    return last_resp
+
+
 def _request_sentinel_token(
     *,
     did: str,
@@ -1735,6 +1782,7 @@ def _try_token_via_password_login(
     *,
     email: str,
     password: str,
+    mailbox: Optional[TempMailbox] = None,
     oauth: OAuthStart,
     proxies: Any,
     impersonate: str,
@@ -1749,7 +1797,11 @@ def _try_token_via_password_login(
     login_session = requests.Session(proxies=proxies, impersonate=impersonate)
 
     try:
-        login_session.get(_oauth_authorize_url(oauth, prompt="login"), timeout=15)
+        _prime_oauth_session(
+            login_session,
+            _oauth_authorize_url(oauth, prompt="login"),
+            thread_id,
+        )
         did = login_session.cookies.get("oai-did")
         sentinel_token = _request_sentinel_token(
             did=did,
@@ -1794,14 +1846,14 @@ def _try_token_via_password_login(
             return None
 
         login_resp = login_session.post(
-            "https://auth.openai.com/api/accounts/user/login",
+            "https://auth.openai.com/api/accounts/password/verify",
             headers={
-                "referer": "https://auth.openai.com/sign-in/password",
+                "referer": "https://auth.openai.com/log-in/password",
                 "accept": "application/json",
                 "content-type": "application/json",
             },
             data=json.dumps(
-                {"username": account, "password": pwd},
+                {"password": pwd},
                 ensure_ascii=False,
                 separators=(",", ":"),
             ),
@@ -1812,7 +1864,56 @@ def _try_token_via_password_login(
             )
             return None
 
+        try:
+            login_payload = login_resp.json() if login_resp.content else {}
+        except Exception:
+            login_payload = {}
+
+        login_page = login_payload.get("page") or {}
+        page_type = str(login_page.get("type") or "").strip()
         continue_url = _extract_continue_url_from_response(login_resp)
+
+        if page_type == "email_otp_verification":
+            if not mailbox:
+                print(
+                    f"[线程 {thread_id}] [警告] 密码登录后需要邮箱验证码，但当前没有可用邮箱上下文"
+                )
+                return None
+
+            print(f"[线程 {thread_id}] [信息] 密码登录后需要邮箱验证码，开始读取登录验证码")
+            login_code = get_oai_code(mailbox, thread_id, proxies)
+            if not login_code:
+                print(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
+                return None
+
+            login_otp_resp = login_session.post(
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                data=json.dumps(
+                    {"code": login_code},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            if login_otp_resp.status_code != 200:
+                print(
+                    f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {login_otp_resp.status_code}"
+                )
+                return None
+            continue_url = _extract_continue_url_from_response(login_otp_resp)
+
+        auth_cookie = login_session.cookies.get("oai-client-auth-session")
+        if auth_cookie:
+            token_json = _try_token_via_workspace_select(
+                login_session, oauth, auth_cookie, thread_id
+            )
+            if token_json:
+                return token_json
+
         if continue_url:
             token_json = _follow_oauth_redirect_chain(
                 login_session, continue_url, oauth, thread_id
@@ -1949,7 +2050,7 @@ def run(
     url = oauth.auth_url
 
     try:
-        resp = s.get(url, timeout=15)
+        resp = _prime_oauth_session(s, url, thread_id)
         did = s.cookies.get("oai-did")
         print(
             f"[线程 {thread_id}] [信息] 已获取 Device ID: {did}"
@@ -2118,6 +2219,7 @@ def run(
             token_json = _try_token_via_password_login(
                 email=email,
                 password=password,
+                mailbox=mailbox,
                 oauth=oauth,
                 proxies=proxies,
                 impersonate=current_impersonate,
@@ -2206,18 +2308,118 @@ def count_json_files(directory: str) -> int:
     return len(list_json_files(directory))
 
 
+def _token_usage_file_signature(file_path: str) -> Tuple[int, int]:
+    stat = os.stat(file_path)
+    return int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _get_cached_used_percent(
+    file_path: str,
+) -> Tuple[bool, Optional[int], Optional[Tuple[int, int]]]:
+    now = time.time()
+    try:
+        signature = _token_usage_file_signature(file_path)
+    except OSError as exc:
+        log_error(f"读取 {os.path.basename(file_path)} 失败: {exc}")
+        return True, None, None
+
+    with _token_usage_cache_lock:
+        cached = TOKEN_USAGE_CACHE.get(file_path)
+        if (
+            cached
+            and cached.get("signature") == signature
+            and now - float(cached.get("checked_at") or 0) <= TOKEN_USAGE_CACHE_TTL_SECONDS
+        ):
+            return True, cached.get("used_percent"), signature
+
+    return False, None, signature
+
+
+def _store_cached_used_percent(
+    file_path: str,
+    signature: Optional[Tuple[int, int]],
+    used_percent: Optional[int],
+) -> None:
+    if signature is None:
+        return
+
+    now = time.time()
+    with _token_usage_cache_lock:
+        TOKEN_USAGE_CACHE[file_path] = {
+            "signature": signature,
+            "used_percent": used_percent,
+            "checked_at": now,
+        }
+        if len(TOKEN_USAGE_CACHE) > 2048:
+            expire_before = now - (TOKEN_USAGE_CACHE_TTL_SECONDS * 2)
+            for cached_path, cached in list(TOKEN_USAGE_CACHE.items()):
+                if float(cached.get("checked_at") or 0) < expire_before:
+                    TOKEN_USAGE_CACHE.pop(cached_path, None)
+
+
+def _collect_used_percent_results(
+    file_paths: List[str],
+    timeout: int,
+    request_interval: int,
+    max_workers: int,
+) -> Dict[str, Optional[int]]:
+    files = [path for path in file_paths if path]
+    if not files:
+        return {}
+
+    worker_count = max(1, int(max_workers or 1))
+    results: Dict[str, Optional[int]] = {}
+
+    if worker_count == 1 or len(files) == 1:
+        for index, file_path in enumerate(files):
+            results[file_path] = get_used_percent(file_path, timeout)
+            if request_interval > 0 and index + 1 < len(files):
+                time.sleep(request_interval)
+        return results
+
+    batch_size = min(worker_count, len(files))
+    for batch_start in range(0, len(files), batch_size):
+        batch = files[batch_start : batch_start + batch_size]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(worker_count, len(batch))
+        ) as executor:
+            future_map = {
+                executor.submit(get_used_percent, file_path, timeout): file_path
+                for file_path in batch
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                file_path = future_map[future]
+                try:
+                    results[file_path] = future.result()
+                except Exception as exc:
+                    log_error(f"文件 {os.path.basename(file_path)} 并发额度查询异常: {exc}")
+                    results[file_path] = None
+
+        if request_interval > 0 and batch_start + batch_size < len(files):
+            time.sleep(request_interval)
+
+    return results
+
+
 def get_used_percent(file_path: str, timeout: int) -> Optional[int]:
+    has_cached, cached_value, signature = _get_cached_used_percent(file_path)
+    if has_cached:
+        return cached_value
+
+    result: Optional[int] = None
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as exc:
         log_error(f"读取 {os.path.basename(file_path)} 失败: {exc}")
+        _store_cached_used_percent(file_path, signature, None)
         return None
 
     access_token = str(data.get("access_token") or "").strip()
     account_id = str(data.get("account_id") or "").strip()
     if not access_token or not account_id:
         log_error(f"文件 {os.path.basename(file_path)} 缺少 access_token 或 account_id")
+        _store_cached_used_percent(file_path, signature, None)
         return None
 
     try:
@@ -2236,20 +2438,21 @@ def get_used_percent(file_path: str, timeout: int) -> Optional[int]:
             log_error(
                 f"文件 {os.path.basename(file_path)} 额度查询失败，状态码: {resp.status_code}"
             )
-            return None
-
-        payload = resp.json()
-        used_percent = (
-            ((payload or {}).get("rate_limit") or {}).get("primary_window") or {}
-        ).get("used_percent")
-        if used_percent is None:
-            log_error(f"文件 {os.path.basename(file_path)} 额度结果缺少 used_percent")
-            return None
-
-        return int(float(used_percent))
+        else:
+            payload = resp.json()
+            used_percent = (
+                ((payload or {}).get("rate_limit") or {}).get("primary_window") or {}
+            ).get("used_percent")
+            if used_percent is None:
+                log_error(f"文件 {os.path.basename(file_path)} 额度结果缺少 used_percent")
+            else:
+                result = int(float(used_percent))
     except Exception as exc:
         log_error(f"文件 {os.path.basename(file_path)} 额度查询异常: {exc}")
-        return None
+        result = None
+
+    _store_cached_used_percent(file_path, signature, result)
+    return result
 
 
 def persist_registration_result(
@@ -2282,6 +2485,7 @@ def _cleanup_tokens_in_dir(
     usage_threshold: int,
     request_interval: int,
     curl_timeout: int,
+    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
 ) -> Tuple[int, int, int]:
     """清理指定目录中的失效 Token 文件。
 
@@ -2296,8 +2500,16 @@ def _cleanup_tokens_in_dir(
     kept_count = 0
     check_failed = 0
 
-    for file_path in list_json_files(directory):
-        used_percent = get_used_percent(file_path, curl_timeout)
+    file_paths = list_json_files(directory)
+    usage_results = _collect_used_percent_results(
+        file_paths,
+        curl_timeout,
+        request_interval,
+        token_check_workers,
+    )
+
+    for file_path in file_paths:
+        used_percent = usage_results.get(file_path)
         if used_percent is None:
             log_warn(f"删除 {label} 中的 {os.path.basename(file_path)}，额度查询失败")
             try:
@@ -2321,9 +2533,6 @@ def _cleanup_tokens_in_dir(
                 f"保留 {label} 中的 {os.path.basename(file_path)}，已用比例 {used_percent}%"
             )
 
-        if request_interval > 0:
-            time.sleep(request_interval)
-
     return kept_count, deleted_count, check_failed
 
 
@@ -2332,8 +2541,16 @@ def cleanup_active_tokens(
     usage_threshold: int,
     request_interval: int,
     curl_timeout: int,
+    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
 ) -> Tuple[int, int, int]:
-    return _cleanup_tokens_in_dir(active_dir, "A", usage_threshold, request_interval, curl_timeout)
+    return _cleanup_tokens_in_dir(
+        active_dir,
+        "A",
+        usage_threshold,
+        request_interval,
+        curl_timeout,
+        token_check_workers,
+    )
 
 
 def cleanup_pool_tokens(
@@ -2341,8 +2558,16 @@ def cleanup_pool_tokens(
     usage_threshold: int,
     request_interval: int,
     curl_timeout: int,
+    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
 ) -> Tuple[int, int, int]:
-    return _cleanup_tokens_in_dir(pool_dir, "B", usage_threshold, request_interval, curl_timeout)
+    return _cleanup_tokens_in_dir(
+        pool_dir,
+        "B",
+        usage_threshold,
+        request_interval,
+        curl_timeout,
+        token_check_workers,
+    )
 
 
 def move_pool_tokens_to_active(
@@ -2352,6 +2577,7 @@ def move_pool_tokens_to_active(
     usage_threshold: int,
     request_interval: int,
     curl_timeout: int,
+    token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
 ) -> Tuple[int, int]:
     current_active = count_json_files(active_dir)
     needed = max(active_target - current_active, 0)
@@ -2362,12 +2588,18 @@ def move_pool_tokens_to_active(
     deleted_count = 0
     pool_files = list_json_files(pool_dir)
     random.shuffle(pool_files)
+    usage_results = _collect_used_percent_results(
+        pool_files,
+        curl_timeout,
+        request_interval,
+        token_check_workers,
+    )
 
     for file_path in pool_files:
         if moved_count >= needed:
             break
 
-        used_percent = get_used_percent(file_path, curl_timeout)
+        used_percent = usage_results.get(file_path)
         if used_percent is None:
             log_warn(f"删除 B 中的 {os.path.basename(file_path)}，额度查询失败")
             try:
@@ -2391,9 +2623,6 @@ def move_pool_tokens_to_active(
             log_info(
                 f"从 B 补充到 A: {os.path.basename(destination)}，已补 {moved_count}/{needed}"
             )
-
-        if request_interval > 0:
-            time.sleep(request_interval)
 
     return moved_count, deleted_count
 
@@ -2491,37 +2720,59 @@ def register_accounts(
 
 
 def build_monitor_dingtalk_message(
+    result: MonitorCycleResult,
+) -> str:
+    status_text = _monitor_status_text(
+        result.active_count,
+        result.pool_count,
+        result.active_target,
+        result.pool_target,
+    )
+    replenish_text = (
+        f"已触发，成功 {result.replenished_count}/{result.register_target}"
+        if result.attempted_replenish
+        else "未触发"
+    )
+    return (
+        "授权池巡检\n"
+        f"主机：{socket.gethostname()}\n"
+        f"时间：{result.completed_at.strftime('%m-%d %H:%M:%S')}\n"
+        f"状态：{status_text}\n"
+        f"A目录：{result.active_count}/{result.active_target}（缺 {result.active_shortage}）\n"
+        f"B目录：{result.pool_count}/{result.pool_target}（缺 {result.pool_shortage}）\n"
+        f"补号：{replenish_text}\n"
+        f"B->A：{result.moved_to_active_count}\n"
+        f"删除：A {result.active_deleted_count}，B {result.pool_deleted_count}，合计 {result.deleted_count}\n"
+        f"查询失败：A {result.active_check_failed}，B {result.pool_check_failed}"
+    )
+
+
+def _monitor_status_text(
     active_count: int,
     pool_count: int,
     active_target: int,
     pool_target: int,
-    attempted_replenish: bool,
-    replenished_count: int,
-    deleted_count: int,
 ) -> str:
-    status_text = "达标" if active_count >= active_target and pool_count >= pool_target else "未达标"
-    replenish_text = "是" if attempted_replenish else "否"
-    return (
-        "授权文件告警\n"
-        f"正在使用：{active_count}\n"
-        f"库存剩余：{pool_count}\n"
-        f"是否补充账号：{replenish_text}\n"
-        f"补充了几个：{replenished_count}\n"
-        f"删除授权文件：{deleted_count}\n"
-        f"正在使用目标：{active_target}\n"
-        f"库存目标：{pool_target}\n"
-        f"当前状态：{status_text}"
-    )
+    return "达标" if active_count >= active_target and pool_count >= pool_target else "未达标"
 
 
 def build_monitor_summary_message(results: List[MonitorCycleResult]) -> str:
     if not results:
         return ""
 
+    if len(results) == 1:
+        return build_monitor_dingtalk_message(results[0])
+
     first_result = results[0]
     last_result = results[-1]
     total_replenished = sum(item.replenished_count for item in results)
+    total_register_target = sum(item.register_target for item in results if item.attempted_replenish)
     total_deleted = sum(item.deleted_count for item in results)
+    total_active_deleted = sum(item.active_deleted_count for item in results)
+    total_pool_deleted = sum(item.pool_deleted_count for item in results)
+    total_moved_to_active = sum(item.moved_to_active_count for item in results)
+    total_active_check_failed = sum(item.active_check_failed for item in results)
+    total_pool_check_failed = sum(item.pool_check_failed for item in results)
     replenish_rounds = sum(1 for item in results if item.attempted_replenish)
     unmet_rounds = sum(
         1
@@ -2532,20 +2783,27 @@ def build_monitor_summary_message(results: List[MonitorCycleResult]) -> str:
     min_pool = min(item.pool_count for item in results)
     max_active = max(item.active_count for item in results)
     max_pool = max(item.pool_count for item in results)
+    latest_status = _monitor_status_text(
+        last_result.active_count,
+        last_result.pool_count,
+        last_result.active_target,
+        last_result.pool_target,
+    )
 
     return (
-        "授权文件汇总\n"
-        f"统计周期：{first_result.completed_at.strftime('%m-%d %H:%M')} ~ {last_result.completed_at.strftime('%m-%d %H:%M')}\n"
-        f"巡检次数：{len(results)}\n"
-        f"触发补号：{replenish_rounds} 次\n"
-        f"补充总数：{total_replenished}\n"
-        f"删除授权文件：{total_deleted}\n"
-        f"未达标轮次：{unmet_rounds}\n"
-        f"A目录区间：{min_active} ~ {max_active}\n"
-        f"B目录区间：{min_pool} ~ {max_pool}\n"
-        f"最新A目录：{last_result.active_count}/{last_result.active_target}\n"
-        f"最新B目录：{last_result.pool_count}/{last_result.pool_target}\n"
-        f"最新状态：{'达标' if last_result.active_count >= last_result.active_target and last_result.pool_count >= last_result.pool_target else '未达标'}"
+        "授权池汇总\n"
+        f"主机：{socket.gethostname()}\n"
+        f"周期：{first_result.completed_at.strftime('%m-%d %H:%M')} ~ {last_result.completed_at.strftime('%m-%d %H:%M')}\n"
+        f"巡检轮次：{len(results)}\n"
+        f"最新状态：{latest_status}\n"
+        f"最新库存：A {last_result.active_count}/{last_result.active_target}（缺 {last_result.active_shortage}），"
+        f"B {last_result.pool_count}/{last_result.pool_target}（缺 {last_result.pool_shortage}）\n"
+        f"库存区间：A {min_active} ~ {max_active}，B {min_pool} ~ {max_pool}\n"
+        f"补号轮次：{replenish_rounds}，补号结果：成功 {total_replenished}/{total_register_target}\n"
+        f"B->A 合计：{total_moved_to_active}\n"
+        f"删除统计：A {total_active_deleted}，B {total_pool_deleted}，合计 {total_deleted}\n"
+        f"查询失败：A {total_active_check_failed}，B {total_pool_check_failed}\n"
+        f"未达标轮次：{unmet_rounds}"
     )
  
 
@@ -2585,6 +2843,7 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
         args.usage_threshold,
         args.request_interval,
         args.curl_timeout,
+        args.token_check_workers,
     )
     log_info(
         f"A 清理完成：保留 {kept_count}，删除 {deleted_count}，查询失败 {check_failed}"
@@ -2595,6 +2854,7 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
         args.usage_threshold,
         args.request_interval,
         args.curl_timeout,
+        args.token_check_workers,
     )
     log_info(
         f"B 清理完成：保留 {pool_kept_count}，删除 {pool_deleted_count}，查询失败 {pool_check_failed}"
@@ -2607,6 +2867,7 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
         args.usage_threshold,
         args.request_interval,
         args.curl_timeout,
+        args.token_check_workers,
     )
     if moved_before_register > 0:
         log_info(f"首次从 B 补充到 A 共 {moved_before_register} 个")
@@ -2650,6 +2911,7 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
                 args.usage_threshold,
                 args.request_interval,
                 args.curl_timeout,
+                args.token_check_workers,
             )
             if moved_after_register > 0:
                 log_info(f"补号后再次从 B 补充到 A 共 {moved_after_register} 个")
@@ -2685,9 +2947,17 @@ def run_monitor_cycle(args: argparse.Namespace) -> MonitorCycleResult:
         pool_count=final_pool_count,
         active_target=args.active_min_count,
         pool_target=args.pool_min_count,
+        active_shortage=final_active_shortage,
+        pool_shortage=final_pool_shortage,
         attempted_replenish=register_target > 0,
+        register_target=register_target,
         replenished_count=replenished_count,
         deleted_count=total_deleted_count,
+        active_deleted_count=deleted_count,
+        pool_deleted_count=pool_deleted_count + deleted_from_pool_before + deleted_from_pool_after,
+        moved_to_active_count=moved_before_register + moved_after_register,
+        active_check_failed=check_failed,
+        pool_check_failed=pool_check_failed,
     )
 
 
@@ -2829,6 +3099,7 @@ _CONFIG_KEY_MAP = {
     "pool_min_count": "pool_min_count",
     "usage_threshold": "usage_threshold",
     "request_interval": "request_interval",
+    "token_check_workers": "token_check_workers",
     "curl_timeout": "curl_timeout",
     "monitor_interval": "monitor_interval",
     "register_batch_size": "register_batch_size",
@@ -2968,6 +3239,12 @@ def main() -> None:
         help="检测账号时每次请求之间的等待秒数",
     )
     parser.add_argument(
+        "--token-check-workers",
+        type=int,
+        default=DEFAULT_TOKEN_CHECK_WORKERS,
+        help="巡检额度查询并发数",
+    )
+    parser.add_argument(
         "--curl-timeout",
         type=int,
         default=15,
@@ -3053,6 +3330,7 @@ def main() -> None:
     args.pool_min_count = max(0, args.pool_min_count)
     args.usage_threshold = max(1, args.usage_threshold)
     args.request_interval = max(0, args.request_interval)
+    args.token_check_workers = max(1, args.token_check_workers)
     args.curl_timeout = max(1, args.curl_timeout)
     args.monitor_interval = max(1, args.monitor_interval)
     args.dingtalk_summary_interval = max(1, args.dingtalk_summary_interval)
@@ -3154,7 +3432,7 @@ def main() -> None:
                 f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，选择={args.cfmail_profile}"
             )
         log_info(
-            f"巡检模式启动：A目录={args.active_token_dir}，B目录={args.token_dir}，A阈值={args.active_min_count}，B阈值={args.pool_min_count}，巡检间隔={args.monitor_interval}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
+            f"巡检模式启动：A目录={args.active_token_dir}，B目录={args.token_dir}，A阈值={args.active_min_count}，B阈值={args.pool_min_count}，巡检间隔={args.monitor_interval}秒，额度查询并发={args.token_check_workers}，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
         )
         run_monitor_loop(args)
         return

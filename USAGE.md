@@ -240,6 +240,7 @@ python /root/openai_register.py --test-cfmail --proxy http://127.0.0.1:7890
 - `--pool-min-count`：B 最少保留数量，默认 `50`
 - `--usage-threshold`：账号使用率达到该值后删除，默认 `90`
 - `--request-interval`：检测账号时每次请求之间的等待秒数，默认 `2`
+- `--token-check-workers`：巡检额度查询并发数，默认 `6`
 - `--curl-timeout`：额度检测超时，默认 `15`
 - `--register-batch-size`：补号时每批并发注册数量，默认 `3`
 
