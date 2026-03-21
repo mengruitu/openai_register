@@ -22,6 +22,7 @@
     "dingtalk_summary_interval": 10800,
     "sleep_min": 10,
     "sleep_max": 30,
+    "failure_sleep_seconds": 10,
 
     "_section_register": "===== 注册配置 =====",
     "mail_provider": "cfmail",
@@ -30,6 +31,8 @@
     "_section_cfmail": "===== cfmail 配置 =====",
     "cfmail_profile": "auto",
     "cfmail_config": "",
+    "cfmail_fail_threshold": 3,
+    "cfmail_cooldown_seconds": 300,
 
     "_section_notify": "===== 通知配置 =====",
     "dingtalk_webhook": "",

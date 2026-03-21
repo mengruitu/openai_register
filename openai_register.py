@@ -76,7 +76,8 @@ DEFAULT_DINGTALK_SUMMARY_INTERVAL_SECONDS = 10800
 DEFAULT_REQUEST_INTERVAL_SECONDS = 2
 DEFAULT_REGISTER_BATCH_SIZE = 3
 DEFAULT_CFMAIL_FAIL_THRESHOLD = 3
-DEFAULT_CFMAIL_COOLDOWN_SECONDS = 1800
+DEFAULT_CFMAIL_COOLDOWN_SECONDS = 300
+DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 10
 # 请改成你的钉钉机器人地址
 DEFAULT_DINGTALK_WEBHOOK = ""
 
@@ -1349,6 +1350,42 @@ def _decode_jwt_segment(seg: str) -> Dict[str, Any]:
         return {}
 
 
+def _extract_workspaces_from_auth_cookie(auth_cookie: str) -> List[Dict[str, Any]]:
+    raw = str(auth_cookie or "").strip()
+    if not raw:
+        return []
+
+    candidates = [raw]
+    if "." in raw:
+        candidates.extend(part for part in raw.split(".") if part)
+
+    seen_candidates: Set[str] = set()
+    for candidate in candidates:
+        if candidate in seen_candidates:
+            continue
+        seen_candidates.add(candidate)
+
+        data = _decode_jwt_segment(candidate)
+        if not isinstance(data, dict) or not data:
+            continue
+
+        nodes = [
+            data,
+            data.get("session"),
+            data.get("user"),
+            data.get("payload"),
+            data.get("claims"),
+        ]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            workspaces = node.get("workspaces") or []
+            if isinstance(workspaces, list) and workspaces:
+                return [item for item in workspaces if isinstance(item, dict)]
+
+    return []
+
+
 def _to_int(v: Any) -> int:
     try:
         return int(v)
@@ -1393,6 +1430,42 @@ class OAuthStart:
     state: str
     code_verifier: str
     redirect_uri: str
+    scope: str
+
+
+def _build_oauth_authorize_url(
+    *,
+    state: str,
+    code_verifier: str,
+    redirect_uri: str,
+    scope: str,
+    prompt: Optional[str] = "login",
+) -> str:
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "state": state,
+        "code_challenge": _sha256_b64url_no_pad(code_verifier),
+        "code_challenge_method": "S256",
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+    }
+    prompt_value = None if prompt is None else str(prompt).strip()
+    if prompt_value:
+        params["prompt"] = prompt_value
+    return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
+
+
+def _oauth_authorize_url(oauth: OAuthStart, *, prompt: Optional[str] = "login") -> str:
+    return _build_oauth_authorize_url(
+        state=oauth.state,
+        code_verifier=oauth.code_verifier,
+        redirect_uri=oauth.redirect_uri,
+        scope=oauth.scope,
+        prompt=prompt,
+    )
 
 
 def generate_oauth_url(
@@ -1400,26 +1473,19 @@ def generate_oauth_url(
 ) -> OAuthStart:
     state = _random_state()
     code_verifier = _pkce_verifier()
-    code_challenge = _sha256_b64url_no_pad(code_verifier)
-
-    params = {
-        "client_id": CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "scope": scope,
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-        "prompt": "login",
-        "id_token_add_organizations": "true",
-        "codex_cli_simplified_flow": "true",
-    }
-    auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
+    auth_url = _build_oauth_authorize_url(
+        state=state,
+        code_verifier=code_verifier,
+        redirect_uri=redirect_uri,
+        scope=scope,
+        prompt="login",
+    )
     return OAuthStart(
         auth_url=auth_url,
         state=state,
         code_verifier=code_verifier,
         redirect_uri=redirect_uri,
+        scope=scope,
     )
 
 
@@ -1483,6 +1549,293 @@ def submit_callback_url(
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
+def _extract_continue_url_from_response(resp: Any) -> str:
+    base_url = str(getattr(resp, "url", "") or AUTH_URL).strip() or AUTH_URL
+    headers = getattr(resp, "headers", {}) or {}
+
+    location = str(headers.get("Location") or "").strip()
+    if location:
+        return urllib.parse.urljoin(base_url, location)
+
+    try:
+        payload = resp.json() if getattr(resp, "content", b"") else {}
+    except Exception:
+        payload = {}
+
+    if isinstance(payload, dict):
+        for key in ("continue_url", "redirect_url", "next_url", "url"):
+            candidate = str(payload.get(key) or "").strip()
+            if candidate:
+                return urllib.parse.urljoin(base_url, candidate)
+
+    text = str(getattr(resp, "text", "") or "")
+    if not text:
+        return ""
+
+    json_like_match = re.search(
+        r'"(?:continue_url|redirect_url|next_url|url)"\s*:\s*"([^"]+)"', text
+    )
+    if json_like_match:
+        candidate = json_like_match.group(1).replace("\\/", "/").strip()
+        if candidate:
+            return urllib.parse.urljoin(base_url, candidate)
+
+    callback_match = re.search(
+        r"(http://localhost:1455/auth/callback[^\"'\s<>]+)", text
+    )
+    if callback_match:
+        return callback_match.group(1).strip()
+
+    return ""
+
+
+def _follow_oauth_redirect_chain(
+    session: Any,
+    start_url: str,
+    oauth: OAuthStart,
+    thread_id: int,
+    *,
+    max_hops: int = 8,
+) -> Optional[str]:
+    current_url = str(start_url or "").strip()
+    if not current_url:
+        return None
+
+    try:
+        for _ in range(max_hops):
+            if "code=" in current_url and "state=" in current_url:
+                return submit_callback_url(
+                    callback_url=current_url,
+                    code_verifier=oauth.code_verifier,
+                    redirect_uri=oauth.redirect_uri,
+                    expected_state=oauth.state,
+                )
+
+            resp = session.get(current_url, allow_redirects=False, timeout=15)
+            next_url = _extract_continue_url_from_response(resp)
+            if not next_url:
+                break
+            if "code=" in next_url and "state=" in next_url:
+                return submit_callback_url(
+                    callback_url=next_url,
+                    code_verifier=oauth.code_verifier,
+                    redirect_uri=oauth.redirect_uri,
+                    expected_state=oauth.state,
+                )
+            if next_url == current_url:
+                break
+            current_url = next_url
+    except Exception as exc:
+        print(
+            f"[线程 {thread_id}] [警告] 跟随 OAuth 跳转链失败: {exc}"
+        )
+
+    return None
+
+
+def _request_sentinel_token(
+    *,
+    did: str,
+    proxies: Any,
+    impersonate: str,
+    thread_id: int,
+) -> str:
+    device_id = str(did or "").strip()
+    if not device_id:
+        print(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
+        return ""
+
+    body = json.dumps(
+        {"p": "", "id": device_id, "flow": "authorize_continue"},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    resp = requests.post(
+        "https://sentinel.openai.com/backend-api/sentinel/req",
+        headers={
+            "origin": "https://sentinel.openai.com",
+            "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+            "content-type": "text/plain;charset=UTF-8",
+        },
+        data=body,
+        proxies=proxies,
+        impersonate=impersonate,
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(
+            f"[线程 {thread_id}] [错误] Sentinel 请求失败，状态码: {resp.status_code}"
+        )
+        return ""
+
+    token = str((resp.json() or {}).get("token") or "").strip()
+    if not token:
+        print(f"[线程 {thread_id}] [错误] Sentinel 响应里缺少 token")
+    return token
+
+
+def _try_token_via_existing_session(
+    session: Any,
+    oauth: OAuthStart,
+    thread_id: int,
+) -> Optional[str]:
+    print(f"[线程 {thread_id}] [信息] 尝试复用当前 session 免密获取 token")
+    return _follow_oauth_redirect_chain(
+        session,
+        _oauth_authorize_url(oauth, prompt=None),
+        oauth,
+        thread_id,
+    )
+
+
+def _try_token_via_workspace_select(
+    session: Any,
+    oauth: OAuthStart,
+    auth_cookie: str,
+    thread_id: int,
+) -> Optional[str]:
+    workspaces = _extract_workspaces_from_auth_cookie(auth_cookie)
+    if not workspaces:
+        print(
+            f"[线程 {thread_id}] [警告] 授权 Cookie 存在，但暂未解析到 workspace"
+        )
+        return None
+
+    workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+    if not workspace_id:
+        print(f"[线程 {thread_id}] [警告] workspace 信息存在，但无法解析 workspace_id")
+        return None
+
+    select_resp = session.post(
+        "https://auth.openai.com/api/accounts/workspace/select",
+        headers={
+            "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            "content-type": "application/json",
+        },
+        json={"workspace_id": workspace_id},
+    )
+    if select_resp.status_code != 200:
+        print(
+            f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}"
+        )
+        return None
+
+    continue_url = _extract_continue_url_from_response(select_resp)
+    if not continue_url:
+        print(
+            f"[线程 {thread_id}] [警告] workspace/select 响应里缺少 continue_url"
+        )
+        return None
+
+    print(f"[线程 {thread_id}] [信息] 已获取 workspace，继续跟随授权跳转链")
+    return _follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
+
+
+def _try_token_via_password_login(
+    *,
+    email: str,
+    password: str,
+    oauth: OAuthStart,
+    proxies: Any,
+    impersonate: str,
+    thread_id: int,
+) -> Optional[str]:
+    account = str(email or "").strip()
+    pwd = str(password or "").strip()
+    if not account or not pwd:
+        return None
+
+    print(f"[线程 {thread_id}] [信息] 当前 session 未拿到 token，尝试账号密码重新登录")
+    login_session = requests.Session(proxies=proxies, impersonate=impersonate)
+
+    try:
+        login_session.get(_oauth_authorize_url(oauth, prompt="login"), timeout=15)
+        did = login_session.cookies.get("oai-did")
+        sentinel_token = _request_sentinel_token(
+            did=did,
+            proxies=proxies,
+            impersonate=impersonate,
+            thread_id=thread_id,
+        )
+        if not sentinel_token:
+            return None
+
+        continue_resp = login_session.post(
+            "https://auth.openai.com/api/accounts/authorize/continue",
+            headers={
+                "referer": "https://auth.openai.com/sign-in",
+                "accept": "application/json",
+                "content-type": "application/json",
+                "openai-sentinel-token": json.dumps(
+                    {
+                        "p": "",
+                        "t": "",
+                        "c": sentinel_token,
+                        "id": did,
+                        "flow": "authorize_continue",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+            data=json.dumps(
+                {
+                    "username": {"value": account, "kind": "email"},
+                    "screen_hint": "login",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        if continue_resp.status_code not in (200, 204):
+            print(
+                f"[线程 {thread_id}] [警告] 账号密码登录预处理失败，状态码: {continue_resp.status_code}"
+            )
+            return None
+
+        login_resp = login_session.post(
+            "https://auth.openai.com/api/accounts/user/login",
+            headers={
+                "referer": "https://auth.openai.com/sign-in/password",
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            data=json.dumps(
+                {"username": account, "password": pwd},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        if login_resp.status_code != 200:
+            print(
+                f"[线程 {thread_id}] [警告] 账号密码登录失败，状态码: {login_resp.status_code}"
+            )
+            return None
+
+        continue_url = _extract_continue_url_from_response(login_resp)
+        if continue_url:
+            token_json = _follow_oauth_redirect_chain(
+                login_session, continue_url, oauth, thread_id
+            )
+            if token_json:
+                return token_json
+
+        auth_cookie = login_session.cookies.get("oai-client-auth-session")
+        if auth_cookie:
+            token_json = _try_token_via_workspace_select(
+                login_session, oauth, auth_cookie, thread_id
+            )
+            if token_json:
+                return token_json
+
+        return _try_token_via_existing_session(login_session, oauth, thread_id)
+    except Exception as exc:
+        print(
+            f"[线程 {thread_id}] [警告] 账号密码登录兜底失败: {exc}"
+        )
+        return None
+
+
 # ==========================================
 # 核心注册逻辑
 # ==========================================
@@ -1516,8 +1869,8 @@ def run(
     proxies: Any = _build_request_proxies(proxy)
     cfmail_config_name = ""
 
-    def _mark_cfmail_failure(reason: str) -> None:
-        if provider_key == "cfmail" and cfmail_config_name:
+    def _mark_cfmail_failure(reason: str, *, affect_cooldown: bool = False) -> None:
+        if provider_key == "cfmail" and cfmail_config_name and affect_cooldown:
             _record_cfmail_failure(cfmail_config_name, reason)
 
     def _mark_cfmail_success() -> None:
@@ -1603,30 +1956,26 @@ def run(
         )
 
         signup_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"signup"}}'
-        sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
-
-        sen_resp = requests.post(
-            "https://sentinel.openai.com/backend-api/sentinel/req",
-            headers={
-                "origin": "https://sentinel.openai.com",
-                "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-                "content-type": "text/plain;charset=UTF-8",
-            },
-            data=sen_req_body,
+        sen_token = _request_sentinel_token(
+            did=did,
             proxies=proxies,
             impersonate=current_impersonate,
-            timeout=15,
+            thread_id=thread_id,
         )
-
-        if sen_resp.status_code != 200:
-            print(
-                f"[线程 {thread_id}] [错误] Sentinel 请求失败，状态码: {sen_resp.status_code}"
-            )
-            _mark_cfmail_failure(f"sentinel status={sen_resp.status_code}")
+        if not sen_token:
             return None
 
-        sen_token = sen_resp.json()["token"]
-        sentinel = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
+        sentinel = json.dumps(
+            {
+                "p": "",
+                "t": "",
+                "c": sen_token,
+                "id": did,
+                "flow": "authorize_continue",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
         signup_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
@@ -1645,7 +1994,6 @@ def run(
             print(
                 f"[线程 {thread_id}] [错误] 注册请求被拒绝（{signup_resp.status_code}）: {signup_resp.text}"
             )
-            _mark_cfmail_failure(f"authorize_continue status={signup_resp.status_code}")
             return None
 
         password = _generate_password()
@@ -1671,7 +2019,6 @@ def run(
             print(
                 f"[线程 {thread_id}] [错误] 提交密码失败: {register_resp.text}"
             )
-            _mark_cfmail_failure(f"user_register status={register_resp.status_code}")
             return None
 
         otp_resp = s.get(
@@ -1688,12 +2035,11 @@ def run(
             print(
                 f"[线程 {thread_id}] [错误] 发送验证码失败: {otp_resp.text}"
             )
-            _mark_cfmail_failure(f"email_otp_send status={otp_resp.status_code}")
             return None
 
         code = get_oai_code(mailbox, thread_id, proxies)
         if not code:
-            _mark_cfmail_failure("email_code empty")
+            _mark_cfmail_failure("email_code empty", affect_cooldown=True)
             return None
 
         code_body = f'{{"code":"{code}"}}'
@@ -1743,80 +2089,46 @@ def run(
                     f"[线程 {thread_id}] [提示] 请求频率过高（429），建议更换代理或降低并发"
                 )
             _mark_cfmail_failure(
-                f"create_account status={create_account_status} body={err_msg[:120]}"
+                f"create_account status={create_account_status} body={err_msg[:120]}",
+                affect_cooldown=(
+                    "unsupported_email" in err_msg
+                    or "registration_disallowed" in err_msg
+                ),
             )
             return None
 
         auth_cookie = s.cookies.get("oai-client-auth-session")
-        if not auth_cookie:
-            print(f"[线程 {thread_id}] [错误] 未能获取到授权 Cookie")
-            _mark_cfmail_failure("missing auth cookie")
-            return None
+        token_json = _try_token_via_existing_session(s, oauth, thread_id)
 
-        auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
-        workspaces = auth_json.get("workspaces") or []
-        if not workspaces:
-            print(f"[线程 {thread_id}] [错误] 授权 Cookie 里没有 workspace 信息")
-            _mark_cfmail_failure("missing workspace")
-            return None
-        workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
-        if not workspace_id:
-            print(f"[线程 {thread_id}] [错误] 无法解析 workspace_id")
-            _mark_cfmail_failure("empty workspace_id")
-            return None
-
-        select_body = f'{{"workspace_id":"{workspace_id}"}}'
-        select_resp = s.post(
-            "https://auth.openai.com/api/accounts/workspace/select",
-            headers={
-                "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-                "content-type": "application/json",
-            },
-            data=select_body,
-        )
-
-        if select_resp.status_code != 200:
-            print(
-                f"[线程 {thread_id}] [错误] 选择 workspace 失败，状态码: {select_resp.status_code}"
+        if not token_json and auth_cookie:
+            token_json = _try_token_via_workspace_select(
+                s, oauth, auth_cookie, thread_id
             )
-            print(f"[线程 {thread_id}] {select_resp.text}")
-            _mark_cfmail_failure(f"workspace_select status={select_resp.status_code}")
-            return None
+        elif not auth_cookie:
+            print(f"[线程 {thread_id}] [警告] 当前会话中暂未拿到授权 Cookie")
 
-        continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
-        if not continue_url:
-            print(
-                f"[线程 {thread_id}] [错误] workspace/select 响应里缺少 continue_url"
-            )
-            _mark_cfmail_failure("missing continue_url")
-            return None
-
-        current_url = continue_url
-        for _ in range(6):
-            final_resp = s.get(current_url, allow_redirects=False, timeout=15)
-            location = final_resp.headers.get("Location") or ""
-
-            if final_resp.status_code not in [301, 302, 303, 307, 308]:
-                break
-            if not location:
-                break
-
-            next_url = urllib.parse.urljoin(current_url, location)
-            if "code=" in next_url and "state=" in next_url:
-                token_json = submit_callback_url(
-                    callback_url=next_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
+        if not token_json:
+            refreshed_auth_cookie = s.cookies.get("oai-client-auth-session")
+            if refreshed_auth_cookie and refreshed_auth_cookie != auth_cookie:
+                token_json = _try_token_via_workspace_select(
+                    s, oauth, refreshed_auth_cookie, thread_id
                 )
-                _mark_cfmail_success()
-                return token_json, password
-            current_url = next_url
 
-        print(
-            f"[线程 {thread_id}] [错误] 未能在重定向链中捕获最终 Callback URL"
-        )
-        _mark_cfmail_failure("missing callback url")
+        if not token_json:
+            token_json = _try_token_via_password_login(
+                email=email,
+                password=password,
+                oauth=oauth,
+                proxies=proxies,
+                impersonate=current_impersonate,
+                thread_id=thread_id,
+            )
+
+        if token_json:
+            _mark_cfmail_success()
+            return token_json, password
+
+        print(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token")
         return None
 
     except Exception as e:
@@ -1829,7 +2141,6 @@ def run(
         print(
             f"[线程 {thread_id}] [提示] 本轮失败，下一轮将继续重试"
         )
-        _mark_cfmail_failure(f"run exception: {e}")
         return None
 
 
@@ -2386,6 +2697,7 @@ def worker(
     once: bool,
     sleep_min: int,
     sleep_max: int,
+    failure_sleep_seconds: int,
     provider_key: str,
     mailtm_base: str,
     token_dir: str,
@@ -2433,9 +2745,9 @@ def worker(
         wait_time = random.randint(sleep_min, sleep_max)
         if not is_success:
             print(
-                f"[线程 {thread_id}] [提示] 本轮失败，额外等待 30 秒后重试"
+                f"[线程 {thread_id}] [提示] 本轮失败，额外等待 {failure_sleep_seconds} 秒后重试"
             )
-            wait_time += 30
+            wait_time += max(0, failure_sleep_seconds)
 
         print(
             f"[线程 {thread_id}] [信息] 等待 {wait_time} 秒后继续"
@@ -2524,6 +2836,9 @@ _CONFIG_KEY_MAP = {
     "dingtalk_summary_interval": "dingtalk_summary_interval",
     "sleep_min": "sleep_min",
     "sleep_max": "sleep_max",
+    "failure_sleep_seconds": "failure_sleep_seconds",
+    "cfmail_fail_threshold": "cfmail_fail_threshold",
+    "cfmail_cooldown_seconds": "cfmail_cooldown_seconds",
 }
 
 # 布尔型参数（配置文件里 true/false）
@@ -2570,6 +2885,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--sleep-max", type=int, default=30, help="注册循环最长等待秒数"
+    )
+    parser.add_argument(
+        "--failure-sleep-seconds",
+        type=int,
+        default=DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS,
+        help="注册失败后额外等待秒数",
     )
     parser.add_argument(
         "--mail-provider",
@@ -2700,6 +3021,18 @@ def main() -> None:
         action="store_true",
         help="仅测试 cfmail 配置是否可创建邮箱并可轮询，不执行注册",
     )
+    parser.add_argument(
+        "--cfmail-fail-threshold",
+        type=int,
+        default=DEFAULT_CFMAIL_FAIL_THRESHOLD,
+        help="cfmail 连续失败达到该阈值后进入冷却",
+    )
+    parser.add_argument(
+        "--cfmail-cooldown-seconds",
+        type=int,
+        default=DEFAULT_CFMAIL_COOLDOWN_SECONDS,
+        help="cfmail 自动冷却时长（秒）",
+    )
     args = parser.parse_args()
 
     # 保存 argparse 的默认值，用于判断命令行是否显式传参
@@ -2715,6 +3048,7 @@ def main() -> None:
 
     sleep_min = max(1, args.sleep_min)
     sleep_max = max(sleep_min, args.sleep_max)
+    args.failure_sleep_seconds = max(0, args.failure_sleep_seconds)
     args.active_min_count = max(1, args.active_min_count)
     args.pool_min_count = max(0, args.pool_min_count)
     args.usage_threshold = max(1, args.usage_threshold)
@@ -2723,6 +3057,8 @@ def main() -> None:
     args.monitor_interval = max(1, args.monitor_interval)
     args.dingtalk_summary_interval = max(1, args.dingtalk_summary_interval)
     args.register_batch_size = max(1, args.register_batch_size)
+    args.cfmail_fail_threshold = max(1, args.cfmail_fail_threshold)
+    args.cfmail_cooldown_seconds = max(0, args.cfmail_cooldown_seconds)
     args.cfmail_profile = str(args.cfmail_profile or "auto").strip() or "auto"
     args.cfmail_profile_name = (
         str(args.cfmail_profile_name or "custom").strip() or "custom"
@@ -2768,6 +3104,8 @@ def main() -> None:
     globals()["CFMAIL_PROFILE_MODE"] = args.cfmail_profile
     globals()["CFMAIL_CONFIG_PATH"] = args.cfmail_config
     globals()["CFMAIL_HOT_RELOAD_ENABLED"] = not has_cfmail_override
+    globals()["CFMAIL_FAIL_THRESHOLD"] = args.cfmail_fail_threshold
+    globals()["CFMAIL_COOLDOWN_SECONDS"] = args.cfmail_cooldown_seconds
     globals()["CFMAIL_CONFIG_MTIME"] = (
         os.path.getmtime(args.cfmail_config)
         if os.path.exists(args.cfmail_config)
@@ -2846,6 +3184,7 @@ def main() -> None:
                 args.once,
                 sleep_min,
                 sleep_max,
+                args.failure_sleep_seconds,
                 provider_key,
                 args.mailtm_api_base,
                 args.token_dir,

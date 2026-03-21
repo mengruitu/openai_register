@@ -226,6 +226,7 @@ python /root/openai_register.py --test-cfmail --proxy http://127.0.0.1:7890
 - `--once`：注册模式只执行一次
 - `--sleep-min`：注册循环最短等待秒数，默认 `10`
 - `--sleep-max`：注册循环最长等待秒数，默认 `30`
+- `--failure-sleep-seconds`：注册失败后额外等待秒数，默认 `10`
 - `--register-only`：只执行注册逻辑，不做 A/B 巡检
 
 ### 巡检参数
@@ -251,6 +252,8 @@ python /root/openai_register.py --test-cfmail --proxy http://127.0.0.1:7890
 
 - `--cfmail-profile`：指定 cfmail 配置名，默认 `auto`
 - `--cfmail-config`：cfmail 配置文件路径
+- `--cfmail-fail-threshold`：cfmail 连续失败多少次后进入冷却，默认 `3`
+- `--cfmail-cooldown-seconds`：cfmail 冷却时长，默认 `300` 秒
 - `--cfmail-worker-domain`：临时指定 worker 域名
 - `--cfmail-email-domain`：临时指定邮箱域名
 - `--cfmail-admin-password`：临时指定管理员密码
@@ -358,7 +361,8 @@ python /root/openai_register.py --monitor --dingtalk-webhook ""
 
 - 启动 3 个线程并发注册
 - 每轮成功后保存 Token 和账号密码
-- 失败后会额外等待 30 秒再重试
+- 失败后会额外等待 `--failure-sleep-seconds` 秒再重试
+- 注册完成后会优先复用当前 session 获取 callback；若 Cookie 中能解析 workspace，则会继续走 workspace 选择；仍失败时再尝试账号密码重新登录兜底获取 token
 - 若指定 `--once`，则每个线程执行一次后退出
 
 ### 10.2 巡检模式
