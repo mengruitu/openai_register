@@ -74,6 +74,18 @@ CFMAIL_EMAIL_DOMAIN = ""
 CFMAIL_ADMIN_PASSWORD = ""
 
 
+def _log_waiting_code_start(thread_id: int, email: str) -> None:
+    print(f"[线程 {thread_id}] [信息] 正在等待邮箱 {email} 的验证码")
+
+
+def _log_waiting_code_success(thread_id: int, code: str) -> None:
+    print(f"[线程 {thread_id}] [信息] 已收到验证码: {code}")
+
+
+def _log_waiting_code_timeout(thread_id: int) -> None:
+    print(f"[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+
+
 def normalize_host(value: str) -> str:
     value = str(value or "").strip()
     if value.startswith("https://"):
@@ -684,10 +696,9 @@ def poll_cfmail_oai_code(
     seen_ids: Set[str] = set(str(x).strip() for x in (skip_message_ids or set()) if str(x).strip())
     ignored_codes: Set[str] = set(str(x).strip() for x in (skip_codes or set()) if str(x).strip())
 
-    print(f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
+    _log_waiting_code_start(thread_id, email)
 
     for _ in range(40):
-        print(".", end="", flush=True)
         try:
             resp = requests.get(
                 f"{api_base}/api/mails",
@@ -744,14 +755,14 @@ def poll_cfmail_oai_code(
                 if code:
                     if code in ignored_codes:
                         continue
-                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                    _log_waiting_code_success(thread_id, code)
                     return code
         except Exception:
             pass
 
         time.sleep(3)
 
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+    _log_waiting_code_timeout(thread_id)
     return ""
 
 

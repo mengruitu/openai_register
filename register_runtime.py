@@ -1,3 +1,4 @@
+import base64
 import builtins
 import concurrent.futures
 import json
@@ -13,11 +14,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from curl_cffi import requests
 
+from register_auth import CLIENT_ID, TOKEN_URL, _post_form
 from register_notifications import build_monitor_summary_message, send_dingtalk_alert
 
 DEFAULT_TOKEN_CHECK_WORKERS = 6
 TOKEN_USAGE_CACHE_TTL_SECONDS = 180
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
+DEFAULT_TOKEN_REFRESH_SKEW_SECONDS = 300
 
 output_lock = threading.Lock()
 _token_usage_cache_lock = threading.Lock()
@@ -45,6 +48,15 @@ class MonitorCycleResult:
     moved_to_active_count: int
     active_check_failed: int
     pool_check_failed: int
+
+
+@dataclass(frozen=True)
+class TokenUsageCheck:
+    used_percent: Optional[int]
+    should_delete: bool
+    check_failed: bool
+    reason: str = ""
+    refreshed: bool = False
 
 
 def log_info(message: str) -> None:
@@ -108,9 +120,265 @@ def _token_usage_file_signature(file_path: str) -> Tuple[int, int]:
     return int(stat.st_mtime_ns), int(stat.st_size)
 
 
-def _get_cached_used_percent(
+def _jwt_claims_no_verify(token: str) -> Dict[str, Any]:
+    if not token or token.count(".") < 2:
+        return {}
+
+    payload_b64 = token.split(".")[1]
+    pad = "=" * ((4 - (len(payload_b64) % 4)) % 4)
+    try:
+        payload = base64.urlsafe_b64decode((payload_b64 + pad).encode("ascii"))
+        return json.loads(payload.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _extract_account_identity(token_data: Dict[str, Any]) -> Tuple[str, str]:
+    id_token = str(token_data.get("id_token") or "").strip()
+    access_token = str(token_data.get("access_token") or "").strip()
+    claims = _jwt_claims_no_verify(id_token) or _jwt_claims_no_verify(access_token)
+    auth_claims = claims.get("https://api.openai.com/auth") or {}
+    profile_claims = claims.get("https://api.openai.com/profile") or {}
+    account_id = str(auth_claims.get("chatgpt_account_id") or token_data.get("account_id") or "").strip()
+    email = str(claims.get("email") or profile_claims.get("email") or token_data.get("email") or "").strip()
+    return account_id, email
+
+
+def _token_expired_soon(token_data: Dict[str, Any], skew_seconds: int) -> bool:
+    access_token = str(token_data.get("access_token") or "").strip()
+    access_claims = _jwt_claims_no_verify(access_token)
+    now = int(time.time())
+
+    exp_value = access_claims.get("exp")
+    try:
+        if int(exp_value) <= now + max(0, skew_seconds):
+            return True
+        return False
+    except (TypeError, ValueError):
+        pass
+
+    expired_value = str(token_data.get("expired") or "").strip()
+    if not expired_value:
+        return False
+
+    try:
+        expired_at = datetime.strptime(expired_value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+
+    return int(expired_at.timestamp()) <= now + max(0, skew_seconds)
+
+
+def _persist_token_data(file_path: str, token_data: Dict[str, Any]) -> None:
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(token_data, f, ensure_ascii=False, separators=(",", ":"))
+
+
+def _extract_error_code_and_message(resp: Any) -> Tuple[str, str]:
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {}
+
+    if isinstance(payload, dict):
+        error_obj = payload.get("error")
+        if isinstance(error_obj, dict):
+            code = str(error_obj.get("code") or error_obj.get("error") or "").strip()
+            message = str(
+                error_obj.get("message")
+                or error_obj.get("description")
+                or error_obj.get("error_description")
+                or ""
+            ).strip()
+            return code, message
+
+        code = str(payload.get("code") or payload.get("error") or "").strip()
+        message = str(
+            payload.get("message") or payload.get("error_description") or ""
+        ).strip()
+        return code, message
+
+    return "", str(getattr(resp, "text", "") or "").strip()
+
+
+def _refresh_access_token(
     file_path: str,
-) -> Tuple[bool, Optional[int], Optional[Tuple[int, int]]]:
+    token_data: Dict[str, Any],
+    timeout: int,
+) -> Tuple[bool, Dict[str, Any], bool, str]:
+    refresh_token = str(token_data.get("refresh_token") or "").strip()
+    if not refresh_token:
+        return False, token_data, True, "缺少 refresh_token，无法刷新 access_token"
+
+    try:
+        resp = requests.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "refresh_token": refresh_token,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+            },
+            impersonate="chrome",
+            timeout=timeout,
+        )
+    except Exception as exc:
+        try:
+            payload = _post_form(
+                TOKEN_URL,
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": CLIENT_ID,
+                    "refresh_token": refresh_token,
+                },
+                timeout=timeout,
+            )
+        except Exception as fallback_exc:
+            error_text = str(fallback_exc or exc)
+            is_auth_invalid = any(
+                marker in error_text.lower()
+                for marker in (
+                    "invalid_grant",
+                    "invalid_refresh",
+                    "refresh_token_reused",
+                    "token_expired",
+                    "token exchange failed: 401",
+                )
+            )
+            return False, token_data, is_auth_invalid, f"刷新 access_token 失败: {error_text}"
+    else:
+        if resp.status_code != 200:
+            error_code, error_message = _extract_error_code_and_message(resp)
+            detail = error_code or error_message or "未知错误"
+            is_auth_invalid = resp.status_code in {400, 401} and any(
+                marker in f"{error_code} {error_message}".lower()
+                for marker in (
+                    "invalid_grant",
+                    "invalid_refresh",
+                    "refresh_token_reused",
+                    "token_expired",
+                    "unauthorized",
+                )
+            )
+            return (
+                False,
+                token_data,
+                is_auth_invalid,
+                f"刷新 access_token 失败，状态码: {resp.status_code}，详情: {detail}",
+            )
+
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            return False, token_data, False, f"刷新 access_token 响应解析失败: {exc}"
+
+    new_access_token = str(payload.get("access_token") or "").strip()
+    if not new_access_token:
+        return False, token_data, False, "刷新 access_token 成功但响应缺少 access_token"
+
+    updated_data = dict(token_data)
+    updated_data["access_token"] = new_access_token
+
+    new_refresh_token = str(payload.get("refresh_token") or "").strip()
+    if new_refresh_token:
+        updated_data["refresh_token"] = new_refresh_token
+
+    new_id_token = str(payload.get("id_token") or "").strip()
+    if new_id_token:
+        updated_data["id_token"] = new_id_token
+
+    account_id, email = _extract_account_identity(updated_data)
+    if account_id:
+        updated_data["account_id"] = account_id
+    if email:
+        updated_data["email"] = email
+
+    now = int(time.time())
+    updated_data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+
+    try:
+        expires_in = int(float(payload.get("expires_in") or 0))
+    except (TypeError, ValueError):
+        expires_in = 0
+    if expires_in > 0:
+        updated_data["expired"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + expires_in)
+        )
+
+    try:
+        _persist_token_data(file_path, updated_data)
+    except Exception as exc:
+        return False, token_data, False, f"刷新 access_token 后写回文件失败: {exc}"
+
+    return True, updated_data, False, "access_token 已刷新"
+
+
+def _request_used_percent(
+    file_path: str,
+    token_data: Dict[str, Any],
+    timeout: int,
+) -> Tuple[Optional[int], bool, str]:
+    access_token = str(token_data.get("access_token") or "").strip()
+    account_id = str(token_data.get("account_id") or "").strip()
+    if not access_token or not account_id:
+        return None, True, "缺少 access_token 或 account_id"
+
+    try:
+        resp = requests.get(
+            "https://chatgpt.com/backend-api/wham/usage",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+                "Chatgpt-Account-Id": account_id,
+            },
+            impersonate="chrome",
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return None, False, f"额度查询异常: {exc}"
+
+    if resp.status_code != 200:
+        error_code, error_message = _extract_error_code_and_message(resp)
+        detail = error_code or error_message or "未知错误"
+        is_auth_invalid = resp.status_code == 401 and any(
+            marker in f"{error_code} {error_message}".lower()
+            for marker in (
+                "token_expired",
+                "authentication token",
+                "unauthorized",
+                "account_deactivated",
+                "deactivated",
+                "account_disabled",
+                "account_not_found",
+            )
+        )
+        return None, is_auth_invalid, f"额度查询失败，状态码: {resp.status_code}，详情: {detail}"
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        return None, False, f"额度查询响应解析失败: {exc}"
+
+    used_percent = (((payload or {}).get("rate_limit") or {}).get("primary_window") or {}).get(
+        "used_percent"
+    )
+    if used_percent is None:
+        return None, False, "额度结果缺少 used_percent"
+
+    try:
+        return int(float(used_percent)), False, ""
+    except (TypeError, ValueError):
+        return None, False, f"额度结果中的 used_percent 非法: {used_percent}"
+
+
+def _get_cached_token_usage_check(
+    file_path: str,
+) -> Tuple[bool, Optional[TokenUsageCheck], Optional[Tuple[int, int]]]:
     now = time.time()
     try:
         signature = _token_usage_file_signature(file_path)
@@ -125,24 +393,29 @@ def _get_cached_used_percent(
             and cached.get("signature") == signature
             and now - float(cached.get("checked_at") or 0) <= TOKEN_USAGE_CACHE_TTL_SECONDS
         ):
-            return True, cached.get("used_percent"), signature
+            return True, cached.get("result"), signature
 
     return False, None, signature
 
 
-def _store_cached_used_percent(
+def _store_cached_token_usage_check(
     file_path: str,
     signature: Optional[Tuple[int, int]],
-    used_percent: Optional[int],
+    result: Optional[TokenUsageCheck],
 ) -> None:
     if signature is None:
+        return
+
+    if result is None:
+        with _token_usage_cache_lock:
+            TOKEN_USAGE_CACHE.pop(file_path, None)
         return
 
     now = time.time()
     with _token_usage_cache_lock:
         TOKEN_USAGE_CACHE[file_path] = {
             "signature": signature,
-            "used_percent": used_percent,
+            "result": result,
             "checked_at": now,
         }
         if len(TOKEN_USAGE_CACHE) > 2048:
@@ -152,76 +425,107 @@ def _store_cached_used_percent(
                     TOKEN_USAGE_CACHE.pop(cached_path, None)
 
 
-def get_used_percent(file_path: str, timeout: int) -> Optional[int]:
-    has_cached, cached_value, signature = _get_cached_used_percent(file_path)
+def get_token_usage_check(file_path: str, timeout: int) -> TokenUsageCheck:
+    has_cached, cached_value, signature = _get_cached_token_usage_check(file_path)
     if has_cached:
-        return cached_value
+        return cached_value or TokenUsageCheck(
+            used_percent=None,
+            should_delete=False,
+            check_failed=True,
+            reason="额度查询缓存缺失",
+        )
 
-    result: Optional[int] = None
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as exc:
-        log_error(f"读取 {os.path.basename(file_path)} 失败: {exc}")
-        _store_cached_used_percent(file_path, signature, None)
-        return None
-
-    access_token = str(data.get("access_token") or "").strip()
-    account_id = str(data.get("account_id") or "").strip()
-    if not access_token or not account_id:
-        log_error(f"文件 {os.path.basename(file_path)} 缺少 access_token 或 account_id")
-        _store_cached_used_percent(file_path, signature, None)
-        return None
-
-    try:
-        resp = requests.get(
-            "https://chatgpt.com/backend-api/wham/usage",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-                "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-                "Chatgpt-Account-Id": account_id,
-            },
-            impersonate="chrome",
-            timeout=timeout,
+        result = TokenUsageCheck(
+            used_percent=None,
+            should_delete=True,
+            check_failed=True,
+            reason=f"读取失败: {exc}",
         )
-        if resp.status_code != 200:
-            log_error(
-                f"文件 {os.path.basename(file_path)} 额度查询失败，状态码: {resp.status_code}"
+        _store_cached_token_usage_check(file_path, signature, result)
+        return result
+
+    refreshed = False
+    if (
+        not str(data.get("access_token") or "").strip()
+        or not str(data.get("account_id") or "").strip()
+        or _token_expired_soon(data, DEFAULT_TOKEN_REFRESH_SKEW_SECONDS)
+    ):
+        is_refreshed, data, should_delete, reason = _refresh_access_token(
+            file_path, data, timeout
+        )
+        refreshed = is_refreshed
+        if not is_refreshed:
+            result = TokenUsageCheck(
+                used_percent=None,
+                should_delete=should_delete,
+                check_failed=True,
+                reason=reason,
+                refreshed=False,
+            )
+            _store_cached_token_usage_check(file_path, signature, result)
+            return result
+
+    used_percent, is_auth_invalid, reason = _request_used_percent(file_path, data, timeout)
+    if used_percent is None and is_auth_invalid and not refreshed:
+        is_refreshed, data, should_delete, refresh_reason = _refresh_access_token(
+            file_path, data, timeout
+        )
+        refreshed = is_refreshed
+        if is_refreshed:
+            used_percent, is_auth_invalid, reason = _request_used_percent(
+                file_path, data, timeout
             )
         else:
-            payload = resp.json()
-            used_percent = (
-                ((payload or {}).get("rate_limit") or {}).get("primary_window") or {}
-            ).get("used_percent")
-            if used_percent is None:
-                log_error(f"文件 {os.path.basename(file_path)} 额度结果缺少 used_percent")
-            else:
-                result = int(float(used_percent))
-    except Exception as exc:
-        log_error(f"文件 {os.path.basename(file_path)} 额度查询异常: {exc}")
-        result = None
+            result = TokenUsageCheck(
+                used_percent=None,
+                should_delete=should_delete,
+                check_failed=True,
+                reason=refresh_reason,
+                refreshed=False,
+            )
+            _store_cached_token_usage_check(file_path, signature, result)
+            return result
 
-    _store_cached_used_percent(file_path, signature, result)
+    if used_percent is not None:
+        result = TokenUsageCheck(
+            used_percent=used_percent,
+            should_delete=False,
+            check_failed=False,
+            refreshed=refreshed,
+        )
+    else:
+        result = TokenUsageCheck(
+            used_percent=None,
+            should_delete=is_auth_invalid,
+            check_failed=True,
+            reason=reason,
+            refreshed=refreshed,
+        )
+
+    _store_cached_token_usage_check(file_path, signature, result)
     return result
 
 
-def _collect_used_percent_results(
+def _collect_token_usage_results(
     file_paths: List[str],
     timeout: int,
     request_interval: int,
     max_workers: int,
-) -> Dict[str, Optional[int]]:
+) -> Dict[str, TokenUsageCheck]:
     files = [path for path in file_paths if path]
     if not files:
         return {}
 
     worker_count = max(1, int(max_workers or 1))
-    results: Dict[str, Optional[int]] = {}
+    results: Dict[str, TokenUsageCheck] = {}
 
     if worker_count == 1 or len(files) == 1:
         for index, file_path in enumerate(files):
-            results[file_path] = get_used_percent(file_path, timeout)
+            results[file_path] = get_token_usage_check(file_path, timeout)
             if request_interval > 0 and index + 1 < len(files):
                 time.sleep(request_interval)
         return results
@@ -233,7 +537,7 @@ def _collect_used_percent_results(
             max_workers=min(worker_count, len(batch))
         ) as executor:
             future_map = {
-                executor.submit(get_used_percent, file_path, timeout): file_path
+                executor.submit(get_token_usage_check, file_path, timeout): file_path
                 for file_path in batch
             }
             for future in concurrent.futures.as_completed(future_map):
@@ -242,7 +546,12 @@ def _collect_used_percent_results(
                     results[file_path] = future.result()
                 except Exception as exc:
                     log_error(f"文件 {os.path.basename(file_path)} 并发额度查询异常: {exc}")
-                    results[file_path] = None
+                    results[file_path] = TokenUsageCheck(
+                        used_percent=None,
+                        should_delete=False,
+                        check_failed=True,
+                        reason=f"并发额度查询异常: {exc}",
+                    )
 
         if request_interval > 0 and batch_start + batch_size < len(files):
             time.sleep(request_interval)
@@ -287,7 +596,7 @@ def _cleanup_tokens_in_dir(
     check_failed = 0
 
     file_paths = list_json_files(directory)
-    usage_results = _collect_used_percent_results(
+    usage_results = _collect_token_usage_results(
         file_paths,
         curl_timeout,
         request_interval,
@@ -295,15 +604,30 @@ def _cleanup_tokens_in_dir(
     )
 
     for file_path in file_paths:
-        used_percent = usage_results.get(file_path)
+        usage_check = usage_results.get(file_path) or TokenUsageCheck(
+            used_percent=None,
+            should_delete=False,
+            check_failed=True,
+            reason="额度查询结果缺失",
+        )
+        used_percent = usage_check.used_percent
         if used_percent is None:
-            log_warn(f"删除 {label} 中的 {os.path.basename(file_path)}，额度查询失败")
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
-            check_failed += 1
+            if usage_check.check_failed:
+                check_failed += 1
+            if usage_check.should_delete:
+                log_warn(
+                    f"删除 {label} 中的 {os.path.basename(file_path)}，{usage_check.reason or '额度查询失败'}"
+                )
+                try:
+                    os.remove(file_path)
+                except FileNotFoundError:
+                    pass
+                deleted_count += 1
+            else:
+                kept_count += 1
+                log_warn(
+                    f"保留 {label} 中的 {os.path.basename(file_path)}，本轮额度查询失败，暂不删除：{usage_check.reason or '未知原因'}"
+                )
         elif used_percent >= usage_threshold:
             log_info(
                 f"删除 {label} 中的 {os.path.basename(file_path)}，已用比例 {used_percent}% >= {usage_threshold}%"
@@ -315,9 +639,6 @@ def _cleanup_tokens_in_dir(
             deleted_count += 1
         else:
             kept_count += 1
-            log_info(
-                f"保留 {label} 中的 {os.path.basename(file_path)}，已用比例 {used_percent}%"
-            )
 
     return kept_count, deleted_count, check_failed
 
@@ -374,7 +695,7 @@ def move_pool_tokens_to_active(
     deleted_count = 0
     pool_files = list_json_files(pool_dir)
     random.shuffle(pool_files)
-    usage_results = _collect_used_percent_results(
+    usage_results = _collect_token_usage_results(
         pool_files,
         curl_timeout,
         request_interval,
@@ -385,14 +706,27 @@ def move_pool_tokens_to_active(
         if moved_count >= needed:
             break
 
-        used_percent = usage_results.get(file_path)
+        usage_check = usage_results.get(file_path) or TokenUsageCheck(
+            used_percent=None,
+            should_delete=False,
+            check_failed=True,
+            reason="额度查询结果缺失",
+        )
+        used_percent = usage_check.used_percent
         if used_percent is None:
-            log_warn(f"删除 B 中的 {os.path.basename(file_path)}，额度查询失败")
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
+            if usage_check.should_delete:
+                log_warn(
+                    f"删除 B 中的 {os.path.basename(file_path)}，{usage_check.reason or '额度查询失败'}"
+                )
+                try:
+                    os.remove(file_path)
+                except FileNotFoundError:
+                    pass
+                deleted_count += 1
+            else:
+                log_warn(
+                    f"跳过从 B 补充 {os.path.basename(file_path)}，本轮额度查询失败，暂不删除：{usage_check.reason or '未知原因'}"
+                )
         elif used_percent >= usage_threshold:
             log_info(
                 f"删除 B 中的 {os.path.basename(file_path)}，已用比例 {used_percent}% >= {usage_threshold}%"
@@ -406,9 +740,7 @@ def move_pool_tokens_to_active(
             destination = _build_unique_path(active_dir, os.path.basename(file_path))
             os.replace(file_path, destination)
             moved_count += 1
-            log_info(
-                f"从 B 补充到 A: {os.path.basename(destination)}，已补 {moved_count}/{needed}"
-            )
+            log_info(f"从 B 补充到 A: {os.path.basename(destination)}")
 
     return moved_count, deleted_count
 
@@ -424,7 +756,7 @@ def register_single_account(
     dingtalk_fallback_interval_seconds: int = DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
 ) -> bool:
     try:
-        result, used_provider = register_runner(
+        result, _used_provider = register_runner(
             proxy,
             provider_key,
             thread_id,
@@ -437,10 +769,7 @@ def register_single_account(
             return False
 
         token_json, password = result
-        file_name, raw_email = persist_registration_result(
-            token_json, password, thread_id, token_dir
-        )
-        log_info(f"补号成功: {raw_email} -> {file_name}（邮箱服务: {used_provider}）")
+        persist_registration_result(token_json, password, thread_id, token_dir)
         return True
     except Exception as exc:
         log_error(f"补号任务 #{thread_id} 异常: {exc}")
@@ -464,7 +793,7 @@ def register_accounts(
     if target_count <= 0:
         return 0
 
-    if auto_continue_non_us and builtins.yasal_bypass_ip_choice is None:
+    if auto_continue_non_us and getattr(builtins, "yasal_bypass_ip_choice", None) is None:
         builtins.yasal_bypass_ip_choice = True
 
     success_count = 0
@@ -564,8 +893,6 @@ def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycl
     )
     if moved_before_register > 0:
         log_info(f"首次从 B 补充到 A 共 {moved_before_register} 个")
-    else:
-        log_info("首次从 B 补充到 A：本轮无需补充或 B 中无可补账号")
 
     active_count = count_json_files(args.active_token_dir)
     pool_count = count_json_files(args.token_dir)
@@ -653,8 +980,6 @@ def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycl
             )
             if moved_after_register > 0:
                 log_info(f"补号后再次从 B 补充到 A 共 {moved_after_register} 个")
-            else:
-                log_info("补号后再次从 B 补充到 A：A 已达标或新号暂未补入 A")
     else:
         log_info(
             f"A/B 均已达标：A={active_count}/{args.active_min_count}，B={pool_count}/{args.pool_min_count}，本轮不补号"
@@ -767,7 +1092,6 @@ def worker(
             )
             wait_time += max(0, failure_sleep_seconds)
 
-        print(f"[线程 {thread_id}] [信息] 等待 {wait_time} 秒后继续")
         time.sleep(wait_time)
 
 

@@ -27,6 +27,18 @@ class TempMailbox:
     config_name: str = ""
 
 
+def _log_waiting_code_start(thread_id: int, email: str) -> None:
+    print(f"[线程 {thread_id}] [信息] 正在等待邮箱 {email} 的验证码")
+
+
+def _log_waiting_code_success(thread_id: int, code: str) -> None:
+    print(f"[线程 {thread_id}] [信息] 已收到验证码: {code}")
+
+
+def _log_waiting_code_timeout(thread_id: int) -> None:
+    print(f"[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+
+
 def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str]:
     headers = {"Accept": "application/json"}
     if use_json:
@@ -381,10 +393,9 @@ def poll_hydra_oai_code(
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     ignored_codes = _normalize_code_values(skip_codes)
 
-    print(f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
+    _log_waiting_code_start(thread_id, email)
 
     for _ in range(40):
-        print(".", end="", flush=True)
         try:
             resp = requests.get(
                 url_list,
@@ -441,14 +452,14 @@ def poll_hydra_oai_code(
                     code = m.group(1)
                     if code in ignored_codes:
                         continue
-                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                    _log_waiting_code_success(thread_id, code)
                     return code
         except Exception:
             pass
 
         time.sleep(3)
 
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+    _log_waiting_code_timeout(thread_id)
     return ""
 
 
@@ -464,10 +475,9 @@ def poll_tempmailio_oai_code(
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     ignored_codes = _normalize_code_values(skip_codes)
 
-    print(f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
+    _log_waiting_code_start(thread_id, email)
 
     for _ in range(40):
-        print(".", end="", flush=True)
         try:
             resp = requests.get(
                 f"{TEMPMAILIO_API}/{email}/messages",
@@ -496,13 +506,13 @@ def poll_tempmailio_oai_code(
                         code = m.group(1)
                         if code in ignored_codes:
                             continue
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                        _log_waiting_code_success(thread_id, code)
                         return code
         except Exception:
             pass
         time.sleep(3)
 
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+    _log_waiting_code_timeout(thread_id)
     return ""
 
 
@@ -519,10 +529,9 @@ def poll_tempmaillol_oai_code(
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     ignored_codes = _normalize_code_values(skip_codes)
 
-    print(f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
+    _log_waiting_code_start(thread_id, email)
 
     for _ in range(40):
-        print(".", end="", flush=True)
         try:
             resp = requests.get(
                 f"{TEMPMAILLOL_BASE}/inbox",
@@ -538,7 +547,7 @@ def poll_tempmaillol_oai_code(
 
             data = resp.json()
             if data is None or (isinstance(data, dict) and not data):
-                print(f"\n[线程 {thread_id}] [警告] 邮箱已过期")
+                print(f"[线程 {thread_id}] [警告] 邮箱已过期")
                 return ""
 
             email_list = data.get("emails", []) if isinstance(data, dict) else []
@@ -569,14 +578,14 @@ def poll_tempmaillol_oai_code(
                     code = m.group(1)
                     if code in ignored_codes:
                         continue
-                    print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                    _log_waiting_code_success(thread_id, code)
                     return code
         except Exception:
             pass
 
         time.sleep(3)
 
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+    _log_waiting_code_timeout(thread_id)
     return ""
 
 
@@ -600,10 +609,9 @@ def poll_dropmail_oai_code(
     }
     """
 
-    print(f"[线程 {thread_id}] [*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
+    _log_waiting_code_start(thread_id, email)
 
     for _ in range(40):
-        print(".", end="", flush=True)
         try:
             resp = requests.post(
                 DROPMAIL_API,
@@ -632,11 +640,11 @@ def poll_dropmail_oai_code(
                         code = m.group(1)
                         if code in ignored_codes:
                             continue
-                        print(f"\n[线程 {thread_id}] [信息] 已收到验证码: {code}")
+                        _log_waiting_code_success(thread_id, code)
                         return code
         except Exception:
             pass
         time.sleep(3)
 
-    print(f"\n[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+    _log_waiting_code_timeout(thread_id)
     return ""
