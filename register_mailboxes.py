@@ -15,6 +15,7 @@ MAILTM_BASE = "https://api.mail.tm"
 TEMPMAILLOL_BASE = "https://api.tempmail.lol/v2"
 TEMPMAILIO_API = "https://api.internal.temp-mail.io/api/v3/email"
 DROPMAIL_API = "https://dropmail.me/api/graphql"
+OTP_CODE_PATTERN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,28 @@ class TempMailbox:
     sid_token: str = ""
     password: str = ""
     config_name: str = ""
+
+
+def _contains_mail_keyword(*parts: Any) -> bool:
+    for part in parts:
+        text = str(part or "")
+        if not text:
+            continue
+        lowered = text.lower()
+        if "openai" in lowered or "chatgpt" in lowered:
+            return True
+    return False
+
+
+def _extract_otp_from_parts(*parts: Any) -> str:
+    for part in parts:
+        text = str(part or "")
+        if not text:
+            continue
+        match = OTP_CODE_PATTERN.search(text)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _log_waiting_code_start(thread_id: int, email: str) -> None:
@@ -392,7 +415,6 @@ def poll_hydra_oai_code(
     skip_codes: Optional[Set[str]] = None,
 ) -> str:
     url_list = f"{api_base}/messages"
-    regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     ignored_codes = _normalize_code_values(skip_codes)
 
@@ -445,14 +467,12 @@ def poll_hydra_oai_code(
                 html = mail_data.get("html") or ""
                 if isinstance(html, list):
                     html = "\n".join(str(x) for x in html)
-                content = "\n".join([subject, intro, text, str(html)])
 
-                if "openai" not in sender and "openai" not in content.lower():
+                if not _contains_mail_keyword(sender, subject, intro, text, html):
                     continue
 
-                m = re.search(regex, content)
-                if m:
-                    code = m.group(1)
+                code = _extract_otp_from_parts(subject, intro, text, html)
+                if code:
                     if code in ignored_codes:
                         continue
                     _log_waiting_code_success(thread_id, code)
@@ -474,7 +494,6 @@ def poll_tempmailio_oai_code(
     skip_message_ids: Optional[Set[str]] = None,
     skip_codes: Optional[Set[str]] = None,
 ) -> str:
-    regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     ignored_codes = _normalize_code_values(skip_codes)
 
@@ -499,14 +518,12 @@ def poll_tempmailio_oai_code(
                     sender = str(msg.get("from") or "").lower()
                     subject = str(msg.get("subject") or "")
                     body = str(msg.get("body_text") or "")
-                    content = "\n".join([subject, body])
 
-                    if "openai" not in sender and "openai" not in content.lower():
+                    if not _contains_mail_keyword(sender, subject, body):
                         continue
 
-                    m = re.search(regex, content)
-                    if m:
-                        code = m.group(1)
+                    code = _extract_otp_from_parts(subject, body)
+                    if code:
                         if code in ignored_codes:
                             continue
                         _log_waiting_code_success(thread_id, code)
@@ -528,7 +545,6 @@ def poll_tempmaillol_oai_code(
     skip_message_ids: Optional[Set[str]] = None,
     skip_codes: Optional[Set[str]] = None,
 ) -> str:
-    regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     ignored_codes = _normalize_code_values(skip_codes)
 
@@ -571,14 +587,12 @@ def poll_tempmaillol_oai_code(
                 subject = str(msg.get("subject") or "")
                 body = str(msg.get("body") or "")
                 html = str(msg.get("html") or "")
-                content = "\n".join([sender, subject, body, html])
 
-                if "openai" not in sender and "openai" not in content.lower():
+                if not _contains_mail_keyword(sender, subject, body, html):
                     continue
 
-                m = re.search(regex, content)
-                if m:
-                    code = m.group(1)
+                code = _extract_otp_from_parts(subject, body, html)
+                if code:
                     if code in ignored_codes:
                         continue
                     _log_waiting_code_success(thread_id, code)
@@ -601,7 +615,6 @@ def poll_dropmail_oai_code(
     skip_message_ids: Optional[Set[str]] = None,
     skip_codes: Optional[Set[str]] = None,
 ) -> str:
-    regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: Set[str] = _normalize_message_ids(skip_message_ids)
     ignored_codes = _normalize_code_values(skip_codes)
     query = """
@@ -633,14 +646,12 @@ def poll_dropmail_oai_code(
                     seen_ids.add(msg_id)
 
                     text = str(msg.get("text") or "")
-                    content = text
 
-                    if "openai" not in content.lower():
+                    if not _contains_mail_keyword(text):
                         continue
 
-                    m = re.search(regex, content)
-                    if m:
-                        code = m.group(1)
+                    code = _extract_otp_from_parts(text)
+                    if code:
                         if code in ignored_codes:
                             continue
                         _log_waiting_code_success(thread_id, code)

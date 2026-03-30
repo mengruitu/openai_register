@@ -9,7 +9,6 @@ import re
 import shutil
 import threading
 import time
-import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -945,7 +944,7 @@ def register_accounts(
             target_count - success_count,
             max_attempts - attempts,
         )
-        batch_results: List[bool] = []
+        batch_success_count = 0
         batch_results_lock = threading.Lock()
         threads = []
 
@@ -953,6 +952,7 @@ def register_accounts(
             current_thread_id = attempts + index + 1
 
             def _task(tid: int = current_thread_id) -> None:
+                nonlocal batch_success_count
                 is_success = register_single_account(
                     proxy,
                     provider_key,
@@ -963,8 +963,9 @@ def register_accounts(
                     dingtalk_webhook,
                     dingtalk_fallback_interval_seconds,
                 )
-                with batch_results_lock:
-                    batch_results.append(is_success)
+                if is_success:
+                    with batch_results_lock:
+                        batch_success_count += 1
 
             thread = threading.Thread(target=_task)
             thread.daemon = True
@@ -977,7 +978,7 @@ def register_accounts(
             thread.join()
 
         attempts += current_batch_size
-        batch_success = sum(1 for item in batch_results if item)
+        batch_success = batch_success_count
         success_count += batch_success
         log_info(
             f"补号批次完成：本批成功 {batch_success} 个，累计成功 {success_count}/{target_count}"
@@ -1213,8 +1214,7 @@ def worker(
                 logger.warning(f"[线程 {thread_id}] 本轮任务未成功")
 
         except Exception as e:
-            logger.error(f"[线程 {thread_id}] 发生未捕获异常: {e}")
-            logger.error(f"[线程 {thread_id}] {traceback.format_exc()}")
+            logger.exception(f"[线程 {thread_id}] 发生未捕获异常: {e}")
             is_success = False
 
         if once:

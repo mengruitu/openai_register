@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from curl_cffi import requests
 
@@ -35,10 +35,16 @@ WEB_SIGNUP_REQUEST_TIMEOUT_SECONDS = 20
 PRIME_OAUTH_MAX_REQUEST_ATTEMPTS = 3
 PRIME_OAUTH_RETRY_DELAY_SECONDS = 2
 PRIME_OAUTH_REQUEST_TIMEOUT_SECONDS = 20
+CHATGPT_SESSION_URL = "https://chatgpt.com/api/auth/session"
+SESSION_API_REQUEST_TIMEOUT_SECONDS = 15
+DEFAULT_SESSION_FALLBACK_EXPIRES_IN_SECONDS = 1800
 SENTINEL_FRAME_URL = (
     "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
 )
 SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+SENTINEL_DOCUMENT_KEYS = ("visibilityState", "readyState", "documentURI", "location")
+SENTINEL_WINDOW_KEYS = ("location", "document", "navigator", "origin", "window")
+SENTINEL_SCRIPT_SOURCES = (SENTINEL_SDK_URL, SENTINEL_FRAME_URL)
 SENTINEL_POW_PREFIX = "gAAAAAB"
 SENTINEL_POW_SUFFIX = "~S"
 SENTINEL_POW_MAX_ATTEMPTS = 500000
@@ -474,6 +480,116 @@ def response_text_preview(resp: Any, limit: int = 240) -> str:
     return compact[: limit - 3] + "..."
 
 
+def _parse_json_object(raw_text: str) -> Dict[str, Any]:
+    content = str(raw_text or "").strip()
+    if not content:
+        return {}
+
+    candidates = [content]
+    match = re.search(r"\{.*\}", content, re.S)
+    if match:
+        candidates.append(match.group(0))
+
+    seen: Set[str] = set()
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            return payload
+
+    return {}
+
+
+def _session_fallback_expired_at(payload: Dict[str, Any]) -> str:
+    expires = str(payload.get("expires") or "").strip()
+    if expires:
+        return expires
+
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ",
+        time.gmtime(time.time() + DEFAULT_SESSION_FALLBACK_EXPIRES_IN_SECONDS),
+    )
+
+
+def try_token_via_session_api(session: Any, thread_id: int) -> Optional[str]:
+    logger.info(f"[线程 {thread_id}] [信息] 尝试通过 chatgpt session 接口兜底提取 token")
+
+    try:
+        resp = session.get(
+            CHATGPT_SESSION_URL,
+            headers={
+                "accept": "application/json,text/plain,*/*",
+                "referer": "https://chatgpt.com/",
+            },
+            timeout=SESSION_API_REQUEST_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning(f"[线程 {thread_id}] [警告] 读取 chatgpt session 接口失败: {exc}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(
+            f"[线程 {thread_id}] [警告] chatgpt session 接口状态异常: {resp.status_code}，"
+            f"摘要: {response_text_preview(resp)}"
+        )
+        return None
+
+    try:
+        payload = resp.json() if resp.content else {}
+    except Exception:
+        payload = _parse_json_object(getattr(resp, "text", ""))
+
+    if not isinstance(payload, dict) or not payload:
+        logger.warning(f"[线程 {thread_id}] [警告] chatgpt session 接口未返回有效 JSON")
+        return None
+
+    access_token = str(payload.get("accessToken") or "").strip()
+    if not access_token:
+        logger.warning(f"[线程 {thread_id}] [警告] chatgpt session 接口响应中缺少 accessToken")
+        return None
+
+    user_info = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    account_info = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+    session_token = str(payload.get("sessionToken") or "").strip()
+    email = str(user_info.get("email") or "").strip()
+    account_id = str(
+        user_info.get("id")
+        or account_info.get("id")
+        or ""
+    ).strip()
+    now = int(time.time())
+
+    config = {
+        "id_token": "",
+        "access_token": access_token,
+        "refresh_token": "",
+        "account_id": account_id,
+        "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "email": email,
+        "type": "chatgpt_session_fallback",
+        "expired": _session_fallback_expired_at(payload),
+    }
+    if session_token:
+        config["session_token"] = session_token
+
+    plan_type = str(account_info.get("planType") or "").strip()
+    if plan_type:
+        config["plan_type"] = plan_type
+
+    logger.info(
+        f"[线程 {thread_id}] [信息] 已通过 chatgpt session 接口提取 access_token"
+        f"{f'，email={email}' if email else ''}"
+        f"{f'，account_id={account_id}' if account_id else ''}"
+    )
+    return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+
+
 def post_email_otp_validate(
     session: Any,
     *,
@@ -674,7 +790,7 @@ def _sentinel_query_keys_signature() -> str:
     )
 
 
-def _sentinel_random_choice(values: List[str], default: str = "") -> str:
+def _sentinel_random_choice(values: Sequence[str], default: str = "") -> str:
     if not values:
         return default
     return random.choice(values)
@@ -689,10 +805,7 @@ def _build_sentinel_pow_fingerprint() -> List[Any]:
         "userAgent": SENTINEL_DEFAULT_USER_AGENT,
         "hardwareConcurrency": str(SENTINEL_DEFAULT_HARDWARE_CONCURRENCY),
     }
-    nav_key = _sentinel_random_choice(list(navigator_values.keys()), "userAgent")
-    script_sources = [SENTINEL_SDK_URL, SENTINEL_FRAME_URL]
-    document_keys = ["visibilityState", "readyState", "documentURI", "location"]
-    window_keys = ["location", "document", "navigator", "origin", "window"]
+    nav_key = _sentinel_random_choice(tuple(navigator_values.keys()), "userAgent")
     perf_now_ms = time.perf_counter() * 1000
     time_origin_ms = int(time.time() * 1000 - perf_now_ms)
     return [
@@ -701,8 +814,8 @@ def _build_sentinel_pow_fingerprint() -> List[Any]:
         SENTINEL_DEFAULT_JS_HEAP_SIZE_LIMIT,
         random.random(),
         SENTINEL_DEFAULT_USER_AGENT,
-        _sentinel_random_choice(script_sources, SENTINEL_SDK_URL),
-        _sentinel_random_choice(script_sources, SENTINEL_SDK_URL),
+        _sentinel_random_choice(SENTINEL_SCRIPT_SOURCES, SENTINEL_SDK_URL),
+        _sentinel_random_choice(SENTINEL_SCRIPT_SOURCES, SENTINEL_SDK_URL),
         SENTINEL_DEFAULT_LANGUAGE,
         SENTINEL_DEFAULT_LANGUAGES,
         random.random(),
@@ -710,8 +823,8 @@ def _build_sentinel_pow_fingerprint() -> List[Any]:
             f"{nav_key}{SENTINEL_MINUS_SIGN}"
             f"{navigator_values.get(nav_key, SENTINEL_DEFAULT_USER_AGENT)}"
         ),
-        _sentinel_random_choice(document_keys, "visibilityState"),
-        _sentinel_random_choice(window_keys, "location"),
+        _sentinel_random_choice(SENTINEL_DOCUMENT_KEYS, "visibilityState"),
+        _sentinel_random_choice(SENTINEL_WINDOW_KEYS, "location"),
         perf_now_ms,
         str(uuid.uuid4()),
         _sentinel_query_keys_signature(),
@@ -733,13 +846,16 @@ def solve_sentinel_pow(*, seed: str, difficulty: str, thread_id: int) -> str:
     if not seed_text or not target:
         return ""
 
-    started_at = time.perf_counter()
-    fingerprint = _build_sentinel_pow_fingerprint()
+    perf_counter = time.perf_counter
+    hash_hex = _sentinel_hash_hex
+    encode_candidate = _sentinel_b64_json
+    started_at = perf_counter()
+    candidate = _build_sentinel_pow_fingerprint()
     prefix_len = len(target)
     timeout = SENTINEL_POW_TIMEOUT_SECONDS
 
     for attempt in range(SENTINEL_POW_MAX_ATTEMPTS):
-        elapsed = time.perf_counter() - started_at
+        elapsed = perf_counter() - started_at
         if elapsed >= timeout:
             elapsed_ms = round(elapsed * 1000)
             logger.error(
@@ -748,19 +864,18 @@ def solve_sentinel_pow(*, seed: str, difficulty: str, thread_id: int) -> str:
             )
             return ""
 
-        candidate = list(fingerprint)
         candidate[3] = attempt
-        candidate[9] = round((time.perf_counter() - started_at) * 1000)
-        encoded = _sentinel_b64_json(candidate)
-        if _sentinel_hash_hex(seed_text + encoded)[:prefix_len] <= target:
-            elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        candidate[9] = round((perf_counter() - started_at) * 1000)
+        encoded = encode_candidate(candidate)
+        if hash_hex(seed_text + encoded)[:prefix_len] <= target:
+            elapsed_ms = round((perf_counter() - started_at) * 1000)
             logger.info(
                 f"[线程 {thread_id}] [信息] Sentinel POW 求解成功，难度={target}，"
                 f"尝试 {attempt + 1} 次，耗时 {elapsed_ms} ms"
             )
             return f"{SENTINEL_POW_PREFIX}{encoded}{SENTINEL_POW_SUFFIX}"
 
-    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    elapsed_ms = round((perf_counter() - started_at) * 1000)
     logger.error(
         f"[线程 {thread_id}] [错误] Sentinel POW 求解失败，难度={target}，"
         f"已尝试 {SENTINEL_POW_MAX_ATTEMPTS} 次，耗时 {elapsed_ms} ms"

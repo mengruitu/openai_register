@@ -75,6 +75,13 @@ CFMAIL_FAILURE_STATE: Dict[str, Dict[str, Any]] = {}
 CFMAIL_WORKER_DOMAIN = ""
 CFMAIL_EMAIL_DOMAIN = ""
 CFMAIL_ADMIN_PASSWORD = ""
+CFMAIL_REMINDER_MARKERS = (
+    "继续未完成的步骤",
+    "完成帐户设置",
+    "complete your account setup",
+    "finish setting up your account",
+    "your progress has been saved",
+)
 
 
 def _log_waiting_code_start(thread_id: int, email: str) -> None:
@@ -87,6 +94,17 @@ def _log_waiting_code_success(thread_id: int, code: str) -> None:
 
 def _log_waiting_code_timeout(thread_id: int) -> None:
     logger.warning(f"[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+
+
+def _contains_cfmail_keyword(*parts: Any) -> bool:
+    for part in parts:
+        text = str(part or "")
+        if not text:
+            continue
+        lowered = text.lower()
+        if "openai" in lowered or "chatgpt" in lowered:
+            return True
+    return False
 
 
 def normalize_host(value: str) -> str:
@@ -733,26 +751,22 @@ def poll_cfmail_oai_code(
                 recipient = str(msg.get("address") or "").strip().lower()
                 raw = str(msg.get("raw") or "")
                 metadata = msg.get("metadata") or {}
-                metadata_text = json.dumps(metadata, ensure_ascii=False)
                 subject, decoded_content = _extract_cfmail_subject_and_content(raw)
-                content = "\n".join([recipient, subject, decoded_content, metadata_text])
 
                 if recipient and recipient != email.strip().lower():
                     continue
-                lowered_content = content.lower()
-
-                reminder_markers = [
-                    "继续未完成的步骤",
-                    "完成帐户设置",
-                    "complete your account setup",
-                    "finish setting up your account",
-                    "your progress has been saved",
-                ]
-                if any(marker in lowered_content for marker in reminder_markers):
+                lowered_subject = subject.lower()
+                lowered_content = decoded_content.lower()
+                if any(
+                    marker in lowered_subject or marker in lowered_content
+                    for marker in CFMAIL_REMINDER_MARKERS
+                ):
                     continue
 
-                if "openai" not in lowered_content and "chatgpt" not in lowered_content:
-                    continue
+                if not _contains_cfmail_keyword(recipient, subject, decoded_content):
+                    metadata_text = json.dumps(metadata, ensure_ascii=False) if metadata else ""
+                    if not _contains_cfmail_keyword(metadata_text):
+                        continue
 
                 code = _extract_cfmail_oai_code(subject, decoded_content)
                 if code:

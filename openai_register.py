@@ -5,6 +5,7 @@
 """
 import argparse
 import builtins
+import ctypes
 import json
 import logging
 import math
@@ -17,9 +18,8 @@ import string
 import sys
 import threading
 import time
-import traceback
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -36,6 +36,7 @@ from register_auth import (
     submit_callback_url,
     try_token_via_existing_session as _try_token_via_existing_session,
     try_token_via_password_login as _try_token_via_password_login,
+    try_token_via_session_api as _try_token_via_session_api,
     try_token_via_workspace_select as _try_token_via_workspace_select,
 )
 from register_cfmail import (
@@ -122,6 +123,10 @@ DEFAULT_CFMAIL_FALLBACK_PROVIDER = "tempmaillol"
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
 CREATE_ACCOUNT_MAX_ATTEMPTS = 2
 CREATE_ACCOUNT_RETRY_DELAY_SECONDS = 2
+LOW_MEMORY_SOFT_LIMIT_MB = 2560
+LOW_MEMORY_HARD_LIMIT_MB = 1536
+
+
 def _random_name_part(min_length: int = 4, max_length: int = 9) -> str:
     length = random.randint(min_length, max_length)
     letters = string.ascii_lowercase
@@ -381,6 +386,122 @@ def _generate_password(length: int = 12) -> str:
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
+@dataclass
+class RegistrationAttemptResult:
+    success: bool = False
+    token_json: str = ""
+    password: str = ""
+    email: str = ""
+    stage: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    provider_key: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def as_legacy_result(self) -> Optional[Tuple[str, str]]:
+        if not self.success or not self.token_json:
+            return None
+        return self.token_json, self.password
+
+
+def _preview_response_text(resp: Any, limit: int = 600) -> str:
+    preview = _response_text_preview(resp, limit=limit) if resp is not None else ""
+    if preview:
+        return preview
+    status_code = getattr(resp, "status_code", "unknown")
+    return f"status={status_code}"
+
+
+def _detect_total_memory_mb() -> int:
+    try:
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return max(0, int(parts[1]) // 1024)
+    except Exception:
+        pass
+
+    try:
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return max(0, int(status.ullTotalPhys // (1024 * 1024)))
+    except Exception:
+        pass
+
+    return 0
+
+
+def _apply_low_memory_tuning(args: argparse.Namespace) -> None:
+    total_memory_mb = _detect_total_memory_mb()
+    if total_memory_mb <= 0:
+        return
+
+    args.detected_total_memory_mb = total_memory_mb
+    if total_memory_mb <= LOW_MEMORY_HARD_LIMIT_MB:
+        max_register_concurrency = 1
+        max_register_batch_size = 1
+        max_token_check_workers = 1
+        profile_name = "hard"
+    elif total_memory_mb <= LOW_MEMORY_SOFT_LIMIT_MB:
+        max_register_concurrency = 2
+        max_register_batch_size = 2
+        max_token_check_workers = 2
+        profile_name = "soft"
+    else:
+        return
+
+    original_values = (
+        args.register_openai_concurrency,
+        args.register_batch_size,
+        args.token_check_workers,
+    )
+    args.register_openai_concurrency = min(
+        args.register_openai_concurrency,
+        max_register_concurrency,
+    )
+    args.register_batch_size = min(
+        args.register_batch_size,
+        max_register_batch_size,
+    )
+    args.token_check_workers = min(
+        args.token_check_workers,
+        max_token_check_workers,
+    )
+
+    tuned_values = (
+        args.register_openai_concurrency,
+        args.register_batch_size,
+        args.token_check_workers,
+    )
+    if tuned_values != original_values:
+        logger.info(
+            "[信息] 检测到低内存环境（总内存约 %s MB，profile=%s），"
+            "已自动收敛并发：register_openai_concurrency=%s，register_batch_size=%s，token_check_workers=%s",
+            total_memory_mb,
+            profile_name,
+            args.register_openai_concurrency,
+            args.register_batch_size,
+            args.token_check_workers,
+        )
+
+
 # ==========================================
 # 核心注册逻辑
 # ==========================================
@@ -402,12 +523,42 @@ def get_auto_proxy() -> Optional[str]:
 
 def run(
     proxy: Optional[str], provider_key: str, thread_id: int, mailtm_base: str
-) -> Optional[Tuple[str, str]]:
+) -> RegistrationAttemptResult:
     # 注册主流程：
     # 1. 检测出口 / 代理
     # 2. 创建临时邮箱
     # 3. OpenAI 注册 + 收验证码
     # 4. 提取 token 并持久化
+    result = RegistrationAttemptResult(
+        provider_key=str(provider_key or "").strip().lower(),
+        metadata={"thread_id": thread_id},
+    )
+
+    def _set_stage(stage: str, **metadata: Any) -> None:
+        result.stage = stage
+        if metadata:
+            result.metadata.update(metadata)
+
+    def _fail(
+        stage: str,
+        error_code: str,
+        error_message: str,
+        *,
+        affect_cooldown: bool = False,
+        cfmail_reason: Optional[str] = None,
+        **metadata: Any,
+    ) -> RegistrationAttemptResult:
+        _set_stage(stage, **metadata)
+        result.success = False
+        result.error_code = str(error_code or "").strip()
+        result.error_message = str(error_message or "").strip()
+        if affect_cooldown:
+            _mark_cfmail_failure(
+                cfmail_reason or f"{result.error_code or 'failed'}: {result.error_message}",
+                affect_cooldown=True,
+            )
+        return result
+
     if provider_key == "cfmail":
         _reload_cfmail_accounts_if_needed()
 
@@ -427,10 +578,12 @@ def run(
     logger.info(
         f"[线程 {thread_id}] [信息] 当前浏览器指纹: {current_impersonate}"
     )
+    result.metadata["impersonate"] = current_impersonate
 
     s = requests.Session(proxies=proxies, impersonate=current_impersonate)
 
     try:
+        _set_stage("network_check")
         trace = s.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
         trace = trace.text
         loc_re = re.search(r"^loc=(.+)$", trace, re.MULTILINE)
@@ -438,10 +591,16 @@ def run(
         logger.info(
             f"[线程 {thread_id}] [信息] 当前出口地区: {loc}"
         )
+        result.metadata["exit_loc"] = loc
         if loc != "US":
             if not builtins.yasal_bypass_ip_choice:
                 logger.info(f"[线程 {thread_id}] [信息] 非 US 节点，已按配置停止当前线程")
-                return None
+                return _fail(
+                    "network_check",
+                    "non_us_exit_blocked",
+                    f"当前出口地区 {loc} 不符合要求",
+                    exit_loc=loc,
+                )
 
             logger.info(
                 f"[线程 {thread_id}] [信息] 当前节点地区 ({loc}) 不是 US，已默认继续执行"
@@ -469,13 +628,19 @@ def run(
                 logger.error(
                     f"[线程 {thread_id}] [错误] 当前节点地区 {loc} 风险过高，请更换代理后重试"
                 )
-                return None
+                return _fail(
+                    "network_check",
+                    "high_risk_exit",
+                    f"当前出口地区 {loc} 风险过高",
+                    exit_loc=loc,
+                )
     except Exception as e:
         logger.error(
             f"[线程 {thread_id}] [错误] 网络检查失败，请确认代理可用: {e}"
         )
-        return None
+        return _fail("network_check", "network_check_failed", str(e))
 
+    _set_stage("mailbox_create")
     mailbox = get_temp_mailbox(
         provider_key,
         thread_id,
@@ -483,30 +648,51 @@ def run(
         mailtm_base=mailtm_base,
     )
     if not mailbox:
-        return None
+        return _fail(
+            "mailbox_create",
+            "mailbox_unavailable",
+            f"临时邮箱服务不可用: {provider_key}",
+        )
     cfmail_config_name = mailbox.config_name
     email = mailbox.email
+    result.email = email
+    result.metadata.update(
+        {
+            "mailbox_provider": mailbox.provider,
+            "mailbox_email": email,
+            "cfmail_config_name": cfmail_config_name or "",
+        }
+    )
     logger.info(
         f"[线程 {thread_id}] [*] 成功获取临时邮箱与授权: {email} ({mailbox.provider})"
     )
 
     oauth = generate_oauth_url()
+    result.metadata["oauth_redirect_uri"] = oauth.redirect_uri
 
     try:
+        _set_stage("signup_start")
         signup_start_url = bootstrap_web_signup_start_url(s, thread_id)
         if not signup_start_url:
-            return None
+            return _fail(
+                "signup_start",
+                "signup_start_url_missing",
+                "未获取到 web signup 授权入口",
+            )
 
+        _set_stage("oauth_prime", signup_start_url=signup_start_url)
         resp = _prime_oauth_session(s, signup_start_url, thread_id)
         did = s.cookies.get("oai-did")
         logger.info(
             f"[线程 {thread_id}] [信息] 已获取 Device ID: {did}"
         )
+        result.metadata["device_id"] = did or ""
 
         signup_body = (
             f'{{"username":{{"value":"{email}","kind":"email"}},'
             f'"screen_hint":"login_or_signup"}}'
         )
+        _set_stage("authorize_continue")
         sentinel = _request_sentinel_token(
             did=did,
             proxies=proxies,
@@ -514,7 +700,11 @@ def run(
             thread_id=thread_id,
         )
         if not sentinel:
-            return None
+            return _fail(
+                "authorize_continue",
+                "sentinel_token_missing",
+                "未获取到 openai-sentinel-token",
+            )
 
         signup_resp = s.post(
             "https://auth.openai.com/api/accounts/authorize/continue",
@@ -530,18 +720,26 @@ def run(
             f"[线程 {thread_id}] [信息] 注册表单已提交，状态码: {signup_resp.status_code}"
         )
         if signup_resp.status_code in (403, 429):
+            signup_error_preview = _preview_response_text(signup_resp)
             logger.error(
-                f"[线程 {thread_id}] [错误] 注册请求被拒绝（{signup_resp.status_code}）: {signup_resp.text}"
+                f"[线程 {thread_id}] [错误] 注册请求被拒绝（{signup_resp.status_code}）: {signup_error_preview}"
             )
-            return None
+            return _fail(
+                "authorize_continue",
+                f"authorize_continue_{signup_resp.status_code}",
+                signup_error_preview,
+                status_code=signup_resp.status_code,
+            )
 
         password = _generate_password()
+        result.password = password
         register_body = json.dumps(
             {
                 "password": password,
                 "username": email,
             }
         )
+        _set_stage("password_register")
         existing_signup_message_ids = get_mailbox_message_snapshot(
             mailbox, thread_id, proxies
         )
@@ -558,11 +756,18 @@ def run(
             f"[线程 {thread_id}] [信息] 密码注册请求已提交，状态码: {register_resp.status_code}"
         )
         if register_resp.status_code != 200:
+            register_error_preview = _preview_response_text(register_resp)
             logger.error(
-                f"[线程 {thread_id}] [错误] 提交密码失败: {register_resp.text}"
+                f"[线程 {thread_id}] [错误] 提交密码失败: {register_error_preview}"
             )
-            return None
+            return _fail(
+                "password_register",
+                f"user_register_{register_resp.status_code}",
+                register_error_preview,
+                status_code=register_resp.status_code,
+            )
 
+        _set_stage("email_otp_send")
         otp_resp = s.get(
             "https://auth.openai.com/api/accounts/email-otp/send",
             headers={
@@ -574,11 +779,18 @@ def run(
             f"[线程 {thread_id}] [信息] 注册阶段验证码发送请求已提交，状态码: {otp_resp.status_code}"
         )
         if otp_resp.status_code != 200:
+            otp_error_preview = _preview_response_text(otp_resp)
             logger.error(
-                f"[线程 {thread_id}] [错误] 注册阶段发送验证码失败: {otp_resp.text}"
+                f"[线程 {thread_id}] [错误] 注册阶段发送验证码失败: {otp_error_preview}"
             )
-            return None
+            return _fail(
+                "email_otp_send",
+                f"email_otp_send_{otp_resp.status_code}",
+                otp_error_preview,
+                status_code=otp_resp.status_code,
+            )
 
+        _set_stage("email_otp_wait")
         code = get_oai_code(
             mailbox,
             thread_id,
@@ -586,9 +798,15 @@ def run(
             skip_message_ids=existing_signup_message_ids,
         )
         if not code:
-            _mark_cfmail_failure("email_code empty", affect_cooldown=True)
-            return None
+            return _fail(
+                "email_otp_wait",
+                "email_code_empty",
+                "未获取到注册阶段验证码",
+                affect_cooldown=True,
+                cfmail_reason="email_code empty",
+            )
 
+        _set_stage("email_otp_validate")
         code_resp = _post_email_otp_validate(
             s,
             code=code,
@@ -607,12 +825,18 @@ def run(
                 f"signup email otp validate status={getattr(code_resp, 'status_code', 'unknown')}",
                 affect_cooldown=False,
             )
-            return None
+            return _fail(
+                "email_otp_validate",
+                f"email_otp_validate_{getattr(code_resp, 'status_code', 'unknown')}",
+                preview or "注册阶段邮箱验证码校验失败",
+                status_code=getattr(code_resp, "status_code", "unknown"),
+            )
 
         signup_profile = _build_random_signup_profile()
         create_account_body = json.dumps(
             signup_profile, ensure_ascii=False, separators=(",", ":")
         )
+        _set_stage("create_account", signup_profile=signup_profile)
         logger.info(
             f"[线程 {thread_id}] [信息] 本次注册资料: name={signup_profile['name']}, birthdate={signup_profile['birthdate']}"
         )
@@ -657,13 +881,20 @@ def run(
                     or "registration_disallowed" in err_msg
                 ),
             )
-            return None
+            return _fail(
+                "create_account",
+                f"create_account_{create_account_status}",
+                err_msg or "创建账户失败",
+                status_code=create_account_status,
+            )
 
         logger.info(
             f"[线程 {thread_id}] [信息] 注册流程已完成，当前会话可能跳到绑手机页，改用全新登录流程提取 token"
         )
         token_json = None
+        token_source = ""
         if not token_json:
+            _set_stage("token_password_login")
             token_json = _try_token_via_password_login(
                 email=email,
                 password=password,
@@ -676,40 +907,58 @@ def run(
                 get_oai_code_fn=get_oai_code,
                 get_mailbox_message_snapshot_fn=get_mailbox_message_snapshot,
             )
+            if token_json:
+                token_source = "password_login"
 
         if not token_json:
             logger.warning(
                 f"[线程 {thread_id}] [警告] 新登录流程未拿到 token，尝试回退到当前注册会话"
             )
+            _set_stage("token_workspace_select")
             auth_cookie = s.cookies.get("oai-client-auth-session")
             if auth_cookie:
                 token_json = _try_token_via_workspace_select(
                     s, oauth, auth_cookie, thread_id
                 )
+                if token_json:
+                    token_source = "workspace_select"
             else:
                 logger.warning(f"[线程 {thread_id}] [警告] 当前会话中暂未拿到授权 Cookie")
 
         if not token_json:
+            _set_stage("token_existing_session")
             token_json = _try_token_via_existing_session(s, oauth, thread_id)
+            if token_json:
+                token_source = "existing_session"
+
+        if not token_json:
+            _set_stage("token_session_api")
+            token_json = _try_token_via_session_api(s, thread_id)
+            if token_json:
+                token_source = "session_api"
 
         if token_json:
             _mark_cfmail_success()
-            return token_json, password
+            result.success = True
+            result.token_json = token_json
+            result.error_code = ""
+            result.error_message = ""
+            _set_stage("completed", token_source=token_source or "unknown")
+            return result
 
         logger.error(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token")
-        return None
+        return _fail(
+            "token_finalize",
+            "token_extraction_failed",
+            "已完成注册，但仍未能获取可用 token",
+        )
 
     except Exception as e:
-        logger.error(
-            f"[线程 {thread_id}] [错误] 运行过程中发生异常: {e}"
-        )
-        logger.error(
-            f"[线程 {thread_id}] [错误] 异常详情: {traceback.format_exc()}"
-        )
+        logger.exception(f"[线程 {thread_id}] [错误] 运行过程中发生异常: {e}")
         logger.info(
             f"[线程 {thread_id}] [提示] 本轮失败，下一轮将继续重试"
         )
-        return None
+        return _fail("exception", "unhandled_exception", str(e))
 
 
 def _provider_fallback_chain(provider_key: str) -> List[str]:
@@ -742,8 +991,8 @@ def run_with_fallback(
                 f"开始回退到 {candidate_provider}"
             )
 
-        result = run(proxy, candidate_provider, thread_id, mailtm_base)
-        if result:
+        attempt = run(proxy, candidate_provider, thread_id, mailtm_base)
+        if attempt.success:
             if index > 0:
                 logger.info(
                     f"[线程 {thread_id}] [信息] 已通过回退邮箱服务 {candidate_provider} 完成注册"
@@ -759,7 +1008,14 @@ def run_with_fallback(
                     logger.info(
                         f"[线程 {thread_id}] [信息] 已发送回退邮箱服务钉钉提醒：{provider_chain[0]} -> {candidate_provider}"
                     )
-            return result, candidate_provider
+            return attempt.as_legacy_result(), candidate_provider
+
+        logger.warning(
+            f"[线程 {thread_id}] [警告] 使用邮箱服务 {candidate_provider} 的注册尝试失败："
+            f"stage={attempt.stage or 'unknown'}"
+            f", error_code={attempt.error_code or 'unknown'}"
+            f", message={attempt.error_message or 'unknown'}"
+        )
 
     return None, last_used_provider
 
@@ -1059,6 +1315,7 @@ def main() -> None:
     args.register_start_delay_seconds = max(0.0, float(args.register_start_delay_seconds))
     args.cfmail_fail_threshold = max(1, args.cfmail_fail_threshold)
     args.cfmail_cooldown_seconds = max(0, args.cfmail_cooldown_seconds)
+    _apply_low_memory_tuning(args)
     args.cfmail_profile = str(args.cfmail_profile or "auto").strip() or "auto"
     args.cfmail_profile_name = (
         str(args.cfmail_profile_name or "custom").strip() or "custom"
