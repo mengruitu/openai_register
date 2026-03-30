@@ -20,13 +20,17 @@ from curl_cffi import requests
 from register_auth import CLIENT_ID, TOKEN_URL, _post_form
 from register_notifications import build_monitor_summary_message, send_dingtalk_alert
 
-DEFAULT_TOKEN_CHECK_WORKERS = 6
-TOKEN_USAGE_CACHE_TTL_SECONDS = 180
-TOKEN_USAGE_CACHE_MAX_SIZE = 2048
+DEFAULT_TOKEN_CHECK_WORKERS = 2
+TOKEN_USAGE_CACHE_TTL_SECONDS = 600
+TOKEN_USAGE_CACHE_MAX_SIZE = 512
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
 DEFAULT_TOKEN_REFRESH_SKEW_SECONDS = 300
 ACCOUNTS_FILE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 ACCOUNTS_FILE_BACKUP_COUNT = 5
+# 检测到库存缺口时的最短重试间隔（秒），避免等满整个 monitor_interval
+SHORTAGE_FAST_RETRY_SECONDS = 60
+# 检测到缺口但补号全部失败时的等待间隔（秒），防止空转
+SHORTAGE_FAIL_RETRY_SECONDS = 120
 
 output_lock = threading.Lock()
 _token_usage_cache_lock = threading.Lock()
@@ -558,55 +562,6 @@ def get_token_usage_check(file_path: str, timeout: int) -> TokenUsageCheck:
     return result
 
 
-def _collect_token_usage_results(
-    file_paths: List[str],
-    timeout: int,
-    request_interval: int,
-    max_workers: int,
-) -> Dict[str, TokenUsageCheck]:
-    files = [path for path in file_paths if path]
-    if not files:
-        return {}
-
-    worker_count = max(1, int(max_workers or 1))
-    results: Dict[str, TokenUsageCheck] = {}
-
-    if worker_count == 1 or len(files) == 1:
-        for index, file_path in enumerate(files):
-            results[file_path] = get_token_usage_check(file_path, timeout)
-            if request_interval > 0 and index + 1 < len(files):
-                time.sleep(request_interval)
-        return results
-
-    batch_size = min(worker_count, len(files))
-    for batch_start in range(0, len(files), batch_size):
-        batch = files[batch_start : batch_start + batch_size]
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(worker_count, len(batch))
-        ) as executor:
-            future_map = {
-                executor.submit(get_token_usage_check, file_path, timeout): file_path
-                for file_path in batch
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                file_path = future_map[future]
-                try:
-                    results[file_path] = future.result()
-                except Exception as exc:
-                    log_error(f"文件 {os.path.basename(file_path)} 并发额度查询异常: {exc}")
-                    results[file_path] = TokenUsageCheck(
-                        used_percent=None,
-                        should_delete=False,
-                        check_failed=True,
-                        reason=f"并发额度查询异常: {exc}",
-                    )
-
-        if request_interval > 0 and batch_start + batch_size < len(files):
-            time.sleep(request_interval)
-
-    return results
-
-
 def _rotate_accounts_file(file_path: str) -> None:
     """当 accounts.txt 超过大小上限时，自动归档为 .1/.2/... 文件。"""
     try:
@@ -668,6 +623,75 @@ def persist_registration_result(
     return file_name, raw_email
 
 
+def _process_single_usage_check(
+    file_path: str,
+    label: str,
+    usage_threshold: int,
+) -> Tuple[str, int, int, int]:
+    """处理单个文件的额度检查结果，返回 (action, kept, deleted, failed)。"""
+    kept = 0
+    deleted = 0
+    failed = 0
+    usage_check = TOKEN_USAGE_PENDING.get(file_path)
+    if usage_check is None:
+        return "skip", 0, 0, 0
+
+    used_percent = usage_check.used_percent
+
+    if used_percent is None:
+        if usage_check.check_failed:
+            failed = 1
+        if usage_check.should_delete:
+            log_warn(
+                f"删除 {label} 中的 {os.path.basename(file_path)}，"
+                f"{usage_check.reason or '额度查询失败'}"
+            )
+            try:
+                os.remove(file_path)
+            except FileNotFoundError:
+                pass
+            deleted = 1
+        else:
+            kept = 1
+            log_warn(
+                f"保留 {label} 中的 {os.path.basename(file_path)}，"
+                f"本轮额度查询失败，暂不删除："
+                f"{usage_check.reason or '未知原因'}"
+            )
+    elif used_percent >= usage_threshold:
+        log_info(
+            f"删除 {label} 中的 {os.path.basename(file_path)}，"
+            f"已用比例 {used_percent}% >= {usage_threshold}%"
+        )
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            pass
+        deleted = 1
+    else:
+        kept = 1
+
+    return "done", kept, deleted, failed
+
+
+# 临时字典，用于在小批量并发中传递检查结果
+TOKEN_USAGE_PENDING: Dict[str, TokenUsageCheck] = {}
+
+
+def _check_and_store(file_path: str, timeout: int) -> None:
+    """在线程中执行检查并将结果存入临时字典。"""
+    try:
+        result = get_token_usage_check(file_path, timeout)
+    except Exception as exc:
+        result = TokenUsageCheck(
+            used_percent=None,
+            should_delete=False,
+            check_failed=True,
+            reason=f"并发额度查询异常: {exc}",
+        )
+    TOKEN_USAGE_PENDING[file_path] = result
+
+
 def _cleanup_tokens_in_dir(
     directory: str,
     label: str,
@@ -676,54 +700,49 @@ def _cleanup_tokens_in_dir(
     curl_timeout: int,
     token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
 ) -> Tuple[int, int, int]:
+    """小批量并发检查账号并立即处理，兼顾速度与内存。
+
+    每批最多 token_check_workers 个文件并发请求，检查完立即处理结果
+    并释放资源，然后再进入下一批。同一时刻内存中最多只有一批的数据。
+    """
     deleted_count = 0
     kept_count = 0
     check_failed = 0
 
     file_paths = list_json_files(directory)
-    usage_results = _collect_token_usage_results(
-        file_paths,
-        curl_timeout,
-        request_interval,
-        token_check_workers,
-    )
+    batch_size = max(1, int(token_check_workers or 1))
 
-    for file_path in file_paths:
-        usage_check = usage_results.get(file_path) or TokenUsageCheck(
-            used_percent=None,
-            should_delete=False,
-            check_failed=True,
-            reason="额度查询结果缺失",
-        )
-        used_percent = usage_check.used_percent
-        if used_percent is None:
-            if usage_check.check_failed:
-                check_failed += 1
-            if usage_check.should_delete:
-                log_warn(
-                    f"删除 {label} 中的 {os.path.basename(file_path)}，{usage_check.reason or '额度查询失败'}"
-                )
-                try:
-                    os.remove(file_path)
-                except FileNotFoundError:
-                    pass
-                deleted_count += 1
-            else:
-                kept_count += 1
-                log_warn(
-                    f"保留 {label} 中的 {os.path.basename(file_path)}，本轮额度查询失败，暂不删除：{usage_check.reason or '未知原因'}"
-                )
-        elif used_percent >= usage_threshold:
-            log_info(
-                f"删除 {label} 中的 {os.path.basename(file_path)}，已用比例 {used_percent}% >= {usage_threshold}%"
-            )
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
+    for batch_start in range(0, len(file_paths), batch_size):
+        batch = file_paths[batch_start: batch_start + batch_size]
+        TOKEN_USAGE_PENDING.clear()
+
+        # 并发检查本批次文件
+        if len(batch) == 1:
+            _check_and_store(batch[0], curl_timeout)
         else:
-            kept_count += 1
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(batch),
+            ) as executor:
+                futures = [
+                    executor.submit(_check_and_store, fp, curl_timeout)
+                    for fp in batch
+                ]
+                concurrent.futures.wait(futures)
+
+        # 立即处理本批次结果并释放
+        for file_path in batch:
+            __, k, d, f = _process_single_usage_check(
+                file_path, label, usage_threshold,
+            )
+            kept_count += k
+            deleted_count += d
+            check_failed += f
+
+        TOKEN_USAGE_PENDING.clear()
+
+        # 批次间按配置间隔控制请求频率
+        if request_interval > 0 and batch_start + batch_size < len(file_paths):
+            time.sleep(request_interval)
 
     return kept_count, deleted_count, check_failed
 
@@ -771,6 +790,11 @@ def move_pool_tokens_to_active(
     curl_timeout: int,
     token_check_workers: int = DEFAULT_TOKEN_CHECK_WORKERS,
 ) -> Tuple[int, int]:
+    """小批量并发检查 B 目录账号并按需搬移到 A。
+
+    每批最多 token_check_workers 个文件并发请求，检查完立即处理
+    并释放资源，然后再进入下一批。搬移够数后立即停止。
+    """
     current_active = count_json_files(active_dir)
     needed = max(active_target - current_active, 0)
     if needed <= 0:
@@ -780,28 +804,59 @@ def move_pool_tokens_to_active(
     deleted_count = 0
     pool_files = list_json_files(pool_dir)
     random.shuffle(pool_files)
-    usage_results = _collect_token_usage_results(
-        pool_files,
-        curl_timeout,
-        request_interval,
-        token_check_workers,
-    )
+    batch_size = max(1, int(token_check_workers or 1))
 
-    for file_path in pool_files:
+    for batch_start in range(0, len(pool_files), batch_size):
         if moved_count >= needed:
             break
 
-        usage_check = usage_results.get(file_path) or TokenUsageCheck(
-            used_percent=None,
-            should_delete=False,
-            check_failed=True,
-            reason="额度查询结果缺失",
-        )
-        used_percent = usage_check.used_percent
-        if used_percent is None:
-            if usage_check.should_delete:
-                log_warn(
-                    f"删除 B 中的 {os.path.basename(file_path)}，{usage_check.reason or '额度查询失败'}"
+        batch = pool_files[batch_start: batch_start + batch_size]
+        TOKEN_USAGE_PENDING.clear()
+
+        # 并发检查本批次文件
+        if len(batch) == 1:
+            _check_and_store(batch[0], curl_timeout)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(batch),
+            ) as executor:
+                futures = [
+                    executor.submit(_check_and_store, fp, curl_timeout)
+                    for fp in batch
+                ]
+                concurrent.futures.wait(futures)
+
+        # 立即处理本批次结果
+        for file_path in batch:
+            if moved_count >= needed:
+                break
+
+            usage_check = TOKEN_USAGE_PENDING.get(file_path)
+            if usage_check is None:
+                continue
+            used_percent = usage_check.used_percent
+
+            if used_percent is None:
+                if usage_check.should_delete:
+                    log_warn(
+                        f"删除 B 中的 {os.path.basename(file_path)}，"
+                        f"{usage_check.reason or '额度查询失败'}"
+                    )
+                    try:
+                        os.remove(file_path)
+                    except FileNotFoundError:
+                        pass
+                    deleted_count += 1
+                else:
+                    log_warn(
+                        f"跳过从 B 补充 {os.path.basename(file_path)}，"
+                        f"本轮额度查询失败，暂不删除："
+                        f"{usage_check.reason or '未知原因'}"
+                    )
+            elif used_percent >= usage_threshold:
+                log_info(
+                    f"删除 B 中的 {os.path.basename(file_path)}，"
+                    f"已用比例 {used_percent}% >= {usage_threshold}%"
                 )
                 try:
                     os.remove(file_path)
@@ -809,23 +864,18 @@ def move_pool_tokens_to_active(
                     pass
                 deleted_count += 1
             else:
-                log_warn(
-                    f"跳过从 B 补充 {os.path.basename(file_path)}，本轮额度查询失败，暂不删除：{usage_check.reason or '未知原因'}"
+                destination = _build_unique_path(
+                    active_dir, os.path.basename(file_path),
                 )
-        elif used_percent >= usage_threshold:
-            log_info(
-                f"删除 B 中的 {os.path.basename(file_path)}，已用比例 {used_percent}% >= {usage_threshold}%"
-            )
-            try:
-                os.remove(file_path)
-            except FileNotFoundError:
-                pass
-            deleted_count += 1
-        else:
-            destination = _build_unique_path(active_dir, os.path.basename(file_path))
-            os.replace(file_path, destination)
-            moved_count += 1
-            log_info(f"从 B 补充到 A: {os.path.basename(destination)}")
+                os.replace(file_path, destination)
+                moved_count += 1
+                log_info(f"从 B 补充到 A: {os.path.basename(destination)}")
+
+        TOKEN_USAGE_PENDING.clear()
+
+        # 批次间按配置间隔控制请求频率
+        if request_interval > 0 and batch_start + batch_size < len(pool_files):
+            time.sleep(request_interval)
 
     return moved_count, deleted_count
 
@@ -1220,6 +1270,35 @@ def run_monitor_loop(
             break
 
         elapsed_seconds = int(time.time() - cycle_started_at)
-        sleep_seconds = max(1, args.monitor_interval - elapsed_seconds)
-        log_info(f"等待 {sleep_seconds} 秒后进入下一轮检测")
+
+        # 如果上一轮检测到仍有缺口（账号不足），缩短等待间隔以加快补号响应
+        has_shortage = (
+            cycle_result is not None
+            and (cycle_result.active_shortage > 0 or cycle_result.pool_shortage > 0)
+        )
+        if has_shortage:
+            attempted_but_failed = (
+                cycle_result.attempted_replenish and cycle_result.replenished_count == 0
+            )
+            if attempted_but_failed:
+                # 尝试补号但全部失败 → 适当延长，防止空转
+                target_interval = max(
+                    SHORTAGE_FAIL_RETRY_SECONDS,
+                    args.monitor_interval // 3,
+                )
+            else:
+                # 有缺口（可能部分补上了）→ 快速重试
+                target_interval = max(
+                    SHORTAGE_FAST_RETRY_SECONDS,
+                    args.monitor_interval // 5,
+                )
+            sleep_seconds = max(1, target_interval - elapsed_seconds)
+            log_info(
+                f"检测到库存缺口（A 缺 {cycle_result.active_shortage}，"
+                f"B 缺 {cycle_result.pool_shortage}），缩短等待间隔，"
+                f"{sleep_seconds} 秒后进入下一轮检测"
+            )
+        else:
+            sleep_seconds = max(1, args.monitor_interval - elapsed_seconds)
+            log_info(f"等待 {sleep_seconds} 秒后进入下一轮检测")
         time.sleep(sleep_seconds)
