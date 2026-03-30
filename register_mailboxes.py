@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 import re
 import secrets
@@ -7,6 +8,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi import requests
+
+logger = logging.getLogger("openai_register")
 
 MAILTM_BASE = "https://api.mail.tm"
 TEMPMAILLOL_BASE = "https://api.tempmail.lol/v2"
@@ -28,15 +31,15 @@ class TempMailbox:
 
 
 def _log_waiting_code_start(thread_id: int, email: str) -> None:
-    print(f"[线程 {thread_id}] [信息] 正在等待邮箱 {email} 的验证码")
+    logger.info(f"[线程 {thread_id}] [信息] 正在等待邮箱 {email} 的验证码")
 
 
 def _log_waiting_code_success(thread_id: int, code: str) -> None:
-    print(f"[线程 {thread_id}] [信息] 已收到验证码: {code}")
+    logger.info(f"[线程 {thread_id}] [信息] 已收到验证码: {code}")
 
 
 def _log_waiting_code_timeout(thread_id: int) -> None:
-    print(f"[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+    logger.warning(f"[线程 {thread_id}] [警告] 等待超时，未收到验证码")
 
 
 def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str]:
@@ -91,7 +94,7 @@ def create_hydra_mailbox(
     try:
         domains = _hydra_domains(api_base, proxies)
         if not domains:
-            print(f"[线程 {thread_id}] [警告] {provider_name} 没有可用域名")
+            logger.warning(f"[线程 {thread_id}] [警告] {provider_name} 没有可用域名")
             return None
 
         for _ in range(5):
@@ -132,10 +135,10 @@ def create_hydra_mailbox(
                         password=password,
                     )
 
-        print(f"[线程 {thread_id}] [警告] {provider_name} 邮箱创建成功但获取 Token 失败")
+        logger.warning(f"[线程 {thread_id}] [警告] {provider_name} 邮箱创建成功但获取 Token 失败")
         return None
     except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 {provider_name} API 出错: {e}")
+        logger.warning(f"[线程 {thread_id}] [警告] 请求 {provider_name} API 出错: {e}")
         return None
 
 
@@ -160,10 +163,10 @@ def create_tempmailio_mailbox(
                     provider="tempmailio",
                     token=token,
                 )
-        print(f"[线程 {thread_id}] [警告] temp-mail.io 邮箱初始化失败")
+        logger.warning(f"[线程 {thread_id}] [警告] temp-mail.io 邮箱初始化失败")
         return None
     except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 temp-mail.io API 出错: {e}")
+        logger.warning(f"[线程 {thread_id}] [警告] 请求 temp-mail.io API 出错: {e}")
         return None
 
 
@@ -183,7 +186,7 @@ def create_tempmaillol_mailbox(
             timeout=15,
         )
         if resp.status_code not in (200, 201):
-            print(
+            logger.warning(
                 f"[线程 {thread_id}] [警告] Tempmail.lol 邮箱初始化失败，状态码: {resp.status_code}"
             )
             return None
@@ -192,7 +195,7 @@ def create_tempmaillol_mailbox(
         email = str(data.get("address") or "").strip()
         token = str(data.get("token") or "").strip()
         if not email or not token:
-            print(f"[线程 {thread_id}] [警告] Tempmail.lol 返回数据不完整")
+            logger.warning(f"[线程 {thread_id}] [警告] Tempmail.lol 返回数据不完整")
             return None
 
         return TempMailbox(
@@ -201,7 +204,7 @@ def create_tempmaillol_mailbox(
             token=token,
         )
     except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 Tempmail.lol API 出错: {e}")
+        logger.warning(f"[线程 {thread_id}] [警告] 请求 Tempmail.lol API 出错: {e}")
         return None
 
 
@@ -234,10 +237,10 @@ def create_dropmail_mailbox(
                     provider="dropmail",
                     sid_token=session_id,
                 )
-        print(f"[线程 {thread_id}] [警告] Dropmail 邮箱初始化失败")
+        logger.warning(f"[线程 {thread_id}] [警告] Dropmail 邮箱初始化失败")
         return None
     except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求 Dropmail API 出错: {e}")
+        logger.warning(f"[线程 {thread_id}] [警告] 请求 Dropmail API 出错: {e}")
         return None
 
 
@@ -547,7 +550,7 @@ def poll_tempmaillol_oai_code(
 
             data = resp.json()
             if data is None or (isinstance(data, dict) and not data):
-                print(f"[线程 {thread_id}] [警告] 邮箱已过期")
+                logger.warning(f"[线程 {thread_id}] [警告] 邮箱已过期")
                 return ""
 
             email_list = data.get("emails", []) if isinstance(data, dict) else []

@@ -6,6 +6,7 @@
 import argparse
 import builtins
 import json
+import logging
 import math
 import os
 import random
@@ -92,6 +93,8 @@ from register_runtime import (
     run_monitor_loop,
     worker,
 )
+
+logger = logging.getLogger("openai_register")
 
 builtins.yasal_bypass_ip_choice = True
 
@@ -190,14 +193,14 @@ def _post_create_account_with_retry(
             )
         except Exception as exc:
             if attempt < attempts:
-                print(
+                logger.warning(
                     f"[线程 {thread_id}] [警告] create_account 请求异常，"
                     f"第 {attempt}/{attempts} 次尝试失败: {exc}；"
                     f"{delay_seconds} 秒后重试"
                 )
                 time.sleep(delay_seconds)
                 continue
-            print(f"[线程 {thread_id}] [错误] create_account 请求异常: {exc}")
+            logger.error(f"[线程 {thread_id}] [错误] create_account 请求异常: {exc}")
             return None
 
         status_code = getattr(last_resp, "status_code", 0)
@@ -206,7 +209,7 @@ def _post_create_account_with_retry(
 
         if status_code in (408, 425, 429, 500, 502, 503, 504) and attempt < attempts:
             preview = _response_text_preview(last_resp)
-            print(
+            logger.warning(
                 f"[线程 {thread_id}] [警告] create_account 遇到临时错误，"
                 f"状态码: {status_code}，第 {attempt}/{attempts} 次尝试；"
                 f"{delay_seconds} 秒后重试。响应摘要: {preview}"
@@ -243,19 +246,19 @@ def get_temp_mailbox(
     elif provider_key == "cfmail":
         mailbox = _create_cfmail_mailbox(proxies=proxies, thread_id=thread_id)
     else:
-        print(f"[线程 {thread_id}] [错误] 不支持的临时邮箱服务: {provider_key}")
+        logger.error(f"[线程 {thread_id}] [错误] 不支持的临时邮箱服务: {provider_key}")
         return None
 
     if mailbox:
         provider_desc = provider_key
         if mailbox.provider == "cfmail" and mailbox.config_name:
             provider_desc = f"{provider_key}:{mailbox.config_name}"
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 已绑定临时邮箱服务: {provider_desc}"
         )
         return mailbox
 
-    print(
+    logger.error(
         f"[线程 {thread_id}] [错误] 临时邮箱服务不可用或创建失败: {provider_key}"
     )
     return None
@@ -286,7 +289,7 @@ def get_mailbox_message_snapshot(
                 proxies=proxies,
             )
     except Exception as exc:
-        print(f"[线程 {thread_id}] [警告] 获取邮箱快照失败: {exc}")
+        logger.warning(f"[线程 {thread_id}] [警告] 获取邮箱快照失败: {exc}")
 
     return set()
 def get_oai_code(
@@ -298,7 +301,7 @@ def get_oai_code(
 ) -> str:
     if mailbox.provider == "cfmail":
         if not mailbox.token:
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] {mailbox.provider} token 为空，无法读取邮件"
             )
             return ""
@@ -313,7 +316,7 @@ def get_oai_code(
         )
     if mailbox.provider == "mailtm":
         if not mailbox.token:
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] {mailbox.provider} token 为空，无法读取邮件"
             )
             return ""
@@ -336,7 +339,7 @@ def get_oai_code(
         )
     if mailbox.provider == "tempmaillol":
         if not mailbox.token:
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] {mailbox.provider} token 为空，无法读取邮件"
             )
             return ""
@@ -350,7 +353,7 @@ def get_oai_code(
         )
     if mailbox.provider == "dropmail":
         if not mailbox.sid_token:
-            print(f"[线程 {thread_id}] [错误] {mailbox.provider} 会话标识为空，无法读取邮件")
+            logger.error(f"[线程 {thread_id}] [错误] {mailbox.provider} 会话标识为空，无法读取邮件")
             return ""
         return poll_dropmail_oai_code(
             sid_token=mailbox.sid_token,
@@ -361,7 +364,7 @@ def get_oai_code(
             skip_codes=skip_codes,
         )
 
-    print(
+    logger.error(
         f"[线程 {thread_id}] [错误] 暂不支持该邮箱服务: {mailbox.provider}"
     )
     return ""
@@ -390,7 +393,7 @@ def get_auto_proxy() -> Optional[str]:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.5)
             if sock.connect_ex(("127.0.0.1", port)) == 0:
-                print(
+                logger.info(
                     f"[信息] 检测到本地代理端口可用: {port}"
                 )
                 return f"http://127.0.0.1:{port}"
@@ -421,7 +424,7 @@ def run(
 
     # 与 xiaomajiang.py 保持一致，固定使用 chrome 指纹
     current_impersonate = "chrome"
-    print(
+    logger.info(
         f"[线程 {thread_id}] [信息] 当前浏览器指纹: {current_impersonate}"
     )
 
@@ -432,21 +435,21 @@ def run(
         trace = trace.text
         loc_re = re.search(r"^loc=(.+)$", trace, re.MULTILINE)
         loc = loc_re.group(1) if loc_re else None
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 当前出口地区: {loc}"
         )
         if loc != "US":
             if not builtins.yasal_bypass_ip_choice:
-                print(f"[线程 {thread_id}] [信息] 非 US 节点，已按配置停止当前线程")
+                logger.info(f"[线程 {thread_id}] [信息] 非 US 节点，已按配置停止当前线程")
                 return None
 
-            print(
+            logger.info(
                 f"[线程 {thread_id}] [信息] 当前节点地区 ({loc}) 不是 US，已默认继续执行"
             )
 
         if loc in ("CN", "HK"):
             if builtins.yasal_bypass_ip_choice:
-                print(
+                logger.warning(
                     f"[线程 {thread_id}] [警告] 当前地区 {loc} 风险较高，尝试自动检测本地代理"
                 )
                 if not proxy:
@@ -454,21 +457,21 @@ def run(
                     if auto_p:
                         proxies = {"http": auto_p, "https": auto_p}
                         s.proxies = proxies
-                        print(
+                        logger.info(
                             f"[线程 {thread_id}] [信息] 已自动启用本地代理: {auto_p}"
                         )
                     else:
-                        print(
+                        logger.warning(
                             f"[线程 {thread_id}] [警告] 未检测到可用本地代理端口，将继续直连"
                         )
                 # 用户选择绕过，继续执行
             else:
-                print(
+                logger.error(
                     f"[线程 {thread_id}] [错误] 当前节点地区 {loc} 风险过高，请更换代理后重试"
                 )
                 return None
     except Exception as e:
-        print(
+        logger.error(
             f"[线程 {thread_id}] [错误] 网络检查失败，请确认代理可用: {e}"
         )
         return None
@@ -483,7 +486,7 @@ def run(
         return None
     cfmail_config_name = mailbox.config_name
     email = mailbox.email
-    print(
+    logger.info(
         f"[线程 {thread_id}] [*] 成功获取临时邮箱与授权: {email} ({mailbox.provider})"
     )
 
@@ -496,7 +499,7 @@ def run(
 
         resp = _prime_oauth_session(s, signup_start_url, thread_id)
         did = s.cookies.get("oai-did")
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 已获取 Device ID: {did}"
         )
 
@@ -523,11 +526,11 @@ def run(
             },
             data=signup_body,
         )
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 注册表单已提交，状态码: {signup_resp.status_code}"
         )
         if signup_resp.status_code in (403, 429):
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] 注册请求被拒绝（{signup_resp.status_code}）: {signup_resp.text}"
             )
             return None
@@ -551,11 +554,11 @@ def run(
             },
             data=register_body,
         )
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 密码注册请求已提交，状态码: {register_resp.status_code}"
         )
         if register_resp.status_code != 200:
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] 提交密码失败: {register_resp.text}"
             )
             return None
@@ -567,11 +570,11 @@ def run(
                 "accept": "application/json",
             },
         )
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 注册阶段验证码发送请求已提交，状态码: {otp_resp.status_code}"
         )
         if otp_resp.status_code != 200:
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] 注册阶段发送验证码失败: {otp_resp.text}"
             )
             return None
@@ -592,12 +595,12 @@ def run(
             thread_id=thread_id,
             stage_label="注册阶段",
         )
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 验证码校验结果状态码: {getattr(code_resp, 'status_code', 'unknown')}"
         )
         if not code_resp or code_resp.status_code != 200:
             preview = _response_text_preview(code_resp) if code_resp else ""
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] 注册阶段邮箱验证码校验失败: {preview}"
             )
             _mark_cfmail_failure(
@@ -610,7 +613,7 @@ def run(
         create_account_body = json.dumps(
             signup_profile, ensure_ascii=False, separators=(",", ":")
         )
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 本次注册资料: name={signup_profile['name']}, birthdate={signup_profile['birthdate']}"
         )
         create_account_resp = _post_create_account_with_retry(
@@ -622,7 +625,7 @@ def run(
             thread_id=thread_id,
         )
         create_account_status = getattr(create_account_resp, "status_code", 0)
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 创建账户接口状态码: {create_account_status}"
         )
 
@@ -632,19 +635,19 @@ def run(
                 if create_account_resp
                 else ""
             )
-            print(
+            logger.error(
                 f"[线程 {thread_id}] [错误] 创建账户失败: {err_msg}"
             )
             if "unsupported_email" in err_msg:
-                print(
+                logger.info(
                     f"[线程 {thread_id}] [提示] 当前邮箱域名可能被限制，建议更换临时邮箱服务或域名"
                 )
             elif "registration_disallowed" in err_msg:
-                print(
+                logger.info(
                     f"[线程 {thread_id}] [提示] 当前邮箱提供商可能被风控，建议优先使用 tempmaillol"
                 )
             elif "429" in str(create_account_status):
-                print(
+                logger.info(
                     f"[线程 {thread_id}] [提示] 请求频率过高（429），建议更换代理或降低并发"
                 )
             _mark_cfmail_failure(
@@ -656,7 +659,7 @@ def run(
             )
             return None
 
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] 注册流程已完成，当前会话可能跳到绑手机页，改用全新登录流程提取 token"
         )
         token_json = None
@@ -675,7 +678,7 @@ def run(
             )
 
         if not token_json:
-            print(
+            logger.warning(
                 f"[线程 {thread_id}] [警告] 新登录流程未拿到 token，尝试回退到当前注册会话"
             )
             auth_cookie = s.cookies.get("oai-client-auth-session")
@@ -684,7 +687,7 @@ def run(
                     s, oauth, auth_cookie, thread_id
                 )
             else:
-                print(f"[线程 {thread_id}] [警告] 当前会话中暂未拿到授权 Cookie")
+                logger.warning(f"[线程 {thread_id}] [警告] 当前会话中暂未拿到授权 Cookie")
 
         if not token_json:
             token_json = _try_token_via_existing_session(s, oauth, thread_id)
@@ -693,17 +696,17 @@ def run(
             _mark_cfmail_success()
             return token_json, password
 
-        print(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token")
+        logger.error(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token")
         return None
 
     except Exception as e:
-        print(
+        logger.error(
             f"[线程 {thread_id}] [错误] 运行过程中发生异常: {e}"
         )
-        print(
+        logger.error(
             f"[线程 {thread_id}] [错误] 异常详情: {traceback.format_exc()}"
         )
-        print(
+        logger.info(
             f"[线程 {thread_id}] [提示] 本轮失败，下一轮将继续重试"
         )
         return None
@@ -734,7 +737,7 @@ def run_with_fallback(
     for index, candidate_provider in enumerate(provider_chain):
         last_used_provider = candidate_provider
         if index > 0:
-            print(
+            logger.info(
                 f"[线程 {thread_id}] [信息] 主邮箱服务 {provider_chain[0]} 不可用，"
                 f"开始回退到 {candidate_provider}"
             )
@@ -742,7 +745,7 @@ def run_with_fallback(
         result = run(proxy, candidate_provider, thread_id, mailtm_base)
         if result:
             if index > 0:
-                print(
+                logger.info(
                     f"[线程 {thread_id}] [信息] 已通过回退邮箱服务 {candidate_provider} 完成注册"
                 )
                 alert_sent = notify_fallback_provider_usage(
@@ -753,7 +756,7 @@ def run_with_fallback(
                     throttle_seconds=dingtalk_fallback_interval_seconds,
                 )
                 if dingtalk_webhook and alert_sent:
-                    print(
+                    logger.info(
                         f"[线程 {thread_id}] [信息] 已发送回退邮箱服务钉钉提醒：{provider_chain[0]} -> {candidate_provider}"
                     )
             return result, candidate_provider
@@ -773,7 +776,7 @@ def _load_config_file(config_path: str) -> dict:
         # 过滤掉以 _ 开头的注释字段
         return {k: v for k, v in data.items() if not k.startswith("_")}
     except Exception as exc:
-        print(f"[警告] 读取配置文件 {config_path} 失败: {exc}")
+        logger.warning(f"[警告] 读取配置文件 {config_path} 失败: {exc}")
         return {}
 
 
@@ -1036,7 +1039,7 @@ def main() -> None:
     # 加载配置文件（命令行参数优先于配置文件）
     config = _load_config_file(args.config)
     if config:
-        print(f"[信息] 已加载配置文件: {args.config}")
+        logger.info(f"[信息] 已加载配置文件: {args.config}")
         _apply_config_to_args(args, config)
 
     sleep_min = max(1, args.sleep_min)
@@ -1170,7 +1173,7 @@ def main() -> None:
             f"选择={args.cfmail_profile}，回退={DEFAULT_CFMAIL_FALLBACK_PROVIDER}，"
             f"回退钉钉间隔={args.dingtalk_fallback_interval}秒"
         )
-    print(startup_message)
+    logger.info(startup_message)
 
     worker_count = min(3, args.register_openai_concurrency)
     providers_list = [args.mail_provider for _ in range(worker_count)]
@@ -1206,10 +1209,10 @@ def main() -> None:
         while True:
             time.sleep(1)
             if not any(t.is_alive() for t in threads):
-                print("\n[信息] 所有线程已执行完成，任务结束")
+                logger.info("\n[信息] 所有线程已执行完成，任务结束")
                 break
     except KeyboardInterrupt:
-        print("\n[信息] 收到中断信号，准备退出")
+        logger.info("\n[信息] 收到中断信号，准备退出")
 
 
 if __name__ == "__main__":

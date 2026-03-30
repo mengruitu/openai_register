@@ -2,14 +2,17 @@ import base64
 import builtins
 import concurrent.futures
 import json
+import logging
 import os
 import random
 import re
+import shutil
 import threading
 import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from curl_cffi import requests
@@ -19,12 +22,47 @@ from register_notifications import build_monitor_summary_message, send_dingtalk_
 
 DEFAULT_TOKEN_CHECK_WORKERS = 6
 TOKEN_USAGE_CACHE_TTL_SECONDS = 180
+TOKEN_USAGE_CACHE_MAX_SIZE = 2048
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
 DEFAULT_TOKEN_REFRESH_SKEW_SECONDS = 300
+ACCOUNTS_FILE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+ACCOUNTS_FILE_BACKUP_COUNT = 5
 
 output_lock = threading.Lock()
 _token_usage_cache_lock = threading.Lock()
 TOKEN_USAGE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# 日志配置：使用 RotatingFileHandler 实现自动轮转，同时保留控制台输出
+# ---------------------------------------------------------------------------
+_LOG_FORMAT = "[%(asctime)s] [%(levelname)s] %(message)s"
+_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+_LOG_FILE = os.path.join(_LOG_DIR, "register.log")
+_LOG_MAX_BYTES = 50 * 1024 * 1024  # 单个日志文件最大 50 MB
+_LOG_BACKUP_COUNT = 5  # 最多保留 5 个旧日志文件
+
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("openai_register")
+logger.setLevel(logging.DEBUG)
+
+# 文件 Handler —— 自动轮转
+_file_handler = RotatingFileHandler(
+    _LOG_FILE,
+    maxBytes=_LOG_MAX_BYTES,
+    backupCount=_LOG_BACKUP_COUNT,
+    encoding="utf-8",
+)
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT))
+logger.addHandler(_file_handler)
+
+# 控制台 Handler
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE_FORMAT))
+logger.addHandler(_console_handler)
 
 RegisterRunner = Callable[..., Tuple[Optional[Tuple[str, str]], str]]
 ReloadCfmailHook = Callable[[], None]
@@ -60,15 +98,15 @@ class TokenUsageCheck:
 
 
 def log_info(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [信息] {message}")
+    logger.info(message)
 
 
 def log_warn(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] {message}")
+    logger.warning(message)
 
 
 def log_error(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [错误] {message}")
+    logger.error(message)
 
 
 def _safe_token_filename(email: str, thread_id: int) -> str:
@@ -418,11 +456,21 @@ def _store_cached_token_usage_check(
             "result": result,
             "checked_at": now,
         }
-        if len(TOKEN_USAGE_CACHE) > 2048:
+        if len(TOKEN_USAGE_CACHE) > TOKEN_USAGE_CACHE_MAX_SIZE:
+            # 第一轮：按 TTL 清理过期项
             expire_before = now - (TOKEN_USAGE_CACHE_TTL_SECONDS * 2)
             for cached_path, cached in list(TOKEN_USAGE_CACHE.items()):
                 if float(cached.get("checked_at") or 0) < expire_before:
                     TOKEN_USAGE_CACHE.pop(cached_path, None)
+            # 第二轮：如仍超限，按 LRU 淘汰最旧条目直到回到硬上限
+            if len(TOKEN_USAGE_CACHE) > TOKEN_USAGE_CACHE_MAX_SIZE:
+                sorted_keys = sorted(
+                    TOKEN_USAGE_CACHE.keys(),
+                    key=lambda k: float(TOKEN_USAGE_CACHE[k].get("checked_at") or 0),
+                )
+                to_remove = len(TOKEN_USAGE_CACHE) - TOKEN_USAGE_CACHE_MAX_SIZE
+                for key in sorted_keys[:to_remove]:
+                    TOKEN_USAGE_CACHE.pop(key, None)
 
 
 def get_token_usage_check(file_path: str, timeout: int) -> TokenUsageCheck:
@@ -559,6 +607,41 @@ def _collect_token_usage_results(
     return results
 
 
+def _rotate_accounts_file(file_path: str) -> None:
+    """当 accounts.txt 超过大小上限时，自动归档为 .1/.2/... 文件。"""
+    try:
+        if not os.path.isfile(file_path):
+            return
+        if os.path.getsize(file_path) < ACCOUNTS_FILE_MAX_BYTES:
+            return
+    except OSError:
+        return
+
+    # 删除最旧的备份
+    oldest = f"{file_path}.{ACCOUNTS_FILE_BACKUP_COUNT}"
+    if os.path.isfile(oldest):
+        try:
+            os.remove(oldest)
+        except OSError:
+            pass
+
+    # 依次重命名 .4 -> .5, .3 -> .4, ...
+    for i in range(ACCOUNTS_FILE_BACKUP_COUNT - 1, 0, -1):
+        src = f"{file_path}.{i}"
+        dst = f"{file_path}.{i + 1}"
+        if os.path.isfile(src):
+            try:
+                shutil.move(src, dst)
+            except OSError:
+                pass
+
+    # 当前文件 -> .1
+    try:
+        shutil.move(file_path, f"{file_path}.1")
+    except OSError:
+        pass
+
+
 def persist_registration_result(
     token_json: str, password: str, thread_id: int, token_dir: str
 ) -> Tuple[str, str]:
@@ -576,8 +659,10 @@ def persist_registration_result(
         f.write(token_json)
 
     os.makedirs("output", exist_ok=True)
+    accounts_path = os.path.join("output", "accounts.txt")
     with output_lock:
-        with open("output/accounts.txt", "a", encoding="utf-8") as f:
+        _rotate_accounts_file(accounts_path)
+        with open(accounts_path, "a", encoding="utf-8") as f:
             f.write(f"{raw_email}----{password}----{refresh_token}\n")
 
     return file_name, raw_email
@@ -1044,8 +1129,8 @@ def worker(
         if provider_key == "cfmail" and reload_cfmail_accounts:
             reload_cfmail_accounts()
         count += 1
-        print(
-            f"\n[{datetime.now().strftime('%H:%M:%S')}] [线程 {thread_id}] [信息] 开始第 {count} 次任务（邮箱服务: {provider_key}）"
+        logger.info(
+            f"[线程 {thread_id}] 开始第 {count} 次任务（邮箱服务: {provider_key}）"
         )
 
         try:
@@ -1069,17 +1154,17 @@ def worker(
                     token_dir,
                 )
 
-                print(
-                    f"[线程 {thread_id}] [成功] 账号信息已追加到 output/accounts.txt，"
+                logger.info(
+                    f"[线程 {thread_id}] 账号信息已追加到 output/accounts.txt，"
                     f"Token 已保存到: {file_name}（邮箱服务: {used_provider}）"
                 )
                 is_success = True
             else:
-                print(f"[线程 {thread_id}] [失败] 本轮任务未成功")
+                logger.warning(f"[线程 {thread_id}] 本轮任务未成功")
 
         except Exception as e:
-            print(f"[线程 {thread_id}] [错误] 发生未捕获异常: {e}")
-            print(f"[线程 {thread_id}] [错误] {traceback.format_exc()}")
+            logger.error(f"[线程 {thread_id}] 发生未捕获异常: {e}")
+            logger.error(f"[线程 {thread_id}] {traceback.format_exc()}")
             is_success = False
 
         if once:
@@ -1087,8 +1172,8 @@ def worker(
 
         wait_time = random.randint(sleep_min, sleep_max)
         if not is_success:
-            print(
-                f"[线程 {thread_id}] [提示] 本轮失败，额外等待 {failure_sleep_seconds} 秒后重试"
+            logger.info(
+                f"[线程 {thread_id}] 本轮失败，额外等待 {failure_sleep_seconds} 秒后重试"
             )
             wait_time += max(0, failure_sleep_seconds)
 

@@ -1,3 +1,4 @@
+import logging
 import socket
 import threading
 import time
@@ -5,6 +6,8 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from curl_cffi import requests
+
+logger = logging.getLogger("openai_register")
 
 _fallback_alert_lock = threading.Lock()
 _fallback_alert_sent_at: Dict[str, float] = {}

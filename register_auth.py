@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import logging
 import random
 import re
 import secrets
@@ -16,6 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from curl_cffi import requests
 
 from register_mailboxes import TempMailbox
+
+logger = logging.getLogger("openai_register")
 
 RETRYABLE_GATEWAY_STATUSES = {502, 503, 504}
 EMAIL_OTP_VALIDATE_MAX_ATTEMPTS = 3
@@ -39,6 +42,7 @@ SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
 SENTINEL_POW_PREFIX = "gAAAAAB"
 SENTINEL_POW_SUFFIX = "~S"
 SENTINEL_POW_MAX_ATTEMPTS = 500000
+SENTINEL_POW_TIMEOUT_SECONDS = 20
 SENTINEL_DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
@@ -289,7 +293,7 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                 timeout=WEB_SIGNUP_REQUEST_TIMEOUT_SECONDS,
             )
             if csrf_resp.status_code != 200:
-                print(
+                logger.error(
                     f"[线程 {thread_id}] [错误] 获取 web signup csrf 失败，状态码: {csrf_resp.status_code}"
                 )
                 if attempt < attempts:
@@ -298,7 +302,7 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
 
             csrf_token = str((csrf_resp.json() or {}).get("csrfToken") or "").strip()
             if not csrf_token:
-                print(f"[线程 {thread_id}] [错误] web signup csrfToken 为空")
+                logger.error(f"[线程 {thread_id}] [错误] web signup csrfToken 为空")
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
                 continue
@@ -330,7 +334,7 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                 timeout=WEB_SIGNUP_REQUEST_TIMEOUT_SECONDS,
             )
             if signin_resp.status_code != 200:
-                print(
+                logger.error(
                     f"[线程 {thread_id}] [错误] web signup signin/openai 失败，状态码: {signin_resp.status_code}"
                 )
                 if attempt < attempts:
@@ -339,22 +343,22 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
 
             start_url = str((signin_resp.json() or {}).get("url") or "").strip()
             if not start_url:
-                print(f"[线程 {thread_id}] [错误] web signup 未返回授权地址")
+                logger.error(f"[线程 {thread_id}] [错误] web signup 未返回授权地址")
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
                 continue
 
-            print(f"[线程 {thread_id}] [信息] 已获取 web signup 授权入口")
+            logger.info(f"[线程 {thread_id}] [信息] 已获取 web signup 授权入口")
             return start_url
         except Exception as exc:
             if attempt < attempts:
-                print(
+                logger.warning(
                     f"[线程 {thread_id}] [警告] 获取 web signup 授权入口失败，第 {attempt}/{attempts} 次尝试异常: {exc}；"
                     f"{WEB_SIGNUP_RETRY_DELAY_SECONDS} 秒后重试"
                 )
                 time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
                 continue
-            print(f"[线程 {thread_id}] [错误] 获取 web signup 授权入口失败: {exc}")
+            logger.error(f"[线程 {thread_id}] [错误] 获取 web signup 授权入口失败: {exc}")
             return ""
 
     return ""
@@ -501,14 +505,14 @@ def post_email_otp_validate(
             )
         except Exception as exc:
             if attempt < attempts:
-                print(
+                logger.warning(
                     f"[线程 {thread_id}] [警告] {stage_label}邮箱验证码校验异常，"
                     f"第 {attempt}/{attempts} 次尝试失败: {exc}；"
                     f"{delay_seconds} 秒后重试"
                 )
                 time.sleep(delay_seconds)
                 continue
-            print(f"[线程 {thread_id}] [错误] {stage_label}邮箱验证码校验异常: {exc}")
+            logger.error(f"[线程 {thread_id}] [错误] {stage_label}邮箱验证码校验异常: {exc}")
             return None
 
         status_code = getattr(last_resp, "status_code", 0)
@@ -517,7 +521,7 @@ def post_email_otp_validate(
 
         if status_code in RETRYABLE_GATEWAY_STATUSES and attempt < attempts:
             preview = response_text_preview(last_resp)
-            print(
+            logger.warning(
                 f"[线程 {thread_id}] [警告] {stage_label}邮箱验证码校验遇到网关波动，"
                 f"状态码: {status_code}，第 {attempt}/{attempts} 次尝试；"
                 f"{delay_seconds} 秒后重试。响应摘要: {preview}"
@@ -567,7 +571,7 @@ def follow_oauth_redirect_chain(
                 break
             current_url = next_url
     except Exception as exc:
-        print(f"[线程 {thread_id}] [警告] 跟随 OAuth 跳转链失败: {exc}")
+        logger.warning(f"[线程 {thread_id}] [警告] 跟随 OAuth 跳转链失败: {exc}")
 
     return None
 
@@ -598,7 +602,7 @@ def prime_oauth_session(
             except Exception as exc:
                 last_exc = exc
                 if attempt < PRIME_OAUTH_MAX_REQUEST_ATTEMPTS:
-                    print(
+                    logger.warning(
                         f"[线程 {thread_id}] [警告] OAuth 初始化请求失败，第 {attempt}/{PRIME_OAUTH_MAX_REQUEST_ATTEMPTS} 次重试: {exc}"
                     )
                     time.sleep(PRIME_OAUTH_RETRY_DELAY_SECONDS)
@@ -615,7 +619,7 @@ def prime_oauth_session(
             and parsed.hostname in ("localhost", "127.0.0.1")
             and "/auth/callback" in parsed.path
         ):
-            print(
+            logger.info(
                 f"[线程 {thread_id}] [信息] OAuth 初始化已到达本地 callback 边界，停止继续自动跳转"
             )
             return last_resp
@@ -732,22 +736,32 @@ def solve_sentinel_pow(*, seed: str, difficulty: str, thread_id: int) -> str:
     started_at = time.perf_counter()
     fingerprint = _build_sentinel_pow_fingerprint()
     prefix_len = len(target)
+    timeout = SENTINEL_POW_TIMEOUT_SECONDS
 
     for attempt in range(SENTINEL_POW_MAX_ATTEMPTS):
+        elapsed = time.perf_counter() - started_at
+        if elapsed >= timeout:
+            elapsed_ms = round(elapsed * 1000)
+            logger.error(
+                f"[线程 {thread_id}] [错误] Sentinel POW 求解超时（{timeout}秒），难度={target}，"
+                f"已尝试 {attempt + 1} 次，耗时 {elapsed_ms} ms"
+            )
+            return ""
+
         candidate = list(fingerprint)
         candidate[3] = attempt
         candidate[9] = round((time.perf_counter() - started_at) * 1000)
         encoded = _sentinel_b64_json(candidate)
         if _sentinel_hash_hex(seed_text + encoded)[:prefix_len] <= target:
             elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-            print(
+            logger.info(
                 f"[线程 {thread_id}] [信息] Sentinel POW 求解成功，难度={target}，"
                 f"尝试 {attempt + 1} 次，耗时 {elapsed_ms} ms"
             )
             return f"{SENTINEL_POW_PREFIX}{encoded}{SENTINEL_POW_SUFFIX}"
 
     elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-    print(
+    logger.error(
         f"[线程 {thread_id}] [错误] Sentinel POW 求解失败，难度={target}，"
         f"已尝试 {SENTINEL_POW_MAX_ATTEMPTS} 次，耗时 {elapsed_ms} ms"
     )
@@ -764,7 +778,7 @@ def request_sentinel_header(
 ) -> str:
     device_id = str(did or "").strip()
     if not device_id:
-        print(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
+        logger.error(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
         return ""
 
     flow_name = str(flow or "authorize_continue").strip() or "authorize_continue"
@@ -787,18 +801,18 @@ def request_sentinel_header(
         timeout=15,
     )
     if resp.status_code != 200:
-        print(f"[线程 {thread_id}] [错误] Sentinel 请求失败，状态码: {resp.status_code}")
+        logger.error(f"[线程 {thread_id}] [错误] Sentinel 请求失败，状态码: {resp.status_code}")
         return ""
 
     try:
         sentinel_payload = resp.json() if resp.content else {}
     except Exception as exc:
-        print(f"[线程 {thread_id}] [错误] Sentinel 响应解析失败: {exc}")
+        logger.error(f"[线程 {thread_id}] [错误] Sentinel 响应解析失败: {exc}")
         return ""
 
     token = str((sentinel_payload or {}).get("token") or "").strip()
     if not token:
-        print(f"[线程 {thread_id}] [错误] Sentinel 响应里缺少 token")
+        logger.error(f"[线程 {thread_id}] [错误] Sentinel 响应里缺少 token")
         return ""
 
     proof = ""
@@ -809,7 +823,7 @@ def request_sentinel_header(
     )
     if isinstance(pow_config, dict) and pow_config.get("required"):
         difficulty = str(pow_config.get("difficulty") or "").strip().lower()
-        print(
+        logger.info(
             f"[线程 {thread_id}] [信息] Sentinel 要求 POW，开始求解，难度={difficulty or 'unknown'}"
         )
         proof = solve_sentinel_pow(
@@ -838,7 +852,7 @@ def try_token_via_existing_session(
     oauth: OAuthStart,
     thread_id: int,
 ) -> Optional[str]:
-    print(f"[线程 {thread_id}] [信息] 尝试复用当前 session 免密获取 token")
+    logger.info(f"[线程 {thread_id}] [信息] 尝试复用当前 session 免密获取 token")
     return follow_oauth_redirect_chain(
         session,
         oauth_authorize_url(oauth, prompt=None),
@@ -855,18 +869,18 @@ def try_token_via_workspace_select(
 ) -> Optional[str]:
     workspaces = extract_workspaces_from_auth_cookie(auth_cookie)
     if not workspaces:
-        print(f"[线程 {thread_id}] [警告] 授权 Cookie 存在，但暂未解析到 workspace")
+        logger.warning(f"[线程 {thread_id}] [警告] 授权 Cookie 存在，但暂未解析到 workspace")
         return None
 
     selected_workspace = workspaces[0] or {}
     workspace_id = str(selected_workspace.get("id") or "").strip()
     if not workspace_id:
-        print(f"[线程 {thread_id}] [警告] workspace 信息存在，但无法解析 workspace_id")
+        logger.warning(f"[线程 {thread_id}] [警告] workspace 信息存在，但无法解析 workspace_id")
         return None
 
     workspace_kind = str(selected_workspace.get("kind") or "").strip() or "unknown"
     workspace_name = str(selected_workspace.get("name") or "").strip() or "(null)"
-    print(
+    logger.info(
         f"[线程 {thread_id}] [信息] 已解析 workspace: count={len(workspaces)}, "
         f"id={workspace_id}, kind={workspace_kind}, name={workspace_name}"
     )
@@ -880,15 +894,15 @@ def try_token_via_workspace_select(
         json={"workspace_id": workspace_id},
     )
     if select_resp.status_code != 200:
-        print(f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}")
+        logger.warning(f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}")
         return None
 
     continue_url = extract_continue_url_from_response(select_resp)
     if not continue_url:
-        print(f"[线程 {thread_id}] [警告] workspace/select 响应里缺少 continue_url")
+        logger.warning(f"[线程 {thread_id}] [警告] workspace/select 响应里缺少 continue_url")
         return None
 
-    print(f"[线程 {thread_id}] [信息] 已获取 workspace，继续跟随授权跳转链")
+    logger.info(f"[线程 {thread_id}] [信息] 已获取 workspace，继续跟随授权跳转链")
     return follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
 
 
@@ -910,7 +924,7 @@ def try_token_via_password_login(
     if not account or not pwd:
         return None
 
-    print(f"[线程 {thread_id}] [信息] 当前 session 未拿到 token，尝试账号密码重新登录")
+    logger.info(f"[线程 {thread_id}] [信息] 当前 session 未拿到 token，尝试账号密码重新登录")
     login_session = requests.Session(proxies=proxies, impersonate=impersonate)
     ignored_codes = _normalize_code_values(used_codes)
 
@@ -948,7 +962,7 @@ def try_token_via_password_login(
             ),
         )
         if continue_resp.status_code not in (200, 204):
-            print(
+            logger.warning(
                 f"[线程 {thread_id}] [警告] 账号密码登录预处理失败，状态码: {continue_resp.status_code}"
             )
             return None
@@ -970,7 +984,7 @@ def try_token_via_password_login(
             ),
         )
         if login_resp.status_code != 200:
-            print(f"[线程 {thread_id}] [警告] 账号密码登录失败，状态码: {login_resp.status_code}")
+            logger.warning(f"[线程 {thread_id}] [警告] 账号密码登录失败，状态码: {login_resp.status_code}")
             return None
 
         try:
@@ -984,12 +998,12 @@ def try_token_via_password_login(
 
         if page_type == "email_otp_verification":
             if not mailbox:
-                print(
+                logger.warning(
                     f"[线程 {thread_id}] [警告] 密码登录后需要邮箱验证码，但当前没有可用邮箱上下文"
                 )
                 return None
 
-            print(f"[线程 {thread_id}] [信息] OpenAI 已自动发送登录验证码邮件，开始等待新邮件")
+            logger.info(f"[线程 {thread_id}] [信息] OpenAI 已自动发送登录验证码邮件，开始等待新邮件")
             login_otp_resp = None
             for otp_attempt in range(2):
                 login_code = get_oai_code_fn(
@@ -1000,7 +1014,7 @@ def try_token_via_password_login(
                     skip_codes=ignored_codes,
                 )
                 if not login_code:
-                    print(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
+                    logger.warning(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
                     return None
 
                 login_otp_resp = post_email_otp_validate(
@@ -1016,11 +1030,11 @@ def try_token_via_password_login(
                 status_code = getattr(login_otp_resp, "status_code", "unknown")
                 if status_code not in RETRYABLE_GATEWAY_STATUSES:
                     ignored_codes.add(login_code)
-                print(
+                logger.warning(
                     f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {status_code}"
                 )
                 if status_code == 401 and otp_attempt == 0:
-                    print(f"[线程 {thread_id}] [信息] 登录验证码可能命中旧邮件，准备重新等待新验证码")
+                    logger.info(f"[线程 {thread_id}] [信息] 登录验证码可能命中旧邮件，准备重新等待新验证码")
                     time.sleep(2)
                     continue
                 return None
@@ -1053,5 +1067,5 @@ def try_token_via_password_login(
 
         return try_token_via_existing_session(login_session, oauth, thread_id)
     except Exception as exc:
-        print(f"[线程 {thread_id}] [警告] 账号密码登录兜底失败: {exc}")
+        logger.warning(f"[线程 {thread_id}] [警告] 账号密码登录兜底失败: {exc}")
         return None

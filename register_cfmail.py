@@ -1,5 +1,6 @@
 import email
 import json
+import logging
 import math
 import os
 import re
@@ -14,6 +15,8 @@ from typing import Any, Dict, List, Optional, Set
 from curl_cffi import requests
 
 from register_mailboxes import TempMailbox
+
+logger = logging.getLogger("openai_register")
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -75,15 +78,15 @@ CFMAIL_ADMIN_PASSWORD = ""
 
 
 def _log_waiting_code_start(thread_id: int, email: str) -> None:
-    print(f"[线程 {thread_id}] [信息] 正在等待邮箱 {email} 的验证码")
+    logger.info(f"[线程 {thread_id}] [信息] 正在等待邮箱 {email} 的验证码")
 
 
 def _log_waiting_code_success(thread_id: int, code: str) -> None:
-    print(f"[线程 {thread_id}] [信息] 已收到验证码: {code}")
+    logger.info(f"[线程 {thread_id}] [信息] 已收到验证码: {code}")
 
 
 def _log_waiting_code_timeout(thread_id: int) -> None:
-    print(f"[线程 {thread_id}] [警告] 等待超时，未收到验证码")
+    logger.warning(f"[线程 {thread_id}] [警告] 等待超时，未收到验证码")
 
 
 def normalize_host(value: str) -> str:
@@ -107,7 +110,7 @@ def load_cfmail_accounts_from_file(
             data = json.load(f)
     except Exception as e:
         if not silent:
-            print(f"[警告] 读取 cfmail 配置文件失败: {path}，错误: {e}")
+            logger.warning(f"[警告] 读取 cfmail 配置文件失败: {path}，错误: {e}")
         return []
 
     if isinstance(data, list):
@@ -119,7 +122,7 @@ def load_cfmail_accounts_from_file(
             return accounts
 
     if not silent:
-        print(f"[警告] cfmail 配置文件格式无效: {path}")
+        logger.warning(f"[警告] cfmail 配置文件格式无效: {path}")
     return []
 
 
@@ -266,7 +269,7 @@ def record_cfmail_failure(account_name: str, reason: str = "") -> None:
 
     if cooldown_until > now:
         remaining = int(math.ceil(cooldown_until - now))
-        print(
+        logger.warning(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置 {account_name} 连续失败达到阈值，已自动跳过 {remaining} 秒"
         )
 
@@ -321,7 +324,7 @@ def select_cfmail_account(profile_name: str = "auto") -> Optional[CfmailAccount]
             if account.name.lower() == selected_key:
                 remaining = _cfmail_skip_remaining_seconds(account.name)
                 if remaining > 0:
-                    print(
+                    logger.warning(
                         f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置 {account.name} 当前仍在冷却中，剩余 {remaining} 秒；因你已手动指定，仍继续尝试"
                     )
                 return account
@@ -344,7 +347,7 @@ def select_cfmail_account(profile_name: str = "auto") -> Optional[CfmailAccount]
 
     if skipped_accounts:
         skip_desc = ", ".join(f"{name}({remaining}s)" for name, remaining in skipped_accounts)
-        print(
+        logger.warning(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] 所有 cfmail 配置当前都在冷却中，暂不分配邮箱：{skip_desc}"
         )
     return None
@@ -372,7 +375,7 @@ def reload_cfmail_accounts_if_needed(force: bool = False) -> bool:
         raw_accounts = load_cfmail_accounts_from_file(config_path)
         new_accounts = build_cfmail_accounts(raw_accounts)
         if not new_accounts:
-            print(
+            logger.warning(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置文件热加载失败：{config_path} 中没有可用配置，保留当前配置"
             )
             CFMAIL_CONFIG_MTIME = mtime
@@ -384,7 +387,7 @@ def reload_cfmail_accounts_if_needed(force: bool = False) -> bool:
         CFMAIL_CONFIG_MTIME = mtime
         new_names = cfmail_account_names()
         if force or old_names != new_names:
-            print(
+            logger.info(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [信息] cfmail 配置已热加载：{new_names}"
             )
         return True
@@ -409,8 +412,8 @@ def _test_single_cfmail_account(
     account: CfmailAccount, proxy: Optional[str] = None
 ) -> bool:
     proxies = _build_request_proxies(proxy)
-    print(f"\n[cfmail测试] 开始测试配置: {account.name}")
-    print(f"[cfmail测试] worker_domain={account.worker_domain} email_domain={account.email_domain}")
+    logger.info(f"\n[cfmail测试] 开始测试配置: {account.name}")
+    logger.info(f"[cfmail测试] worker_domain={account.worker_domain} email_domain={account.email_domain}")
 
     try:
         local = f"codextest{secrets.token_hex(4)}"
@@ -430,7 +433,7 @@ def _test_single_cfmail_account(
             timeout=20,
         )
         if create_resp.status_code != 200:
-            print(
+            logger.info(
                 f"[cfmail测试] 失败：创建邮箱返回 {create_resp.status_code}，响应={create_resp.text[:300]}"
             )
             return False
@@ -439,10 +442,10 @@ def _test_single_cfmail_account(
         address = str(data.get("address") or "").strip()
         jwt = str(data.get("jwt") or "").strip()
         if not address or not jwt:
-            print("[cfmail测试] 失败：创建邮箱成功但返回 address/jwt 不完整")
+            logger.info("[cfmail测试] 失败：创建邮箱成功但返回 address/jwt 不完整")
             return False
 
-        print(f"[cfmail测试] 创建成功: {address}")
+        logger.info(f"[cfmail测试] 创建成功: {address}")
 
         poll_resp = requests.get(
             f"https://{account.worker_domain}/api/mails",
@@ -453,17 +456,17 @@ def _test_single_cfmail_account(
             timeout=20,
         )
         if poll_resp.status_code != 200:
-            print(
+            logger.info(
                 f"[cfmail测试] 失败：轮询接口返回 {poll_resp.status_code}，响应={poll_resp.text[:300]}"
             )
             return False
 
         poll_data = poll_resp.json() if poll_resp.content else {}
         count = poll_data.get("count", 0) if isinstance(poll_data, dict) else 0
-        print(f"[cfmail测试] 轮询成功: count={count}")
+        logger.info(f"[cfmail测试] 轮询成功: count={count}")
         return True
     except Exception as e:
-        print(f"[cfmail测试] 失败：{account.name} 测试异常: {e}")
+        logger.info(f"[cfmail测试] 失败：{account.name} 测试异常: {e}")
         return False
 
 
@@ -474,7 +477,7 @@ def run_cfmail_self_test(
     profile_name: str = "auto",
 ) -> bool:
     if not accounts:
-        print("[cfmail测试] 未找到可用的 cfmail 配置")
+        logger.info("[cfmail测试] 未找到可用的 cfmail 配置")
         return False
 
     selected_accounts = accounts
@@ -486,12 +489,12 @@ def run_cfmail_self_test(
             if account.name.lower() == selected_name.lower()
         ]
         if not selected_accounts:
-            print(
+            logger.info(
                 f"[cfmail测试] 未找到指定配置: {selected_name}；当前可用配置: {cfmail_account_names(accounts)}"
             )
             return False
 
-    print(
+    logger.info(
         f"[cfmail测试] 共需测试 {len(selected_accounts)} 个配置: {cfmail_account_names(selected_accounts)}"
     )
     passed = 0
@@ -499,7 +502,7 @@ def run_cfmail_self_test(
         if _test_single_cfmail_account(account, proxy):
             passed += 1
 
-    print(
+    logger.info(
         f"\n[cfmail测试] 测试完成：成功 {passed} / {len(selected_accounts)}，失败 {len(selected_accounts) - passed}"
     )
     return passed == len(selected_accounts)
@@ -511,7 +514,7 @@ def create_cfmail_mailbox(
     reload_cfmail_accounts_if_needed()
     selected_account = select_cfmail_account(CFMAIL_PROFILE_MODE)
     if not selected_account:
-        print(
+        logger.error(
             f"[线程 {thread_id}] [错误] 自建邮箱配置不可用，请检查 {CFMAIL_CONFIG_PATH} 或 --cfmail-profile 参数；当前可用配置: {cfmail_account_names()}"
         )
         return None
@@ -535,7 +538,7 @@ def create_cfmail_mailbox(
             timeout=15,
         )
         if resp.status_code != 200:
-            print(
+            logger.warning(
                 f"[线程 {thread_id}] [警告] 自建邮箱[{selected_account.name}]创建失败，状态码: {resp.status_code}，响应: {resp.text[:300]}"
             )
             record_cfmail_failure(selected_account.name, f"new_address status={resp.status_code}")
@@ -545,7 +548,7 @@ def create_cfmail_mailbox(
         email = str(data.get("address") or "").strip()
         jwt = str(data.get("jwt") or "").strip()
         if not email or not jwt:
-            print(f"[线程 {thread_id}] [警告] 自建邮箱[{selected_account.name}]返回数据不完整")
+            logger.warning(f"[线程 {thread_id}] [警告] 自建邮箱[{selected_account.name}]返回数据不完整")
             record_cfmail_failure(selected_account.name, "new_address incomplete data")
             return None
 
@@ -558,7 +561,7 @@ def create_cfmail_mailbox(
             config_name=selected_account.name,
         )
     except Exception as e:
-        print(f"[线程 {thread_id}] [警告] 请求自建邮箱[{selected_account.name}] API 出错: {e}")
+        logger.warning(f"[线程 {thread_id}] [警告] 请求自建邮箱[{selected_account.name}] API 出错: {e}")
         record_cfmail_failure(selected_account.name, f"new_address exception: {e}")
         return None
 
@@ -690,7 +693,7 @@ def poll_cfmail_oai_code(
         worker_domain = normalize_host(CFMAIL_WORKER_DOMAIN)
         api_base = f"https://{worker_domain}" if worker_domain else ""
     if not api_base:
-        print(f"[线程 {thread_id}] [错误] 自建邮箱 api_base 为空，无法轮询邮件")
+        logger.error(f"[线程 {thread_id}] [错误] 自建邮箱 api_base 为空，无法轮询邮件")
         return ""
 
     seen_ids: Set[str] = set(str(x).strip() for x in (skip_message_ids or set()) if str(x).strip())
