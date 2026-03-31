@@ -1,8 +1,22 @@
+# -*- coding: utf-8 -*-
+"""OAuth 授权、PKCE、回调处理与 Web Signup 逻辑。
+
+本模块只保留与 OpenAI OAuth 认证流程直接相关的功能：
+- PKCE code_verifier / code_challenge 生成
+- OAuth 授权 URL 构建
+- Web Signup 入口获取
+- 回调 URL 解析与 Token 交换
+- OAuth 重定向链跟随
+- Email OTP 校验请求
+- JWT/Cookie 解析工具
+
+Sentinel / 指纹 / POW 求解 → register_sentinel.py
+Token 提取策略 → register_token.py
+"""
 import base64
 import hashlib
 import json
 import logging
-import random
 import re
 import secrets
 import time
@@ -11,8 +25,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi import requests
 
@@ -20,6 +33,9 @@ from register_mailboxes import TempMailbox
 
 logger = logging.getLogger("openai_register")
 
+# ---------------------------------------------------------------------------
+# OAuth 常量
+# ---------------------------------------------------------------------------
 RETRYABLE_GATEWAY_STATUSES = {502, 503, 504}
 EMAIL_OTP_VALIDATE_MAX_ATTEMPTS = 3
 EMAIL_OTP_VALIDATE_RETRY_DELAY_SECONDS = 2
@@ -38,46 +54,17 @@ PRIME_OAUTH_REQUEST_TIMEOUT_SECONDS = 20
 CHATGPT_SESSION_URL = "https://chatgpt.com/api/auth/session"
 SESSION_API_REQUEST_TIMEOUT_SECONDS = 15
 DEFAULT_SESSION_FALLBACK_EXPIRES_IN_SECONDS = 1800
-SENTINEL_FRAME_URL = (
-    "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
-)
-SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
-SENTINEL_DOCUMENT_KEYS = ("visibilityState", "readyState", "documentURI", "location")
-SENTINEL_WINDOW_KEYS = ("location", "document", "navigator", "origin", "window")
-SENTINEL_SCRIPT_SOURCES = (SENTINEL_SDK_URL, SENTINEL_FRAME_URL)
-SENTINEL_POW_PREFIX = "gAAAAAB"
-SENTINEL_POW_SUFFIX = "~S"
-SENTINEL_POW_MAX_ATTEMPTS = 500000
-SENTINEL_POW_TIMEOUT_SECONDS = 20
-SENTINEL_DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-)
-SENTINEL_DEFAULT_JS_HEAP_SIZE_LIMIT = 4294705152
-SENTINEL_DEFAULT_SCREEN_SUM = 3000
-SENTINEL_DEFAULT_LANGUAGE = "en-US"
-SENTINEL_DEFAULT_LANGUAGES = "en-US,en"
-SENTINEL_DEFAULT_HARDWARE_CONCURRENCY = 8
-SENTINEL_MINUS_SIGN = "\u2212"
-SENTINEL_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-SENTINEL_MONTH_NAMES = (
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-)
+
+
+# ---------------------------------------------------------------------------
+# 数据类
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class OAuthStart:
+    """OAuth 授权起始参数。"""
+
     auth_url: str
     state: str
     code_verifier: str
@@ -85,7 +72,13 @@ class OAuthStart:
     scope: str
 
 
+# ---------------------------------------------------------------------------
+# PKCE / 编码工具
+# ---------------------------------------------------------------------------
+
+
 def _normalize_code_values(code_values: Optional[Set[str]] = None) -> Set[str]:
+    """标准化验证码集合，去除空值和空白。"""
     if not code_values:
         return set()
     normalized: Set[str] = set()
@@ -97,22 +90,32 @@ def _normalize_code_values(code_values: Optional[Set[str]] = None) -> Set[str]:
 
 
 def _b64url_no_pad(raw: bytes) -> str:
+    """Base64url 编码（无填充）。"""
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 def _sha256_b64url_no_pad(s: str) -> str:
+    """SHA-256 哈希后 Base64url 编码（无填充）。"""
     return _b64url_no_pad(hashlib.sha256(s.encode("ascii")).digest())
 
 
 def _random_state(nbytes: int = 16) -> str:
+    """生成随机 OAuth state 参数。"""
     return secrets.token_urlsafe(nbytes)
 
 
 def _pkce_verifier() -> str:
+    """生成 PKCE code_verifier。"""
     return secrets.token_urlsafe(64)
 
 
+# ---------------------------------------------------------------------------
+# 回调 URL 解析
+# ---------------------------------------------------------------------------
+
+
 def _parse_callback_url(callback_url: str) -> Dict[str, str]:
+    """解析 OAuth 回调 URL 中的 code / state / error 等参数。"""
     parsed = urllib.parse.urlparse(callback_url)
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     fragment = urllib.parse.parse_qs(parsed.fragment, keep_blank_values=True)
@@ -140,7 +143,13 @@ def _parse_callback_url(callback_url: str) -> Dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# JWT / Cookie 解析工具
+# ---------------------------------------------------------------------------
+
+
 def _jwt_claims_no_verify(id_token: str) -> Dict[str, Any]:
+    """无验证地解码 JWT id_token 的 payload 部分。"""
     if not id_token or id_token.count(".") < 2:
         return {}
     payload_b64 = id_token.split(".")[1]
@@ -153,6 +162,7 @@ def _jwt_claims_no_verify(id_token: str) -> Dict[str, Any]:
 
 
 def _decode_jwt_segment(seg: str) -> Dict[str, Any]:
+    """解码单个 JWT/Base64 编码的段。"""
     raw = (seg or "").strip()
     if not raw:
         return {}
@@ -165,6 +175,7 @@ def _decode_jwt_segment(seg: str) -> Dict[str, Any]:
 
 
 def extract_workspaces_from_auth_cookie(auth_cookie: str) -> List[Dict[str, Any]]:
+    """从 oai-client-auth-session Cookie 中提取 workspace 列表。"""
     raw = str(auth_cookie or "").strip()
     if not raw:
         return []
@@ -201,13 +212,20 @@ def extract_workspaces_from_auth_cookie(auth_cookie: str) -> List[Dict[str, Any]
 
 
 def _to_int(v: Any) -> int:
+    """安全地将值转为整数。"""
     try:
         return int(v)
     except (TypeError, ValueError):
         return 0
 
 
+# ---------------------------------------------------------------------------
+# HTTP 表单提交工具
+# ---------------------------------------------------------------------------
+
+
 def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
+    """向指定 URL 提交表单（application/x-www-form-urlencoded）。"""
     body = urllib.parse.urlencode(data).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -233,6 +251,11 @@ def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, A
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# OAuth 授权 URL 构建
+# ---------------------------------------------------------------------------
+
+
 def build_oauth_authorize_url(
     *,
     state: str,
@@ -241,6 +264,7 @@ def build_oauth_authorize_url(
     scope: str,
     prompt: Optional[str] = "login",
 ) -> str:
+    """构建 OpenAI OAuth 授权 URL。"""
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -259,6 +283,7 @@ def build_oauth_authorize_url(
 
 
 def oauth_authorize_url(oauth: OAuthStart, *, prompt: Optional[str] = "login") -> str:
+    """基于 OAuthStart 参数构建授权 URL。"""
     return build_oauth_authorize_url(
         state=oauth.state,
         code_verifier=oauth.code_verifier,
@@ -271,6 +296,7 @@ def oauth_authorize_url(oauth: OAuthStart, *, prompt: Optional[str] = "login") -
 def generate_oauth_url(
     *, redirect_uri: str = DEFAULT_REDIRECT_URI, scope: str = DEFAULT_SCOPE
 ) -> OAuthStart:
+    """生成一组全新的 OAuth 授权参数（含 PKCE）。"""
     state = _random_state()
     code_verifier = _pkce_verifier()
     auth_url = build_oauth_authorize_url(
@@ -289,7 +315,13 @@ def generate_oauth_url(
     )
 
 
+# ---------------------------------------------------------------------------
+# Web Signup 入口
+# ---------------------------------------------------------------------------
+
+
 def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
+    """通过 ChatGPT Web 入口获取 OAuth 授权起始 URL。"""
     attempts = max(1, WEB_SIGNUP_MAX_ATTEMPTS)
     for attempt in range(1, attempts + 1):
         try:
@@ -370,6 +402,11 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# 回调 URL 提交与 Token 交换
+# ---------------------------------------------------------------------------
+
+
 def submit_callback_url(
     *,
     callback_url: str,
@@ -377,6 +414,7 @@ def submit_callback_url(
     code_verifier: str,
     redirect_uri: str = DEFAULT_REDIRECT_URI,
 ) -> str:
+    """解析回调 URL 并用 authorization_code 换取 token。"""
     cb = _parse_callback_url(callback_url)
     if cb["error"]:
         desc = cb["error_description"]
@@ -430,7 +468,13 @@ def submit_callback_url(
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 
 
+# ---------------------------------------------------------------------------
+# 响应解析工具
+# ---------------------------------------------------------------------------
+
+
 def extract_continue_url_from_response(resp: Any) -> str:
+    """从 HTTP 响应中提取 continue/redirect URL。"""
     base_url = str(getattr(resp, "url", "") or AUTH_URL).strip() or AUTH_URL
     headers = getattr(resp, "headers", {}) or {}
 
@@ -471,6 +515,7 @@ def extract_continue_url_from_response(resp: Any) -> str:
 
 
 def response_text_preview(resp: Any, limit: int = 240) -> str:
+    """获取 HTTP 响应文本的简短预览。"""
     text = str(getattr(resp, "text", "") or "").strip()
     if not text:
         return ""
@@ -481,6 +526,7 @@ def response_text_preview(resp: Any, limit: int = 240) -> str:
 
 
 def _parse_json_object(raw_text: str) -> Dict[str, Any]:
+    """从文本中尝试解析 JSON 对象。"""
     content = str(raw_text or "").strip()
     if not content:
         return {}
@@ -507,6 +553,7 @@ def _parse_json_object(raw_text: str) -> Dict[str, Any]:
 
 
 def _session_fallback_expired_at(payload: Dict[str, Any]) -> str:
+    """获取 session 兜底的过期时间。"""
     expires = str(payload.get("expires") or "").strip()
     if expires:
         return expires
@@ -517,77 +564,9 @@ def _session_fallback_expired_at(payload: Dict[str, Any]) -> str:
     )
 
 
-def try_token_via_session_api(session: Any, thread_id: int) -> Optional[str]:
-    logger.info(f"[线程 {thread_id}] [信息] 尝试通过 chatgpt session 接口兜底提取 token")
-
-    try:
-        resp = session.get(
-            CHATGPT_SESSION_URL,
-            headers={
-                "accept": "application/json,text/plain,*/*",
-                "referer": "https://chatgpt.com/",
-            },
-            timeout=SESSION_API_REQUEST_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        logger.warning(f"[线程 {thread_id}] [警告] 读取 chatgpt session 接口失败: {exc}")
-        return None
-
-    if resp.status_code != 200:
-        logger.warning(
-            f"[线程 {thread_id}] [警告] chatgpt session 接口状态异常: {resp.status_code}，"
-            f"摘要: {response_text_preview(resp)}"
-        )
-        return None
-
-    try:
-        payload = resp.json() if resp.content else {}
-    except Exception:
-        payload = _parse_json_object(getattr(resp, "text", ""))
-
-    if not isinstance(payload, dict) or not payload:
-        logger.warning(f"[线程 {thread_id}] [警告] chatgpt session 接口未返回有效 JSON")
-        return None
-
-    access_token = str(payload.get("accessToken") or "").strip()
-    if not access_token:
-        logger.warning(f"[线程 {thread_id}] [警告] chatgpt session 接口响应中缺少 accessToken")
-        return None
-
-    user_info = payload.get("user") if isinstance(payload.get("user"), dict) else {}
-    account_info = payload.get("account") if isinstance(payload.get("account"), dict) else {}
-    session_token = str(payload.get("sessionToken") or "").strip()
-    email = str(user_info.get("email") or "").strip()
-    account_id = str(
-        user_info.get("id")
-        or account_info.get("id")
-        or ""
-    ).strip()
-    now = int(time.time())
-
-    config = {
-        "id_token": "",
-        "access_token": access_token,
-        "refresh_token": "",
-        "account_id": account_id,
-        "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-        "email": email,
-        "type": "chatgpt_session_fallback",
-        "expired": _session_fallback_expired_at(payload),
-    }
-    if session_token:
-        config["session_token"] = session_token
-
-    plan_type = str(account_info.get("planType") or "").strip()
-    if plan_type:
-        config["plan_type"] = plan_type
-
-    logger.info(
-        f"[线程 {thread_id}] [信息] 已通过 chatgpt session 接口提取 access_token"
-        f"{f'，email={email}' if email else ''}"
-        f"{f'，account_id={account_id}' if account_id else ''}"
-    )
-    return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+# ---------------------------------------------------------------------------
+# Email OTP 校验
+# ---------------------------------------------------------------------------
 
 
 def post_email_otp_validate(
@@ -599,6 +578,7 @@ def post_email_otp_validate(
     max_attempts: int = EMAIL_OTP_VALIDATE_MAX_ATTEMPTS,
     retry_delay_seconds: int = EMAIL_OTP_VALIDATE_RETRY_DELAY_SECONDS,
 ) -> Optional[Any]:
+    """向 OpenAI 提交邮箱验证码校验请求（带重试）。"""
     payload = json.dumps(
         {"code": str(code or "").strip()},
         ensure_ascii=False,
@@ -650,6 +630,11 @@ def post_email_otp_validate(
     return last_resp
 
 
+# ---------------------------------------------------------------------------
+# OAuth 重定向链跟随
+# ---------------------------------------------------------------------------
+
+
 def follow_oauth_redirect_chain(
     session: Any,
     start_url: str,
@@ -658,6 +643,7 @@ def follow_oauth_redirect_chain(
     *,
     max_hops: int = 8,
 ) -> Optional[str]:
+    """跟随 OAuth 重定向链直到拿到 callback URL 并兑换 token。"""
     current_url = str(start_url or "").strip()
     if not current_url:
         return None
@@ -692,6 +678,11 @@ def follow_oauth_redirect_chain(
     return None
 
 
+# ---------------------------------------------------------------------------
+# OAuth Session 初始化
+# ---------------------------------------------------------------------------
+
+
 def prime_oauth_session(
     session: Any,
     start_url: str,
@@ -699,6 +690,7 @@ def prime_oauth_session(
     *,
     max_hops: int = 6,
 ) -> Any:
+    """初始化 OAuth session，跟随重定向直到停止或遇到本地 callback。"""
     current_url = str(start_url or "").strip()
     last_resp = None
     if not current_url:
@@ -743,444 +735,3 @@ def prime_oauth_session(
         current_url = next_url
 
     return last_resp
-
-
-def _sentinel_js_now_string() -> str:
-    now = datetime.now().astimezone()
-    offset = now.strftime("%z")
-    if len(offset) == 5:
-        offset = f"{offset[:3]}:{offset[3:]}"
-    return (
-        f"{SENTINEL_WEEKDAY_NAMES[now.weekday()]} "
-        f"{SENTINEL_MONTH_NAMES[now.month - 1]} "
-        f"{now.day:02d} {now.year:04d} "
-        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d} "
-        f"GMT{offset or '+00:00'}"
-    )
-
-
-def _sentinel_b64_json(value: Any) -> str:
-    raw = json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return base64.b64encode(raw).decode("ascii")
-
-
-def _sentinel_hash_hex(value: str) -> str:
-    hashed = 2166136261
-    for ch in str(value or ""):
-        hashed ^= ord(ch)
-        hashed = (hashed * 16777619) & 0xFFFFFFFF
-    hashed ^= hashed >> 16
-    hashed = (hashed * 2246822507) & 0xFFFFFFFF
-    hashed ^= hashed >> 13
-    hashed = (hashed * 3266489909) & 0xFFFFFFFF
-    hashed ^= hashed >> 16
-    return f"{hashed & 0xFFFFFFFF:08x}"
-
-
-def _sentinel_query_keys_signature() -> str:
-    return ",".join(
-        urllib.parse.parse_qs(
-            urllib.parse.urlparse(SENTINEL_FRAME_URL).query,
-            keep_blank_values=True,
-        ).keys()
-    )
-
-
-def _sentinel_random_choice(values: Sequence[str], default: str = "") -> str:
-    if not values:
-        return default
-    return random.choice(values)
-
-
-def _build_sentinel_pow_fingerprint() -> List[Any]:
-    navigator_values = {
-        "vendor": "Google Inc.",
-        "platform": "Win32",
-        "languages": SENTINEL_DEFAULT_LANGUAGES,
-        "language": SENTINEL_DEFAULT_LANGUAGE,
-        "userAgent": SENTINEL_DEFAULT_USER_AGENT,
-        "hardwareConcurrency": str(SENTINEL_DEFAULT_HARDWARE_CONCURRENCY),
-    }
-    nav_key = _sentinel_random_choice(tuple(navigator_values.keys()), "userAgent")
-    perf_now_ms = time.perf_counter() * 1000
-    time_origin_ms = int(time.time() * 1000 - perf_now_ms)
-    return [
-        SENTINEL_DEFAULT_SCREEN_SUM,
-        _sentinel_js_now_string(),
-        SENTINEL_DEFAULT_JS_HEAP_SIZE_LIMIT,
-        random.random(),
-        SENTINEL_DEFAULT_USER_AGENT,
-        _sentinel_random_choice(SENTINEL_SCRIPT_SOURCES, SENTINEL_SDK_URL),
-        _sentinel_random_choice(SENTINEL_SCRIPT_SOURCES, SENTINEL_SDK_URL),
-        SENTINEL_DEFAULT_LANGUAGE,
-        SENTINEL_DEFAULT_LANGUAGES,
-        random.random(),
-        (
-            f"{nav_key}{SENTINEL_MINUS_SIGN}"
-            f"{navigator_values.get(nav_key, SENTINEL_DEFAULT_USER_AGENT)}"
-        ),
-        _sentinel_random_choice(SENTINEL_DOCUMENT_KEYS, "visibilityState"),
-        _sentinel_random_choice(SENTINEL_WINDOW_KEYS, "location"),
-        perf_now_ms,
-        str(uuid.uuid4()),
-        _sentinel_query_keys_signature(),
-        SENTINEL_DEFAULT_HARDWARE_CONCURRENCY,
-        time_origin_ms,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ]
-
-
-def solve_sentinel_pow(*, seed: str, difficulty: str, thread_id: int) -> str:
-    seed_text = str(seed or "").strip()
-    target = str(difficulty or "").strip().lower()
-    if not seed_text or not target:
-        return ""
-
-    perf_counter = time.perf_counter
-    hash_hex = _sentinel_hash_hex
-    encode_candidate = _sentinel_b64_json
-    started_at = perf_counter()
-    candidate = _build_sentinel_pow_fingerprint()
-    prefix_len = len(target)
-    timeout = SENTINEL_POW_TIMEOUT_SECONDS
-
-    for attempt in range(SENTINEL_POW_MAX_ATTEMPTS):
-        elapsed = perf_counter() - started_at
-        if elapsed >= timeout:
-            elapsed_ms = round(elapsed * 1000)
-            logger.error(
-                f"[线程 {thread_id}] [错误] Sentinel POW 求解超时（{timeout}秒），难度={target}，"
-                f"已尝试 {attempt + 1} 次，耗时 {elapsed_ms} ms"
-            )
-            return ""
-
-        candidate[3] = attempt
-        candidate[9] = round((perf_counter() - started_at) * 1000)
-        encoded = encode_candidate(candidate)
-        if hash_hex(seed_text + encoded)[:prefix_len] <= target:
-            elapsed_ms = round((perf_counter() - started_at) * 1000)
-            logger.info(
-                f"[线程 {thread_id}] [信息] Sentinel POW 求解成功，难度={target}，"
-                f"尝试 {attempt + 1} 次，耗时 {elapsed_ms} ms"
-            )
-            return f"{SENTINEL_POW_PREFIX}{encoded}{SENTINEL_POW_SUFFIX}"
-
-    elapsed_ms = round((perf_counter() - started_at) * 1000)
-    logger.error(
-        f"[线程 {thread_id}] [错误] Sentinel POW 求解失败，难度={target}，"
-        f"已尝试 {SENTINEL_POW_MAX_ATTEMPTS} 次，耗时 {elapsed_ms} ms"
-    )
-    return ""
-
-
-def request_sentinel_header(
-    *,
-    did: str,
-    proxies: Any,
-    impersonate: str,
-    thread_id: int,
-    flow: str = "authorize_continue",
-) -> str:
-    device_id = str(did or "").strip()
-    if not device_id:
-        logger.error(f"[线程 {thread_id}] [错误] 无法获取 Device ID，Sentinel 请求已跳过")
-        return ""
-
-    flow_name = str(flow or "authorize_continue").strip() or "authorize_continue"
-
-    body = json.dumps(
-        {"p": "", "id": device_id, "flow": flow_name},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    resp = requests.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        headers={
-            "origin": "https://sentinel.openai.com",
-            "referer": SENTINEL_FRAME_URL,
-            "content-type": "text/plain;charset=UTF-8",
-        },
-        data=body,
-        proxies=proxies,
-        impersonate=impersonate,
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        logger.error(f"[线程 {thread_id}] [错误] Sentinel 请求失败，状态码: {resp.status_code}")
-        return ""
-
-    try:
-        sentinel_payload = resp.json() if resp.content else {}
-    except Exception as exc:
-        logger.error(f"[线程 {thread_id}] [错误] Sentinel 响应解析失败: {exc}")
-        return ""
-
-    token = str((sentinel_payload or {}).get("token") or "").strip()
-    if not token:
-        logger.error(f"[线程 {thread_id}] [错误] Sentinel 响应里缺少 token")
-        return ""
-
-    proof = ""
-    pow_config = (
-        sentinel_payload.get("proofofwork")
-        if isinstance(sentinel_payload, dict)
-        else {}
-    )
-    if isinstance(pow_config, dict) and pow_config.get("required"):
-        difficulty = str(pow_config.get("difficulty") or "").strip().lower()
-        logger.info(
-            f"[线程 {thread_id}] [信息] Sentinel 要求 POW，开始求解，难度={difficulty or 'unknown'}"
-        )
-        proof = solve_sentinel_pow(
-            seed=str(pow_config.get("seed") or ""),
-            difficulty=difficulty,
-            thread_id=thread_id,
-        )
-        if not proof:
-            return ""
-
-    return json.dumps(
-        {
-            "p": proof,
-            "t": "",
-            "c": token,
-            "id": device_id,
-            "flow": flow_name,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def try_token_via_existing_session(
-    session: Any,
-    oauth: OAuthStart,
-    thread_id: int,
-) -> Optional[str]:
-    logger.info(f"[线程 {thread_id}] [信息] 尝试复用当前 session 免密获取 token")
-    return follow_oauth_redirect_chain(
-        session,
-        oauth_authorize_url(oauth, prompt=None),
-        oauth,
-        thread_id,
-    )
-
-
-def try_token_via_workspace_select(
-    session: Any,
-    oauth: OAuthStart,
-    auth_cookie: str,
-    thread_id: int,
-) -> Optional[str]:
-    workspaces = extract_workspaces_from_auth_cookie(auth_cookie)
-    if not workspaces:
-        logger.warning(f"[线程 {thread_id}] [警告] 授权 Cookie 存在，但暂未解析到 workspace")
-        return None
-
-    selected_workspace = workspaces[0] or {}
-    workspace_id = str(selected_workspace.get("id") or "").strip()
-    if not workspace_id:
-        logger.warning(f"[线程 {thread_id}] [警告] workspace 信息存在，但无法解析 workspace_id")
-        return None
-
-    workspace_kind = str(selected_workspace.get("kind") or "").strip() or "unknown"
-    workspace_name = str(selected_workspace.get("name") or "").strip() or "(null)"
-    logger.info(
-        f"[线程 {thread_id}] [信息] 已解析 workspace: count={len(workspaces)}, "
-        f"id={workspace_id}, kind={workspace_kind}, name={workspace_name}"
-    )
-
-    select_resp = session.post(
-        "https://auth.openai.com/api/accounts/workspace/select",
-        headers={
-            "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            "content-type": "application/json",
-        },
-        json={"workspace_id": workspace_id},
-    )
-    if select_resp.status_code != 200:
-        logger.warning(f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}")
-        return None
-
-    continue_url = extract_continue_url_from_response(select_resp)
-    if not continue_url:
-        logger.warning(f"[线程 {thread_id}] [警告] workspace/select 响应里缺少 continue_url")
-        return None
-
-    logger.info(f"[线程 {thread_id}] [信息] 已获取 workspace，继续跟随授权跳转链")
-    return follow_oauth_redirect_chain(session, continue_url, oauth, thread_id)
-
-
-def try_token_via_password_login(
-    *,
-    email: str,
-    password: str,
-    mailbox: Optional[TempMailbox] = None,
-    used_codes: Optional[Set[str]] = None,
-    oauth: OAuthStart,
-    proxies: Any,
-    impersonate: str,
-    thread_id: int,
-    get_oai_code_fn: Callable[..., str],
-    get_mailbox_message_snapshot_fn: Callable[..., Set[str]],
-) -> Optional[str]:
-    account = str(email or "").strip()
-    pwd = str(password or "").strip()
-    if not account or not pwd:
-        return None
-
-    logger.info(f"[线程 {thread_id}] [信息] 当前 session 未拿到 token，尝试账号密码重新登录")
-    login_session = requests.Session(proxies=proxies, impersonate=impersonate)
-    ignored_codes = _normalize_code_values(used_codes)
-
-    try:
-        prime_oauth_session(
-            login_session,
-            oauth_authorize_url(oauth, prompt="login"),
-            thread_id,
-        )
-        did = login_session.cookies.get("oai-did")
-        sentinel_header = request_sentinel_header(
-            did=did,
-            proxies=proxies,
-            impersonate=impersonate,
-            thread_id=thread_id,
-        )
-        if not sentinel_header:
-            return None
-
-        continue_resp = login_session.post(
-            "https://auth.openai.com/api/accounts/authorize/continue",
-            headers={
-                "referer": "https://auth.openai.com/sign-in",
-                "accept": "application/json",
-                "content-type": "application/json",
-                "openai-sentinel-token": sentinel_header,
-            },
-            data=json.dumps(
-                {
-                    "username": {"value": account, "kind": "email"},
-                    "screen_hint": "login",
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        )
-        if continue_resp.status_code not in (200, 204):
-            logger.warning(
-                f"[线程 {thread_id}] [警告] 账号密码登录预处理失败，状态码: {continue_resp.status_code}"
-            )
-            return None
-
-        existing_message_ids = (
-            get_mailbox_message_snapshot_fn(mailbox, thread_id, proxies) if mailbox else set()
-        )
-        login_resp = login_session.post(
-            "https://auth.openai.com/api/accounts/password/verify",
-            headers={
-                "referer": "https://auth.openai.com/log-in/password",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-            data=json.dumps(
-                {"password": pwd},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        )
-        if login_resp.status_code != 200:
-            logger.warning(f"[线程 {thread_id}] [警告] 账号密码登录失败，状态码: {login_resp.status_code}")
-            return None
-
-        try:
-            login_payload = login_resp.json() if login_resp.content else {}
-        except Exception:
-            login_payload = {}
-
-        login_page = login_payload.get("page") or {}
-        page_type = str(login_page.get("type") or "").strip()
-        continue_url = extract_continue_url_from_response(login_resp)
-
-        if page_type == "email_otp_verification":
-            if not mailbox:
-                logger.warning(
-                    f"[线程 {thread_id}] [警告] 密码登录后需要邮箱验证码，但当前没有可用邮箱上下文"
-                )
-                return None
-
-            logger.info(f"[线程 {thread_id}] [信息] OpenAI 已自动发送登录验证码邮件，开始等待新邮件")
-            login_otp_resp = None
-            for otp_attempt in range(2):
-                login_code = get_oai_code_fn(
-                    mailbox,
-                    thread_id,
-                    proxies,
-                    skip_message_ids=existing_message_ids,
-                    skip_codes=ignored_codes,
-                )
-                if not login_code:
-                    logger.warning(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
-                    return None
-
-                login_otp_resp = post_email_otp_validate(
-                    login_session,
-                    code=login_code,
-                    thread_id=thread_id,
-                    stage_label="登录阶段",
-                )
-                if login_otp_resp and login_otp_resp.status_code == 200:
-                    continue_url = extract_continue_url_from_response(login_otp_resp)
-                    break
-
-                status_code = getattr(login_otp_resp, "status_code", "unknown")
-                if status_code not in RETRYABLE_GATEWAY_STATUSES:
-                    ignored_codes.add(login_code)
-                logger.warning(
-                    f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {status_code}"
-                )
-                if status_code == 401 and otp_attempt == 0:
-                    logger.info(f"[线程 {thread_id}] [信息] 登录验证码可能命中旧邮件，准备重新等待新验证码")
-                    time.sleep(2)
-                    continue
-                return None
-
-            if not login_otp_resp or login_otp_resp.status_code != 200:
-                return None
-
-        auth_cookie = login_session.cookies.get("oai-client-auth-session")
-        if auth_cookie:
-            token_json = try_token_via_workspace_select(
-                login_session, oauth, auth_cookie, thread_id
-            )
-            if token_json:
-                return token_json
-
-        if continue_url:
-            token_json = follow_oauth_redirect_chain(
-                login_session, continue_url, oauth, thread_id
-            )
-            if token_json:
-                return token_json
-
-        auth_cookie = login_session.cookies.get("oai-client-auth-session")
-        if auth_cookie:
-            token_json = try_token_via_workspace_select(
-                login_session, oauth, auth_cookie, thread_id
-            )
-            if token_json:
-                return token_json
-
-        return try_token_via_existing_session(login_session, oauth, thread_id)
-    except Exception as exc:
-        logger.warning(f"[线程 {thread_id}] [警告] 账号密码登录兜底失败: {exc}")
-        return None
