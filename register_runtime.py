@@ -626,12 +626,14 @@ def _process_single_usage_check(
     file_path: str,
     label: str,
     usage_threshold: int,
+    pending: Optional[Dict[str, "TokenUsageCheck"]] = None,
 ) -> Tuple[str, int, int, int]:
     """处理单个文件的额度检查结果，返回 (action, kept, deleted, failed)。"""
     kept = 0
     deleted = 0
     failed = 0
-    usage_check = TOKEN_USAGE_PENDING.get(file_path)
+    source = pending if pending is not None else TOKEN_USAGE_PENDING
+    usage_check = source.get(file_path)
     if usage_check is None:
         return "skip", 0, 0, 0
 
@@ -673,12 +675,19 @@ def _process_single_usage_check(
     return "done", kept, deleted, failed
 
 
-# 临时字典，用于在小批量并发中传递检查结果
+# 临时字典，用于在小批量并发中传递检查结果（传入局部字典以保证线程安全）
 TOKEN_USAGE_PENDING: Dict[str, TokenUsageCheck] = {}
 
 
-def _check_and_store(file_path: str, timeout: int) -> None:
-    """在线程中执行检查并将结果存入临时字典。"""
+def _check_and_store(
+    file_path: str,
+    timeout: int,
+    pending: Optional[Dict[str, "TokenUsageCheck"]] = None,
+) -> None:
+    """在线程中执行检查并将结果存入临时字典。
+
+    :param pending: 局部临时字典；为 None 时退化为全局 TOKEN_USAGE_PENDING（兼容旧调用）。
+    """
     try:
         result = get_token_usage_check(file_path, timeout)
     except Exception as exc:
@@ -688,7 +697,8 @@ def _check_and_store(file_path: str, timeout: int) -> None:
             check_failed=True,
             reason=f"并发额度查询异常: {exc}",
         )
-    TOKEN_USAGE_PENDING[file_path] = result
+    target = pending if pending is not None else TOKEN_USAGE_PENDING
+    target[file_path] = result
 
 
 def _cleanup_tokens_in_dir(
@@ -703,6 +713,8 @@ def _cleanup_tokens_in_dir(
 
     每批最多 token_check_workers 个文件并发请求，检查完立即处理结果
     并释放资源，然后再进入下一批。同一时刻内存中最多只有一批的数据。
+    使用局部字典传递检查结果，保证多目录并行清理时的线程安全。
+    批次间采用自适应等待：扣除批次本身耗时后再 sleep，避免无效等待。
     """
     deleted_count = 0
     kept_count = 0
@@ -712,18 +724,19 @@ def _cleanup_tokens_in_dir(
     batch_size = max(1, int(token_check_workers or 1))
 
     for batch_start in range(0, len(file_paths), batch_size):
+        batch_t0 = time.monotonic()
         batch = file_paths[batch_start: batch_start + batch_size]
-        TOKEN_USAGE_PENDING.clear()
+        pending: Dict[str, TokenUsageCheck] = {}
 
         # 并发检查本批次文件
         if len(batch) == 1:
-            _check_and_store(batch[0], curl_timeout)
+            _check_and_store(batch[0], curl_timeout, pending)
         else:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=len(batch),
             ) as executor:
                 futures = [
-                    executor.submit(_check_and_store, fp, curl_timeout)
+                    executor.submit(_check_and_store, fp, curl_timeout, pending)
                     for fp in batch
                 ]
                 concurrent.futures.wait(futures)
@@ -731,17 +744,21 @@ def _cleanup_tokens_in_dir(
         # 立即处理本批次结果并释放
         for file_path in batch:
             __, k, d, f = _process_single_usage_check(
-                file_path, label, usage_threshold,
+                file_path, label, usage_threshold, pending,
             )
             kept_count += k
             deleted_count += d
             check_failed += f
 
-        TOKEN_USAGE_PENDING.clear()
+        # 批次局部字典在此自然销毁，释放内存
+        del pending
 
-        # 批次间按配置间隔控制请求频率
+        # P2 优化：自适应等待——扣除批次执行耗时，避免无效 sleep
         if request_interval > 0 and batch_start + batch_size < len(file_paths):
-            time.sleep(request_interval)
+            elapsed = time.monotonic() - batch_t0
+            remaining = request_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     return kept_count, deleted_count, check_failed
 
@@ -809,18 +826,19 @@ def move_pool_tokens_to_active(
         if moved_count >= needed:
             break
 
+        batch_t0 = time.monotonic()
         batch = pool_files[batch_start: batch_start + batch_size]
-        TOKEN_USAGE_PENDING.clear()
+        pending: Dict[str, TokenUsageCheck] = {}
 
         # 并发检查本批次文件
         if len(batch) == 1:
-            _check_and_store(batch[0], curl_timeout)
+            _check_and_store(batch[0], curl_timeout, pending)
         else:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=len(batch),
             ) as executor:
                 futures = [
-                    executor.submit(_check_and_store, fp, curl_timeout)
+                    executor.submit(_check_and_store, fp, curl_timeout, pending)
                     for fp in batch
                 ]
                 concurrent.futures.wait(futures)
@@ -830,7 +848,7 @@ def move_pool_tokens_to_active(
             if moved_count >= needed:
                 break
 
-            usage_check = TOKEN_USAGE_PENDING.get(file_path)
+            usage_check = pending.get(file_path)
             if usage_check is None:
                 continue
             used_percent = usage_check.used_percent
@@ -870,11 +888,14 @@ def move_pool_tokens_to_active(
                 moved_count += 1
                 log_info(f"从 B 补充到 A: {os.path.basename(destination)}")
 
-        TOKEN_USAGE_PENDING.clear()
+        del pending
 
-        # 批次间按配置间隔控制请求频率
+        # P2 优化：自适应等待——扣除批次执行耗时，避免无效 sleep
         if request_interval > 0 and batch_start + batch_size < len(pool_files):
-            time.sleep(request_interval)
+            elapsed = time.monotonic() - batch_t0
+            remaining = request_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     return moved_count, deleted_count
 
@@ -998,22 +1019,29 @@ def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycl
     os.makedirs(args.token_dir, exist_ok=True)
 
     log_info("========== 开始执行账号检测 ==========")
-    kept_count, deleted_count, check_failed = cleanup_active_tokens(
+
+    # P1 优化：A/B 两个目录完全独立，使用线程并行清理以缩短总耗时
+    cleanup_args_a = (
         args.active_token_dir,
         args.usage_threshold,
         args.request_interval,
         args.curl_timeout,
         args.token_check_workers,
     )
-    log_info(f"A 清理完成：保留 {kept_count}，删除 {deleted_count}，查询失败 {check_failed}")
-
-    pool_kept_count, pool_deleted_count, pool_check_failed = cleanup_pool_tokens(
+    cleanup_args_b = (
         args.token_dir,
         args.usage_threshold,
         args.request_interval,
         args.curl_timeout,
         args.token_check_workers,
     )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as cleanup_executor:
+        future_a = cleanup_executor.submit(cleanup_active_tokens, *cleanup_args_a)
+        future_b = cleanup_executor.submit(cleanup_pool_tokens, *cleanup_args_b)
+        kept_count, deleted_count, check_failed = future_a.result()
+        pool_kept_count, pool_deleted_count, pool_check_failed = future_b.result()
+
+    log_info(f"A 清理完成：保留 {kept_count}，删除 {deleted_count}，查询失败 {check_failed}")
     log_info(
         f"B 清理完成：保留 {pool_kept_count}，删除 {pool_deleted_count}，查询失败 {pool_check_failed}"
     )

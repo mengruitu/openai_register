@@ -1,3 +1,4 @@
+import concurrent.futures
 import email
 import json
 import logging
@@ -515,10 +516,23 @@ def run_cfmail_self_test(
     logger.info(
         f"[cfmail测试] 共需测试 {len(selected_accounts)} 个配置: {cfmail_account_names(selected_accounts)}"
     )
-    passed = 0
-    for account in selected_accounts:
-        if _test_single_cfmail_account(account, proxy):
-            passed += 1
+
+    # P4 优化：各配置之间互不依赖，使用线程并发测试以缩短总耗时
+    if len(selected_accounts) == 1:
+        passed = 1 if _test_single_cfmail_account(selected_accounts[0], proxy) else 0
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(selected_accounts), 4),
+        ) as executor:
+            futures = {
+                executor.submit(_test_single_cfmail_account, account, proxy): account
+                for account in selected_accounts
+            }
+            passed = sum(
+                1
+                for future in concurrent.futures.as_completed(futures)
+                if future.result()
+            )
 
     logger.info(
         f"\n[cfmail测试] 测试完成：成功 {passed} / {len(selected_accounts)}，失败 {len(selected_accounts) - passed}"

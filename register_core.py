@@ -65,7 +65,6 @@ from register_sentinel import random_impersonate, request_sentinel_header
 from register_token import (
     try_token_via_existing_session,
     try_token_via_password_login,
-    try_token_via_passwordless_login,
     try_token_via_session_api,
     try_token_via_workspace_select,
 )
@@ -793,26 +792,6 @@ def run(
             )
             if token_json:
                 token_source = "password_login"
-
-        # 如果密码登录也被 add_phone 拦截，尝试 passwordless OTP 登录
-        if not token_json:
-            logger.info(
-                f"[线程 {thread_id}] [信息] 密码登录未拿到 token，"
-                "尝试 passwordless OTP 登录绕过 add_phone"
-            )
-            _set_stage("token_passwordless_login")
-            token_json = try_token_via_passwordless_login(
-                email=email,
-                mailbox=mailbox,
-                used_codes={code},
-                proxies=proxies,
-                impersonate=current_impersonate,
-                thread_id=thread_id,
-                get_oai_code_fn=get_oai_code,
-                get_mailbox_message_snapshot_fn=get_mailbox_message_snapshot,
-            )
-            if token_json:
-                token_source = "passwordless_login"
 
         if not token_json:
             logger.warning(
