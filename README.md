@@ -40,11 +40,22 @@
 
 ## 运行环境
 
-- Python 3.9+
-- 依赖：
+- Python 3.10+
+- 依赖见 [requirements.txt](./requirements.txt)
+
+推荐先创建虚拟环境并安装依赖：
 
 ```bash
-pip install curl_cffi
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
+如果你直接用仓库自带脚本部署：
+
+```bash
+bash ctl.sh deps
 ```
 
 ## 快速开始

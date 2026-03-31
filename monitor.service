@@ -8,10 +8,10 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/data/openai_register
+# 请先执行 bash ctl.sh deps 或 bash ctl.sh install 创建 .venv
 # 如需代理、阈值、自定义配置文件，请修改 monitor_config.json
 # 可追加 --dingtalk-webhook <URL> 设置钉钉通知
-ExecStart=/data/openai_register/.venv/bin/python /data/openai_register/openai_register.py \
-    --config /data/openai_register/monitor_config.json
+ExecStart=/data/openai_register/.venv/bin/python /data/openai_register/openai_register.py --monitor --config /data/openai_register/monitor_config.json
 Restart=always
 RestartSec=10
 # 日志由 journald 管理，自动轮转，无需手动处理日志文件
@@ -20,6 +20,7 @@ StandardError=journal
 SyslogIdentifier=openai-register
 Environment=LANG=C
 Environment=LC_ALL=C
+Environment=PYTHONUNBUFFERED=1
 # 所有配置项（含钉钉 webhook）均通过 monitor_config.json 管理
 
 [Install]
