@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi import requests
+from register_mailbox_diagnostics import (
+    increment_mailbox_wait_poll,
+    mark_mailbox_wait_matched,
+    mark_mailbox_wait_timeout,
+    note_mailbox_messages_scanned,
+    reset_mailbox_wait_diagnostics,
+)
 
 logger = logging.getLogger("openai_register")
 
@@ -419,8 +426,10 @@ def poll_hydra_oai_code(
     ignored_codes = _normalize_code_values(skip_codes)
 
     _log_waiting_code_start(thread_id, email)
+    reset_mailbox_wait_diagnostics("mailtm", email)
 
     for _ in range(40):
+        increment_mailbox_wait_poll("mailtm", email)
         try:
             resp = requests.get(
                 url_list,
@@ -440,6 +449,7 @@ def poll_hydra_oai_code(
                 messages = data.get("hydra:member") or data.get("messages") or []
             else:
                 messages = []
+            note_mailbox_messages_scanned("mailtm", email, len(messages))
 
             for msg in messages:
                 if not isinstance(msg, dict):
@@ -475,6 +485,7 @@ def poll_hydra_oai_code(
                 if code:
                     if code in ignored_codes:
                         continue
+                    mark_mailbox_wait_matched("mailtm", email, code=code)
                     _log_waiting_code_success(thread_id, code)
                     return code
         except Exception:
@@ -482,6 +493,11 @@ def poll_hydra_oai_code(
 
         time.sleep(3)
 
+    mark_mailbox_wait_timeout(
+        "mailtm",
+        email,
+        reason="mailbox_timeout_no_message" if not seen_ids else "mailbox_timeout_no_match",
+    )
     _log_waiting_code_timeout(thread_id)
     return ""
 
@@ -498,8 +514,10 @@ def poll_tempmailio_oai_code(
     ignored_codes = _normalize_code_values(skip_codes)
 
     _log_waiting_code_start(thread_id, email)
+    reset_mailbox_wait_diagnostics("tempmailio", email)
 
     for _ in range(40):
+        increment_mailbox_wait_poll("tempmailio", email)
         try:
             resp = requests.get(
                 f"{TEMPMAILIO_API}/{email}/messages",
@@ -509,6 +527,7 @@ def poll_tempmailio_oai_code(
             )
             if resp.status_code == 200:
                 messages = resp.json()
+                note_mailbox_messages_scanned("tempmailio", email, len(messages or []))
                 for msg in messages:
                     msg_id = msg.get("id")
                     if not msg_id or msg_id in seen_ids:
@@ -526,12 +545,18 @@ def poll_tempmailio_oai_code(
                     if code:
                         if code in ignored_codes:
                             continue
+                        mark_mailbox_wait_matched("tempmailio", email, code=code)
                         _log_waiting_code_success(thread_id, code)
                         return code
         except Exception:
             pass
         time.sleep(3)
 
+    mark_mailbox_wait_timeout(
+        "tempmailio",
+        email,
+        reason="mailbox_timeout_no_message" if not seen_ids else "mailbox_timeout_no_match",
+    )
     _log_waiting_code_timeout(thread_id)
     return ""
 
@@ -549,8 +574,10 @@ def poll_tempmaillol_oai_code(
     ignored_codes = _normalize_code_values(skip_codes)
 
     _log_waiting_code_start(thread_id, email)
+    reset_mailbox_wait_diagnostics("tempmaillol", email)
 
     for _ in range(40):
+        increment_mailbox_wait_poll("tempmaillol", email)
         try:
             resp = requests.get(
                 f"{TEMPMAILLOL_BASE}/inbox",
@@ -567,12 +594,14 @@ def poll_tempmaillol_oai_code(
             data = resp.json()
             if data is None or (isinstance(data, dict) and not data):
                 logger.warning(f"[线程 {thread_id}] [警告] 邮箱已过期")
+                mark_mailbox_wait_timeout("tempmaillol", email, reason="mailbox_expired")
                 return ""
 
             email_list = data.get("emails", []) if isinstance(data, dict) else []
             if not isinstance(email_list, list):
                 time.sleep(3)
                 continue
+            note_mailbox_messages_scanned("tempmaillol", email, len(email_list))
 
             for msg in email_list:
                 if not isinstance(msg, dict):
@@ -595,6 +624,7 @@ def poll_tempmaillol_oai_code(
                 if code:
                     if code in ignored_codes:
                         continue
+                    mark_mailbox_wait_matched("tempmaillol", email, code=code)
                     _log_waiting_code_success(thread_id, code)
                     return code
         except Exception:
@@ -602,6 +632,11 @@ def poll_tempmaillol_oai_code(
 
         time.sleep(3)
 
+    mark_mailbox_wait_timeout(
+        "tempmaillol",
+        email,
+        reason="mailbox_timeout_no_message" if not seen_ids else "mailbox_timeout_no_match",
+    )
     _log_waiting_code_timeout(thread_id)
     return ""
 
@@ -626,8 +661,10 @@ def poll_dropmail_oai_code(
     """
 
     _log_waiting_code_start(thread_id, email)
+    reset_mailbox_wait_diagnostics("dropmail", email)
 
     for _ in range(40):
+        increment_mailbox_wait_poll("dropmail", email)
         try:
             resp = requests.post(
                 DROPMAIL_API,
@@ -639,6 +676,7 @@ def poll_dropmail_oai_code(
             if resp.status_code == 200:
                 data = resp.json().get("data", {}).get("session", {}) or {}
                 messages = data.get("mails", [])
+                note_mailbox_messages_scanned("dropmail", email, len(messages or []))
                 for msg in messages:
                     msg_id = msg.get("id")
                     if not msg_id or msg_id in seen_ids:
@@ -654,11 +692,17 @@ def poll_dropmail_oai_code(
                     if code:
                         if code in ignored_codes:
                             continue
+                        mark_mailbox_wait_matched("dropmail", email, code=code)
                         _log_waiting_code_success(thread_id, code)
                         return code
         except Exception:
             pass
         time.sleep(3)
 
+    mark_mailbox_wait_timeout(
+        "dropmail",
+        email,
+        reason="mailbox_timeout_no_message" if not seen_ids else "mailbox_timeout_no_match",
+    )
     _log_waiting_code_timeout(thread_id)
     return ""

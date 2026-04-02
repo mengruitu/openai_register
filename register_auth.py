@@ -20,9 +20,7 @@ import logging
 import re
 import secrets
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
@@ -116,9 +114,23 @@ def _pkce_verifier() -> str:
 
 def _parse_callback_url(callback_url: str) -> Dict[str, str]:
     """解析 OAuth 回调 URL 中的 code / state / error 等参数。"""
-    parsed = urllib.parse.urlparse(callback_url)
+    candidate = str(callback_url or "").strip()
+    if not candidate:
+        return {"code": "", "state": "", "error": "", "error_description": ""}
+    if "://" not in candidate:
+        if candidate.startswith("?"):
+            candidate = f"http://localhost{candidate}"
+        elif "=" in candidate:
+            candidate = f"http://localhost/?{candidate}"
+        else:
+            candidate = f"http://{candidate}"
+
+    parsed = urllib.parse.urlparse(candidate)
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     fragment = urllib.parse.parse_qs(parsed.fragment, keep_blank_values=True)
+    for key, values in fragment.items():
+        if key not in query or not query[key]:
+            query[key] = values
 
     def get1(k: str) -> str:
         vals = query.get(k) or fragment.get(k) or [""]
@@ -226,29 +238,28 @@ def _to_int(v: Any) -> int:
 
 def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
     """向指定 URL 提交表单（application/x-www-form-urlencoded）。"""
-    body = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(
+    response = requests.post(
         url,
-        data=body,
-        method="POST",
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         },
+        data=data,
+        timeout=timeout,
+        impersonate="chrome120",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            if resp.status != 200:
-                raise RuntimeError(
-                    f"token exchange failed: {resp.status}: {raw.decode('utf-8', 'replace')}"
-                )
-            return json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
+    if response.status_code != 200:
         raise RuntimeError(
-            f"token exchange failed: {exc.code}: {raw.decode('utf-8', 'replace')}"
-        ) from exc
+            f"token exchange failed: {response.status_code}: {response.text}"
+        )
+    return response.json()
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +684,17 @@ def follow_oauth_redirect_chain(
                 break
             current_url = next_url
     except Exception as exc:
+        callback_match = re.search(
+            r"(http://localhost:1455/auth/callback[^\"'\s<>]+)",
+            str(exc or ""),
+        )
+        if callback_match:
+            return submit_callback_url(
+                callback_url=callback_match.group(1).strip(),
+                code_verifier=oauth.code_verifier,
+                redirect_uri=oauth.redirect_uri,
+                expected_state=oauth.state,
+            )
         logger.warning(f"[线程 {thread_id}] [警告] 跟随 OAuth 跳转链失败: {exc}")
 
     return None

@@ -18,6 +18,7 @@ from curl_cffi import requests
 
 from register_auth import CLIENT_ID, TOKEN_URL, _post_form
 from register_notifications import build_monitor_summary_message, send_dingtalk_alert
+from register_session_refresh import TokenRefreshManager
 
 DEFAULT_TOKEN_CHECK_WORKERS = 2
 TOKEN_USAGE_CACHE_TTL_SECONDS = 600
@@ -248,7 +249,38 @@ def _refresh_access_token(
     timeout: int,
 ) -> Tuple[bool, Dict[str, Any], bool, str]:
     refresh_token = str(token_data.get("refresh_token") or "").strip()
+    session_token = str(token_data.get("session_token") or "").strip()
+    oauth_client_id = str(token_data.get("client_id") or CLIENT_ID).strip() or CLIENT_ID
+    registration_proxy_url = str(token_data.get("registration_proxy_url") or "").strip() or None
     if not refresh_token:
+        if session_token:
+            session_refresh = TokenRefreshManager(proxy_url=registration_proxy_url).refresh_by_session_token(session_token)
+            if session_refresh.success:
+                updated_data = dict(token_data)
+                updated_data["access_token"] = session_refresh.access_token
+                updated_data["session_token"] = session_refresh.session_token or session_token
+                if session_refresh.account_id:
+                    updated_data["account_id"] = session_refresh.account_id
+                if session_refresh.email:
+                    updated_data["email"] = session_refresh.email
+                updated_data["last_refresh"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                )
+                if session_refresh.expires_at is not None:
+                    updated_data["expired"] = session_refresh.expires_at.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                try:
+                    _persist_token_data(file_path, updated_data)
+                except Exception as exc:
+                    return False, token_data, False, f"session_token 刷新成功但写回文件失败: {exc}"
+                return True, updated_data, False, "access_token 已通过 session_token 刷新"
+            return (
+                False,
+                token_data,
+                True,
+                session_refresh.error_message or "缺少 refresh_token，且 session_token 刷新失败",
+            )
         return False, token_data, True, "缺少 refresh_token，无法刷新 access_token"
 
     try:
@@ -256,7 +288,7 @@ def _refresh_access_token(
             TOKEN_URL,
             data={
                 "grant_type": "refresh_token",
-                "client_id": CLIENT_ID,
+                "client_id": oauth_client_id,
                 "refresh_token": refresh_token,
             },
             headers={
@@ -273,7 +305,7 @@ def _refresh_access_token(
                 TOKEN_URL,
                 {
                     "grant_type": "refresh_token",
-                    "client_id": CLIENT_ID,
+                    "client_id": oauth_client_id,
                     "refresh_token": refresh_token,
                 },
                 timeout=timeout,
@@ -290,6 +322,24 @@ def _refresh_access_token(
                     "token exchange failed: 401",
                 )
             )
+            if is_auth_invalid and session_token:
+                session_refresh = TokenRefreshManager(proxy_url=registration_proxy_url).refresh_by_session_token(session_token)
+                if session_refresh.success:
+                    updated_data = dict(token_data)
+                    updated_data["access_token"] = session_refresh.access_token
+                    updated_data["session_token"] = session_refresh.session_token or session_token
+                    if session_refresh.account_id:
+                        updated_data["account_id"] = session_refresh.account_id
+                    if session_refresh.email:
+                        updated_data["email"] = session_refresh.email
+                    updated_data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    if session_refresh.expires_at is not None:
+                        updated_data["expired"] = session_refresh.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    try:
+                        _persist_token_data(file_path, updated_data)
+                    except Exception as write_exc:
+                        return False, token_data, False, f"session_token 回退刷新成功但写回失败: {write_exc}"
+                    return True, updated_data, False, "access_token 已通过 session_token 回退刷新"
             return False, token_data, is_auth_invalid, f"刷新 access_token 失败: {error_text}"
     else:
         if resp.status_code != 200:
@@ -305,6 +355,24 @@ def _refresh_access_token(
                     "unauthorized",
                 )
             )
+            if is_auth_invalid and session_token:
+                session_refresh = TokenRefreshManager(proxy_url=registration_proxy_url).refresh_by_session_token(session_token)
+                if session_refresh.success:
+                    updated_data = dict(token_data)
+                    updated_data["access_token"] = session_refresh.access_token
+                    updated_data["session_token"] = session_refresh.session_token or session_token
+                    if session_refresh.account_id:
+                        updated_data["account_id"] = session_refresh.account_id
+                    if session_refresh.email:
+                        updated_data["email"] = session_refresh.email
+                    updated_data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    if session_refresh.expires_at is not None:
+                        updated_data["expired"] = session_refresh.expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    try:
+                        _persist_token_data(file_path, updated_data)
+                    except Exception as write_exc:
+                        return False, token_data, False, f"session_token 回退刷新成功但写回失败: {write_exc}"
+                    return True, updated_data, False, "access_token 已通过 session_token 回退刷新"
             return (
                 False,
                 token_data,

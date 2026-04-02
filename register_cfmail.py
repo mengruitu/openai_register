@@ -16,6 +16,13 @@ from typing import Any, Dict, List, Optional, Set
 from curl_cffi import requests
 
 from register_mailboxes import TempMailbox
+from register_mailbox_diagnostics import (
+    increment_mailbox_wait_poll,
+    mark_mailbox_wait_matched,
+    mark_mailbox_wait_timeout,
+    note_mailbox_messages_scanned,
+    reset_mailbox_wait_diagnostics,
+)
 
 logger = logging.getLogger("openai_register")
 
@@ -732,8 +739,10 @@ def poll_cfmail_oai_code(
     ignored_codes: Set[str] = set(str(x).strip() for x in (skip_codes or set()) if str(x).strip())
 
     _log_waiting_code_start(thread_id, email)
+    reset_mailbox_wait_diagnostics("cfmail", email)
 
     for _ in range(40):
+        increment_mailbox_wait_poll("cfmail", email)
         try:
             resp = requests.get(
                 f"{api_base}/api/mails",
@@ -752,6 +761,7 @@ def poll_cfmail_oai_code(
             if not isinstance(messages, list):
                 time.sleep(3)
                 continue
+            note_mailbox_messages_scanned("cfmail", email, len(messages))
 
             for msg in messages:
                 if not isinstance(msg, dict):
@@ -786,6 +796,7 @@ def poll_cfmail_oai_code(
                 if code:
                     if code in ignored_codes:
                         continue
+                    mark_mailbox_wait_matched("cfmail", email, code=code)
                     _log_waiting_code_success(thread_id, code)
                     return code
         except Exception:
@@ -793,6 +804,11 @@ def poll_cfmail_oai_code(
 
         time.sleep(3)
 
+    mark_mailbox_wait_timeout(
+        "cfmail",
+        email,
+        reason="mailbox_timeout_no_message" if not seen_ids else "mailbox_timeout_no_match",
+    )
     _log_waiting_code_timeout(thread_id)
     return ""
 
