@@ -14,9 +14,11 @@ Sentinel / 指纹 / POW 求解 → register_app/sentinel.py
 Token 提取策略 → register_app/auth/token.py
 """
 import base64
+import html
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -52,6 +54,8 @@ PRIME_OAUTH_REQUEST_TIMEOUT_SECONDS = 20
 CHATGPT_SESSION_URL = "https://chatgpt.com/api/auth/session"
 SESSION_API_REQUEST_TIMEOUT_SECONDS = 15
 DEFAULT_SESSION_FALLBACK_EXPIRES_IN_SECONDS = 1800
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_DEBUG_DIR = os.path.join(_PROJECT_ROOT, "debug")
 
 
 # ---------------------------------------------------------------------------
@@ -348,15 +352,19 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                 timeout=WEB_SIGNUP_REQUEST_TIMEOUT_SECONDS,
             )
             if csrf_resp.status_code != 200:
-                preview = response_text_preview(csrf_resp, limit=500) or "(empty)"
+                diagnostics = _response_diagnostics(
+                    csrf_resp,
+                    thread_id=thread_id,
+                    label="web_signup_csrf",
+                )
                 setattr(
                     session,
                     "_last_web_signup_failure_detail",
-                    f"csrf status={csrf_resp.status_code} preview={preview}",
+                    f"csrf status={csrf_resp.status_code} {diagnostics}",
                 )
                 logger.error(
                     f"[线程 {thread_id}] [错误] 获取 web signup csrf 失败，状态码: {csrf_resp.status_code}，"
-                    f"响应摘要: {preview}"
+                    f"{diagnostics}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -364,14 +372,18 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
 
             csrf_token = str((csrf_resp.json() or {}).get("csrfToken") or "").strip()
             if not csrf_token:
-                preview = response_text_preview(csrf_resp, limit=500) or "(empty)"
+                diagnostics = _response_diagnostics(
+                    csrf_resp,
+                    thread_id=thread_id,
+                    label="web_signup_csrf_empty",
+                )
                 setattr(
                     session,
                     "_last_web_signup_failure_detail",
-                    f"csrf token missing preview={preview}",
+                    f"csrf token missing {diagnostics}",
                 )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] web signup csrfToken 为空，响应摘要: {preview}"
+                    f"[线程 {thread_id}] [错误] web signup csrfToken 为空，{diagnostics}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -404,15 +416,19 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                 timeout=WEB_SIGNUP_REQUEST_TIMEOUT_SECONDS,
             )
             if signin_resp.status_code != 200:
-                preview = response_text_preview(signin_resp, limit=500) or "(empty)"
+                diagnostics = _response_diagnostics(
+                    signin_resp,
+                    thread_id=thread_id,
+                    label="web_signup_signin_openai",
+                )
                 setattr(
                     session,
                     "_last_web_signup_failure_detail",
-                    f"signin/openai status={signin_resp.status_code} preview={preview}",
+                    f"signin/openai status={signin_resp.status_code} {diagnostics}",
                 )
                 logger.error(
                     f"[线程 {thread_id}] [错误] web signup signin/openai 失败，状态码: {signin_resp.status_code}，"
-                    f"响应摘要: {preview}"
+                    f"{diagnostics}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -420,14 +436,18 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
 
             start_url = str((signin_resp.json() or {}).get("url") or "").strip()
             if not start_url:
-                preview = response_text_preview(signin_resp, limit=500) or "(empty)"
+                diagnostics = _response_diagnostics(
+                    signin_resp,
+                    thread_id=thread_id,
+                    label="web_signup_signin_openai_missing_url",
+                )
                 setattr(
                     session,
                     "_last_web_signup_failure_detail",
-                    f"signin/openai missing url preview={preview}",
+                    f"signin/openai missing url {diagnostics}",
                 )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] web signup 未返回授权地址，响应摘要: {preview}"
+                    f"[线程 {thread_id}] [错误] web signup 未返回授权地址，{diagnostics}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -571,6 +591,85 @@ def response_text_preview(resp: Any, limit: int = 240) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
+
+
+def _response_header_value(resp: Any, key: str) -> str:
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return ""
+    try:
+        value = headers.get(key)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    try:
+        for header_key, header_value in headers.items():
+            if str(header_key).strip().lower() == key.lower():
+                return str(header_value).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _html_title_from_response(resp: Any) -> str:
+    text = str(getattr(resp, "text", "") or "")
+    if not text:
+        return ""
+    matched = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.I | re.S)
+    if not matched:
+        return ""
+    title = re.sub(r"\s+", " ", matched.group(1)).strip()
+    return html.unescape(title)
+
+
+def _dump_response_html(resp: Any, *, thread_id: int, label: str) -> str:
+    text = str(getattr(resp, "text", "") or "")
+    if not text:
+        return ""
+    content_type = _response_header_value(resp, "content-type").lower()
+    looks_html = "text/html" in content_type or "<html" in text.lower()
+    if not looks_html:
+        return ""
+    try:
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+        safe_label = re.sub(r"[^0-9a-zA-Z._-]+", "_", str(label or "response")).strip("._") or "response"
+        filename = f"{safe_label}.t{int(thread_id)}.{int(time.time() * 1000)}.html"
+        path = os.path.join(_DEBUG_DIR, filename)
+        with open(path, "w", encoding="utf-8") as file_obj:
+            file_obj.write(text[:2_000_000])
+        return path
+    except Exception:
+        return ""
+
+
+def _response_diagnostics(resp: Any, *, thread_id: int, label: str) -> str:
+    preview = response_text_preview(resp, limit=220) or "(empty)"
+    final_url = str(getattr(resp, "url", "") or "").strip()
+    content_type = _response_header_value(resp, "content-type")
+    server = _response_header_value(resp, "server")
+    cf_ray = _response_header_value(resp, "cf-ray")
+    x_vercel_id = _response_header_value(resp, "x-vercel-id")
+    location = _response_header_value(resp, "location")
+    title = _html_title_from_response(resp)
+    dump_path = _dump_response_html(resp, thread_id=thread_id, label=label)
+    parts = [f"final_url={final_url or '(unknown)'}"]
+    if content_type:
+        parts.append(f"content_type={content_type}")
+    if server:
+        parts.append(f"server={server}")
+    if cf_ray:
+        parts.append(f"cf_ray={cf_ray}")
+    if x_vercel_id:
+        parts.append(f"x_vercel_id={x_vercel_id}")
+    if location:
+        parts.append(f"location={location}")
+    if title:
+        parts.append(f"title={title}")
+    if dump_path:
+        parts.append(f"html_dump={dump_path}")
+    parts.append(f"preview={preview}")
+    return "，".join(parts)
 
 
 def _parse_json_object(raw_text: str) -> Dict[str, Any]:
