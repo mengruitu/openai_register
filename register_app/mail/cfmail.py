@@ -2,7 +2,6 @@ import concurrent.futures
 import email
 import json
 import logging
-import math
 import os
 import re
 import secrets
@@ -241,16 +240,8 @@ def prune_cfmail_failure_state(accounts: Optional[List[CfmailAccount]] = None) -
 
 
 def _cfmail_skip_remaining_seconds(account_name: str) -> int:
-    key = str(account_name or "").strip().lower()
-    if not key:
-        return 0
-
-    with _cfmail_failure_lock:
-        state = CFMAIL_FAILURE_STATE.get(key) or {}
-        cooldown_until = float(state.get("cooldown_until") or 0)
-
-    remaining = int(math.ceil(cooldown_until - time.time()))
-    return max(0, remaining)
+    _ = account_name
+    return 0
 
 
 def record_cfmail_success(account_name: str) -> None:
@@ -272,32 +263,13 @@ def record_cfmail_failure(account_name: str, reason: str = "") -> None:
     if not key:
         return
 
-    now = time.time()
-    cooldown_seconds = max(0, int(CFMAIL_COOLDOWN_SECONDS))
-    fail_threshold = max(1, int(CFMAIL_FAIL_THRESHOLD))
-
     with _cfmail_failure_lock:
         state = CFMAIL_FAILURE_STATE.setdefault(key, {"name": account_name})
         state["name"] = account_name
         state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
         state["last_error"] = str(reason or "").strip()[:300]
-        state["last_failed_at"] = now
-
-        if state["consecutive_failures"] >= fail_threshold:
-            state["cooldown_until"] = max(
-                float(state.get("cooldown_until") or 0),
-                now + cooldown_seconds,
-            )
-            state["consecutive_failures"] = 0
-            cooldown_until = state["cooldown_until"]
-        else:
-            cooldown_until = float(state.get("cooldown_until") or 0)
-
-    if cooldown_until > now:
-        remaining = int(math.ceil(cooldown_until - now))
-        logger.warning(
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置 {account_name} 连续失败达到阈值，已自动跳过 {remaining} 秒"
-        )
+        state["last_failed_at"] = time.time()
+        state["cooldown_until"] = 0
 
 
 def set_cfmail_accounts(accounts: List[CfmailAccount]) -> None:
@@ -348,35 +320,14 @@ def select_cfmail_account(profile_name: str = "auto") -> Optional[CfmailAccount]
         selected_key = selected_name.lower()
         for account in accounts:
             if account.name.lower() == selected_key:
-                remaining = _cfmail_skip_remaining_seconds(account.name)
-                if remaining > 0:
-                    logger.warning(
-                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] cfmail 配置 {account.name} 当前仍在冷却中，剩余 {remaining} 秒；因你已手动指定，仍继续尝试"
-                    )
                 return account
         return None
 
     with _cfmail_account_lock:
-        start_index = _cfmail_account_index % len(accounts)
-        skipped_accounts = []
-
-        for offset in range(len(accounts)):
-            index = (start_index + offset) % len(accounts)
-            account = accounts[index]
-            remaining = _cfmail_skip_remaining_seconds(account.name)
-            if remaining > 0:
-                skipped_accounts.append((account.name, remaining))
-                continue
-
-            _cfmail_account_index = (index + 1) % len(accounts)
-            return account
-
-    if skipped_accounts:
-        skip_desc = ", ".join(f"{name}({remaining}s)" for name, remaining in skipped_accounts)
-        logger.warning(
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [警告] 所有 cfmail 配置当前都在冷却中，暂不分配邮箱：{skip_desc}"
-        )
-    return None
+        index = _cfmail_account_index % len(accounts)
+        account = accounts[index]
+        _cfmail_account_index = (index + 1) % len(accounts)
+        return account
 
 
 def reload_cfmail_accounts_if_needed(force: bool = False) -> bool:

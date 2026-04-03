@@ -42,7 +42,6 @@ from register_app.mail.cfmail import (
 )
 from register_app.config import (
     DEFAULT_ACTIVE_TOKEN_DIR,
-    DEFAULT_CFMAIL_FALLBACK_PROVIDER,
     DEFAULT_CHECK_INTERVAL_SECONDS,
     DEFAULT_CONFIG_PATH,
     DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
@@ -240,7 +239,7 @@ def main() -> None:
         "--dingtalk-fallback-interval",
         type=int,
         default=DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
-        help="回退到保底邮箱服务时的钉钉提醒最小间隔秒数，默认 900 秒",
+        help="兼容参数，当前未使用",
     )
     parser.add_argument(
         "--auto-continue-non-us",
@@ -271,13 +270,13 @@ def main() -> None:
         "--cfmail-fail-threshold",
         type=int,
         default=DEFAULT_CFMAIL_FAIL_THRESHOLD,
-        help="cfmail 连续失败达到该阈值后进入冷却",
+        help="兼容参数，当前未使用",
     )
     parser.add_argument(
         "--cfmail-cooldown-seconds",
         type=int,
         default=DEFAULT_CFMAIL_COOLDOWN_SECONDS,
-        help="cfmail 自动冷却时长（秒）",
+        help="兼容参数，当前未使用",
     )
     args = parser.parse_args()
 
@@ -442,8 +441,7 @@ def main() -> None:
         if args.mail_provider == "cfmail":
             cfmail_desc = (
                 f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，"
-                f"选择={args.cfmail_profile}，回退={DEFAULT_CFMAIL_FALLBACK_PROVIDER}，"
-                f"回退钉钉间隔={args.dingtalk_fallback_interval}秒"
+                f"选择={args.cfmail_profile}"
             )
         log_info(
             f"巡检模式启动：A目录={args.active_token_dir}，B目录={args.token_dir}，A阈值={args.active_min_count}，B阈值={args.pool_min_count}，巡检间隔={args.monitor_interval}秒，额度查询并发={args.token_check_workers}，注册并发={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
@@ -464,8 +462,7 @@ def main() -> None:
     if args.mail_provider == "cfmail":
         startup_message += (
             f"，cfmail配置文件={args.cfmail_config}，cfmail配置={_cfmail_account_names()}，"
-            f"选择={args.cfmail_profile}，回退={DEFAULT_CFMAIL_FALLBACK_PROVIDER}，"
-            f"回退钉钉间隔={args.dingtalk_fallback_interval}秒"
+            f"选择={args.cfmail_profile}"
         )
     logger.info(startup_message)
 

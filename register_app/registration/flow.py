@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""核心注册流程与带回退的注册入口。"""
+"""核心注册流程与单 provider 注册入口。"""
 from __future__ import annotations
 
 import builtins
@@ -24,12 +24,8 @@ from ..mail.cfmail import (
     reload_cfmail_accounts_if_needed as _reload_cfmail_accounts_if_needed,
 )
 from ..mail.dedupe import get_mailbox_dedupe_store
-from ..config import (
-    DEFAULT_CFMAIL_FALLBACK_PROVIDER,
-    DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
-)
+from ..config import DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS
 from ..mail.providers import TempMailbox
-from ..notifications import notify_fallback_provider_usage
 from ..sentinel import random_impersonate, request_sentinel_header
 from ..auth.token import (
     try_token_via_continue_url,
@@ -623,18 +619,16 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# 带回退的注册封装
+# 单 provider 注册封装（保留兼容函数名）
 # ---------------------------------------------------------------------------
 
 
 def _provider_fallback_chain(provider_key: str) -> List[str]:
-    """构建邮箱服务提供商的回退链。"""
+    """构建邮箱服务提供商链。当前仅返回主 provider。"""
     primary = str(provider_key or "").strip().lower()
     chain: List[str] = []
     if primary:
         chain.append(primary)
-    if primary == "cfmail" and DEFAULT_CFMAIL_FALLBACK_PROVIDER not in chain:
-        chain.append(DEFAULT_CFMAIL_FALLBACK_PROVIDER)
     return chain
 
 
@@ -647,35 +641,16 @@ def run_with_fallback(
     dingtalk_webhook: str = "",
     dingtalk_fallback_interval_seconds: int = DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
 ) -> Tuple[Optional[Tuple[str, str]], str]:
-    """带邮箱服务回退的注册入口。"""
+    """兼容旧接口名；当前不再执行任何保底邮箱回退。"""
+    _ = dingtalk_webhook, dingtalk_fallback_interval_seconds
     provider_chain = _provider_fallback_chain(provider_key)
     last_used_provider = str(provider_key or "").strip().lower()
 
     for index, candidate_provider in enumerate(provider_chain):
         last_used_provider = candidate_provider
-        if index > 0:
-            logger.info(
-                f"[线程 {thread_id}] [信息] 主邮箱服务 {provider_chain[0]} 不可用，"
-                f"开始回退到 {candidate_provider}"
-            )
 
         attempt = run(proxy, candidate_provider, thread_id, mailtm_base)
         if attempt.success:
-            if index > 0:
-                logger.info(
-                    f"[线程 {thread_id}] [信息] 已通过回退邮箱服务 {candidate_provider} 完成注册"
-                )
-                alert_sent = notify_fallback_provider_usage(
-                    dingtalk_webhook,
-                    primary_provider=provider_chain[0],
-                    fallback_provider=candidate_provider,
-                    thread_id=thread_id,
-                    throttle_seconds=dingtalk_fallback_interval_seconds,
-                )
-                if dingtalk_webhook and alert_sent:
-                    logger.info(
-                        f"[线程 {thread_id}] [信息] 已发送回退邮箱服务钉钉提醒：{provider_chain[0]} -> {candidate_provider}"
-                    )
             return attempt.as_legacy_result(), candidate_provider
 
         logger.warning(

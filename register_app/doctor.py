@@ -11,7 +11,7 @@ from typing import Any
 
 from curl_cffi import requests
 
-from .config import DEFAULT_CFMAIL_FALLBACK_PROVIDER, load_config_file
+from .config import load_config_file
 from .mail.cfmail import cfmail_account_names, get_cfmail_accounts, select_cfmail_account
 from .runtime import count_json_files
 
@@ -150,7 +150,7 @@ def _check_cfmail(args: Any) -> DoctorCheck:
         "cfmail",
         "ok",
         f"cfmail 已配置：{active.name} -> {active.email_domain}",
-        detail=f"配置数={len(accounts)} fallback={DEFAULT_CFMAIL_FALLBACK_PROVIDER}",
+        detail=f"配置数={len(accounts)}",
     )
 
 
@@ -216,7 +216,6 @@ def build_status_snapshot(args: Any) -> dict[str, Any]:
                 }
                 for item in accounts
             ],
-            "fallback_provider": DEFAULT_CFMAIL_FALLBACK_PROVIDER,
         }
 
     return snapshot
