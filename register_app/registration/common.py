@@ -24,6 +24,8 @@ from ..sentinel import request_sentinel_header
 
 logger = logging.getLogger("openai_register")
 
+
+@dataclass
 class RegistrationAttemptResult:
     """单次注册尝试的结果。"""
 
