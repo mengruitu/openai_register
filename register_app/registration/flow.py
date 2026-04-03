@@ -273,8 +273,7 @@ def run(
         if signup_resp.status_code in (403, 429):
             signup_error_preview = _preview_response_text(signup_resp)
             logger.warning(
-                f"[线程 {thread_id}] [警告] 注册表单失败：status={signup_resp.status_code}，"
-                f"detail={signup_error_preview or '(empty)'}"
+                f"[线程 {thread_id}] [警告] 注册表单失败：status={signup_resp.status_code}"
             )
             return _fail(
                 "authorize_continue",
@@ -306,7 +305,7 @@ def run(
             signup_detail = signup_error_message or _preview_response_text(signup_resp)
             logger.warning(
                 f"[线程 {thread_id}] [警告] 注册表单失败：status={signup_resp.status_code}，"
-                f"code={signup_error_code or 'unknown'}，detail={signup_detail or '(empty)'}"
+                f"code={signup_error_code or 'unknown'}"
             )
             return _fail(
                 "authorize_continue",
@@ -358,7 +357,7 @@ def run(
                 register_detail = register_error_message or _resp_detail(register_resp, limit=800)
                 logger.warning(
                     f"[线程 {thread_id}] [警告] 密码注册失败：status={register_resp.status_code}，"
-                    f"code={register_error_code or 'unknown'}，detail={register_detail}"
+                    f"code={register_error_code or 'unknown'}"
                 )
                 return _fail(
                     "password_register",
@@ -384,7 +383,7 @@ def run(
                 otp_detail = otp_error_message or _resp_detail(otp_resp, limit=800)
                 logger.warning(
                     f"[线程 {thread_id}] [警告] 注册阶段验证码发送失败：status={otp_resp.status_code}，"
-                    f"code={otp_error_code or 'unknown'}，detail={otp_detail}"
+                    f"code={otp_error_code or 'unknown'}"
                 )
                 return _fail(
                     "email_otp_send",
@@ -464,7 +463,7 @@ def run(
                 err_msg = err_message or _preview_response_text(create_account_resp, limit=1200)
                 logger.warning(
                     f"[线程 {thread_id}] [警告] 创建账户失败：status={create_account_status}，"
-                    f"code={err_code or 'unknown'}，detail={err_msg or '(empty)'}"
+                    f"code={err_code or 'unknown'}"
                 )
                 if str(err_code or "").strip().lower() == "user_already_exists":
                     mailbox_dedupe_store.mark(email, reason="user_already_exists")
@@ -658,7 +657,6 @@ def run_with_fallback(
             f"stage={attempt.stage or 'unknown'}"
             f", error_code={attempt.error_code or 'unknown'}"
             f", message={attempt.error_message or 'unknown'}"
-            f", detail={str((attempt.metadata or {}).get('failure_detail') or '').strip() or 'n/a'}"
         )
 
     return None, last_used_provider

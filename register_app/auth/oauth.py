@@ -363,8 +363,7 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                     f"csrf status={csrf_resp.status_code} {diagnostics}",
                 )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] 获取 web signup csrf 失败，状态码: {csrf_resp.status_code}，"
-                    f"{diagnostics}"
+                    f"[线程 {thread_id}] [错误] 获取 web signup csrf 失败，状态码: {csrf_resp.status_code}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -383,7 +382,7 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                     f"csrf token missing {diagnostics}",
                 )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] web signup csrfToken 为空，{diagnostics}"
+                    f"[线程 {thread_id}] [错误] web signup csrfToken 为空"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -427,8 +426,7 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                     f"signin/openai status={signin_resp.status_code} {diagnostics}",
                 )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] web signup signin/openai 失败，状态码: {signin_resp.status_code}，"
-                    f"{diagnostics}"
+                    f"[线程 {thread_id}] [错误] web signup signin/openai 失败，状态码: {signin_resp.status_code}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -447,7 +445,7 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                     f"signin/openai missing url {diagnostics}",
                 )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] web signup 未返回授权地址，{diagnostics}"
+                    f"[线程 {thread_id}] [错误] web signup 未返回授权地址"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
