@@ -10,8 +10,8 @@
 - Email OTP 校验请求
 - JWT/Cookie 解析工具
 
-Sentinel / 指纹 / POW 求解 → register_sentinel.py
-Token 提取策略 → register_token.py
+Sentinel / 指纹 / POW 求解 → register_app/sentinel.py
+Token 提取策略 → register_app/auth/token.py
 """
 import base64
 import hashlib
@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi import requests
 
-from register_mailboxes import TempMailbox
+from ..mail.providers import TempMailbox
 
 logger = logging.getLogger("openai_register")
 
@@ -236,7 +236,12 @@ def _to_int(v: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
+def _post_form(
+    url: str,
+    data: Dict[str, str],
+    timeout: int = 30,
+    proxies: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """向指定 URL 提交表单（application/x-www-form-urlencoded）。"""
     response = requests.post(
         url,
@@ -252,6 +257,7 @@ def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, A
             "sec-ch-ua-platform": '"Windows"',
         },
         data=data,
+        proxies=proxies,
         timeout=timeout,
         impersonate="chrome120",
     )

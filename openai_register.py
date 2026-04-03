@@ -4,20 +4,27 @@
 支持多种临时邮箱服务，自动完成注册流程并维护双目录 Token 池。
 
 本文件仅作为 CLI 入口：
-- 核心注册流程 → register_core.py
-- OAuth 授权逻辑 → register_auth.py
-- Sentinel/指纹 → register_sentinel.py
-- Token 提取策略 → register_token.py
-- 常量/配置管理 → register_config.py
+- 核心注册流程 → register_app/registration/
+- OAuth / Token 链路 → register_app/auth/
+- Sentinel/指纹 → register_app/sentinel.py
+- 邮箱 / cfmail → register_app/mail/
+- 常量/配置管理 → register_app/config.py
 """
 import argparse
 import builtins
+import json
 import logging
 import sys
 import threading
 import time
 
-from register_cfmail import (
+from register_app.doctor import (
+    build_status_snapshot,
+    collect_doctor_report,
+    print_doctor_report,
+    print_status_snapshot,
+)
+from register_app.mail.cfmail import (
     CfmailAccount,
     DEFAULT_CFMAIL_ACCOUNTS,
     DEFAULT_CFMAIL_CONFIG_PATH,
@@ -33,7 +40,7 @@ from register_cfmail import (
     run_cfmail_self_test,
     select_cfmail_account as _select_cfmail_account,
 )
-from register_config import (
+from register_app.config import (
     DEFAULT_ACTIVE_TOKEN_DIR,
     DEFAULT_CFMAIL_FALLBACK_PROVIDER,
     DEFAULT_CHECK_INTERVAL_SECONDS,
@@ -54,9 +61,9 @@ from register_config import (
     apply_low_memory_tuning,
     load_config_file,
 )
-from register_core import run_with_fallback
-from register_mailboxes import MAILTM_BASE
-from register_runtime import (
+from register_app.registration import run_with_fallback
+from register_app.mail.providers import MAILTM_BASE
+from register_app.runtime import (
     DEFAULT_TOKEN_CHECK_WORKERS,
     log_info,
     run_monitor_loop,
@@ -246,6 +253,21 @@ def main() -> None:
         help="仅测试 cfmail 配置是否可创建邮箱并可轮询，不执行注册",
     )
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="执行轻量环境检查并输出结果",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="输出当前池子与运行配置状态，不执行注册/巡检",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="doctor/status 以 JSON 输出",
+    )
+    parser.add_argument(
         "--cfmail-fail-threshold",
         type=int,
         default=DEFAULT_CFMAIL_FAIL_THRESHOLD,
@@ -338,12 +360,20 @@ def main() -> None:
         cooldown_seconds=args.cfmail_cooldown_seconds,
     )
 
-    if args.mail_provider == "cfmail" and not get_cfmail_accounts():
+    inspection_mode = bool(args.doctor or args.status)
+
+    if (
+        not inspection_mode
+        and args.mail_provider == "cfmail"
+        and not get_cfmail_accounts()
+    ):
         parser.error(
             "未配置可用的 cfmail 邮箱，请先在 cfmail 配置文件中添加，或通过 --cfmail-worker-domain 等参数临时指定"
         )
 
     if (
+        not inspection_mode
+        and
         args.mail_provider == "cfmail"
         and args.cfmail_profile.lower() != "auto"
         and not _select_cfmail_account(args.cfmail_profile)
@@ -351,6 +381,41 @@ def main() -> None:
         parser.error(
             f"--cfmail-profile 指定的配置不存在：{args.cfmail_profile}；当前可用配置: {_cfmail_account_names()}"
         )
+
+    if inspection_mode:
+        doctor_report = collect_doctor_report(args) if args.doctor else None
+        status_snapshot = build_status_snapshot(args) if args.status else None
+
+        if args.json and doctor_report and status_snapshot:
+            payload = {
+                "doctor": {
+                    "checked_at": doctor_report.checked_at,
+                    "error_count": doctor_report.error_count,
+                    "warn_count": doctor_report.warn_count,
+                    "checks": [
+                        {
+                            "name": item.name,
+                            "status": item.status,
+                            "summary": item.summary,
+                            "detail": item.detail,
+                        }
+                        for item in doctor_report.checks
+                    ],
+                },
+                "status": status_snapshot,
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            if doctor_report:
+                print_doctor_report(doctor_report, output_json=args.json)
+            if doctor_report and status_snapshot and not args.json:
+                print("")
+            if status_snapshot:
+                print_status_snapshot(status_snapshot, output_json=args.json)
+
+        if doctor_report:
+            sys.exit(1 if doctor_report.error_count > 0 else 0)
+        return
 
     if args.test_cfmail:
         ok = run_cfmail_self_test(

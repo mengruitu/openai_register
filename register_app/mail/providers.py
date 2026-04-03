@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi import requests
-from register_mailbox_diagnostics import (
+from .diagnostics import (
     increment_mailbox_wait_poll,
     mark_mailbox_wait_matched,
     mark_mailbox_wait_timeout,

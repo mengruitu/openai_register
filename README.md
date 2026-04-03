@@ -23,16 +23,29 @@
 
 - `openai_register.py`
   主入口脚本
-- `register_runtime.py`
-  巡检、额度查询、补号调度
-- `register_auth.py`
-  OAuth / token 提取与登录链路
-- `register_cfmail.py`
-  自建 `cfmail` 相关逻辑
-- `register_mailboxes.py`
-  第三方临时邮箱逻辑
-- `register_notifications.py`
-  钉钉通知
+- `register_app/`
+  业务代码主目录，按职责拆分
+  - `auth/`
+    - `oauth.py`：OAuth / signup / callback
+    - `token.py`：token 提取策略
+    - `session_refresh.py`：session / refresh_token 刷新
+  - `mail/`
+    - `providers.py`：第三方临时邮箱
+    - `cfmail.py`：自建 cfmail
+    - `dedupe.py`：邮箱去重
+    - `diagnostics.py`：OTP 等待诊断
+  - `registration/`
+    - `common.py`：注册共享辅助逻辑
+    - `mailbox.py`：邮箱路由与收码
+    - `flow.py`：注册主流程与回退
+  - `runtime/`
+    - `common.py`：runtime 共享类型、日志、持久化
+    - `tokens.py`：额度检查、刷新、A/B 清理
+    - `tasks.py`：巡检循环、补号调度
+  - `config.py`：配置与默认值
+  - `doctor.py`：轻量环境检查与状态输出
+  - `notifications.py`：钉钉通知
+  - `sentinel.py`：指纹 / sentinel
 - `monitor_config.example.json`
   巡检配置示例
 - `cfmail_accounts.example.json`
@@ -101,13 +114,25 @@ python openai_register.py
 python openai_register.py --monitor
 ```
 
-### 4. 只跑注册
+### 4. 查看状态
+
+```bash
+python openai_register.py --status
+```
+
+### 5. 做环境检查
+
+```bash
+python openai_register.py --doctor
+```
+
+### 6. 只跑注册
 
 ```bash
 python openai_register.py --register-only
 ```
 
-### 5. 测试 cfmail
+### 7. 测试 cfmail
 
 ```bash
 python openai_register.py --test-cfmail
@@ -119,6 +144,18 @@ python openai_register.py --test-cfmail
 
 ```bash
 python openai_register.py
+```
+
+### 查看状态（JSON）
+
+```bash
+python openai_register.py --status --json
+```
+
+### 环境检查 + 状态
+
+```bash
+python openai_register.py --doctor --status
 ```
 
 ### 持续巡检补号
@@ -159,6 +196,11 @@ python openai_register.py --monitor --cfmail-profile node1
   - TLS/网络抖动
   - 接口短暂异常
   - 返回结构异常
+
+巡检链路的网络出口现在与注册链路保持一致：
+
+- 优先使用命令行 / 配置中的 `proxy`
+- 未显式提供时，回退使用 token 文件里的 `registration_proxy_url`
 
 这意味着：
 

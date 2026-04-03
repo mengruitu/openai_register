@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from curl_cffi import requests
 
-from register_auth import (
+from .oauth import (
     AUTH_URL,
     CHATGPT_SESSION_URL,
     DEFAULT_SESSION_FALLBACK_EXPIRES_IN_SECONDS,
@@ -40,9 +40,9 @@ from register_auth import (
     response_text_preview,
     submit_callback_url,
 )
-from register_mailboxes import TempMailbox
-from register_sentinel import request_sentinel_header
-from register_session_refresh import TokenRefreshManager
+from ..mail.providers import TempMailbox
+from ..sentinel import request_sentinel_header
+from .session_refresh import TokenRefreshManager
 
 logger = logging.getLogger("openai_register")
 

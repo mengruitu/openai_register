@@ -15,8 +15,8 @@ from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi import requests
 
-from register_mailboxes import TempMailbox
-from register_mailbox_diagnostics import (
+from .providers import TempMailbox
+from .diagnostics import (
     increment_mailbox_wait_poll,
     mark_mailbox_wait_matched,
     mark_mailbox_wait_timeout,
@@ -26,7 +26,7 @@ from register_mailbox_diagnostics import (
 
 logger = logging.getLogger("openai_register")
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DEFAULT_CFMAIL_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "cfmail_accounts.json")
 DEFAULT_CFMAIL_ACCOUNTS: List[Dict[str, Any]] = []
