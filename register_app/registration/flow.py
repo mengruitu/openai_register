@@ -106,6 +106,9 @@ def run(
             )
         return result
 
+    def _resp_detail(resp: Any, limit: int = 500) -> str:
+        return _preview_response_text(resp, limit=limit) or "(empty)"
+
     if provider_key == "cfmail":
         _reload_cfmail_accounts_if_needed()
 
@@ -258,7 +261,13 @@ def run(
 
         signup_start_url, did, sentinel = _bootstrap_signup_context()
         if not signup_start_url:
-            return _fail("signup_start", "signup_start_url_missing", "未获取到 web signup 授权入口")
+            signup_debug = str(getattr(s, "_last_web_signup_failure_detail", "") or "").strip()
+            return _fail(
+                "signup_start",
+                "signup_start_url_missing",
+                "未获取到 web signup 授权入口",
+                failure_detail=signup_debug,
+            )
         if not did:
             return _fail("oauth_prime", "device_id_missing", "OAuth 初始化后未获取到 device id")
         if not sentinel:
@@ -267,18 +276,29 @@ def run(
         signup_resp = _submit_signup(sentinel)
         if signup_resp.status_code in (403, 429):
             signup_error_preview = _preview_response_text(signup_resp)
+            logger.warning(
+                f"[线程 {thread_id}] [警告] 注册表单失败：status={signup_resp.status_code}，"
+                f"detail={signup_error_preview or '(empty)'}"
+            )
             return _fail(
                 "authorize_continue",
                 f"authorize_continue_{signup_resp.status_code}",
                 signup_error_preview,
                 status_code=signup_resp.status_code,
+                failure_detail=signup_error_preview,
             )
         if signup_resp.status_code != 200 and _is_invalid_auth_step(signup_resp):
             logger.info(f"[线程 {thread_id}] [信息] signup 遇到 invalid_auth_step，重建认证上下文后重试一次")
             s = requests.Session(proxies=proxies, impersonate=current_impersonate)
             signup_start_url, did, sentinel = _bootstrap_signup_context(reset_reason="invalid_auth_step")
             if not signup_start_url:
-                return _fail("signup_start", "signup_start_url_missing", "重试时未获取到 web signup 授权入口")
+                signup_debug = str(getattr(s, "_last_web_signup_failure_detail", "") or "").strip()
+                return _fail(
+                    "signup_start",
+                    "signup_start_url_missing",
+                    "重试时未获取到 web signup 授权入口",
+                    failure_detail=signup_debug,
+                )
             if not did:
                 return _fail("oauth_prime", "device_id_missing", "重试时未获取到 device id")
             if not sentinel:
@@ -287,13 +307,19 @@ def run(
 
         if signup_resp.status_code != 200:
             signup_error_code, signup_error_message = _extract_response_error_code_message(signup_resp)
+            signup_detail = signup_error_message or _preview_response_text(signup_resp)
+            logger.warning(
+                f"[线程 {thread_id}] [警告] 注册表单失败：status={signup_resp.status_code}，"
+                f"code={signup_error_code or 'unknown'}，detail={signup_detail or '(empty)'}"
+            )
             return _fail(
                 "authorize_continue",
                 signup_error_code or f"authorize_continue_{signup_resp.status_code}",
-                signup_error_message or _preview_response_text(signup_resp),
+                signup_detail,
                 status_code=signup_resp.status_code,
                 signup_error_code=signup_error_code,
                 signup_error_message=signup_error_message,
+                failure_detail=signup_detail,
             )
 
         signup_payload = _response_json_object(signup_resp)
@@ -333,11 +359,19 @@ def run(
             logger.info(f"[线程 {thread_id}] [信息] 密码注册请求已提交，状态码: {register_resp.status_code}")
             if register_resp.status_code != 200:
                 register_error_code, register_error_message = _extract_response_error_code_message(register_resp)
+                register_detail = register_error_message or _resp_detail(register_resp, limit=800)
+                logger.warning(
+                    f"[线程 {thread_id}] [警告] 密码注册失败：status={register_resp.status_code}，"
+                    f"code={register_error_code or 'unknown'}，detail={register_detail}"
+                )
                 return _fail(
                     "password_register",
                     register_error_code or f"user_register_{register_resp.status_code}",
-                    register_error_message or _preview_response_text(register_resp),
+                    register_detail,
                     status_code=register_resp.status_code,
+                    register_error_code=register_error_code,
+                    register_error_message=register_error_message,
+                    failure_detail=register_detail,
                 )
 
             _set_stage("email_otp_send")
@@ -351,11 +385,19 @@ def run(
             logger.info(f"[线程 {thread_id}] [信息] 注册阶段验证码发送请求已提交，状态码: {otp_resp.status_code}")
             if otp_resp.status_code != 200:
                 otp_error_code, otp_error_message = _extract_response_error_code_message(otp_resp)
+                otp_detail = otp_error_message or _resp_detail(otp_resp, limit=800)
+                logger.warning(
+                    f"[线程 {thread_id}] [警告] 注册阶段验证码发送失败：status={otp_resp.status_code}，"
+                    f"code={otp_error_code or 'unknown'}，detail={otp_detail}"
+                )
                 return _fail(
                     "email_otp_send",
                     otp_error_code or f"email_otp_send_{otp_resp.status_code}",
-                    otp_error_message or _preview_response_text(otp_resp),
+                    otp_detail,
                     status_code=otp_resp.status_code,
+                    otp_error_code=otp_error_code,
+                    otp_error_message=otp_error_message,
+                    failure_detail=otp_detail,
                 )
 
         _set_stage("email_otp_wait")
@@ -424,6 +466,10 @@ def run(
             if not create_account_resp or create_account_status != 200:
                 err_code, err_message = _extract_response_error_code_message(create_account_resp)
                 err_msg = err_message or _preview_response_text(create_account_resp, limit=1200)
+                logger.warning(
+                    f"[线程 {thread_id}] [警告] 创建账户失败：status={create_account_status}，"
+                    f"code={err_code or 'unknown'}，detail={err_msg or '(empty)'}"
+                )
                 if str(err_code or "").strip().lower() == "user_already_exists":
                     mailbox_dedupe_store.mark(email, reason="user_already_exists")
                 if "unsupported_email" in err_msg:
@@ -445,6 +491,7 @@ def run(
                     status_code=create_account_status,
                     create_account_error_code=err_code,
                     create_account_error_message=err_message,
+                    failure_detail=err_msg,
                 )
 
             create_account_payload = _response_json_object(create_account_resp)
@@ -636,6 +683,7 @@ def run_with_fallback(
             f"stage={attempt.stage or 'unknown'}"
             f", error_code={attempt.error_code or 'unknown'}"
             f", message={attempt.error_message or 'unknown'}"
+            f", detail={str((attempt.metadata or {}).get('failure_detail') or '').strip() or 'n/a'}"
         )
 
     return None, last_used_provider

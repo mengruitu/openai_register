@@ -348,8 +348,15 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                 timeout=WEB_SIGNUP_REQUEST_TIMEOUT_SECONDS,
             )
             if csrf_resp.status_code != 200:
+                preview = response_text_preview(csrf_resp, limit=500) or "(empty)"
+                setattr(
+                    session,
+                    "_last_web_signup_failure_detail",
+                    f"csrf status={csrf_resp.status_code} preview={preview}",
+                )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] 获取 web signup csrf 失败，状态码: {csrf_resp.status_code}"
+                    f"[线程 {thread_id}] [错误] 获取 web signup csrf 失败，状态码: {csrf_resp.status_code}，"
+                    f"响应摘要: {preview}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -357,7 +364,15 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
 
             csrf_token = str((csrf_resp.json() or {}).get("csrfToken") or "").strip()
             if not csrf_token:
-                logger.error(f"[线程 {thread_id}] [错误] web signup csrfToken 为空")
+                preview = response_text_preview(csrf_resp, limit=500) or "(empty)"
+                setattr(
+                    session,
+                    "_last_web_signup_failure_detail",
+                    f"csrf token missing preview={preview}",
+                )
+                logger.error(
+                    f"[线程 {thread_id}] [错误] web signup csrfToken 为空，响应摘要: {preview}"
+                )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
                 continue
@@ -389,8 +404,15 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
                 timeout=WEB_SIGNUP_REQUEST_TIMEOUT_SECONDS,
             )
             if signin_resp.status_code != 200:
+                preview = response_text_preview(signin_resp, limit=500) or "(empty)"
+                setattr(
+                    session,
+                    "_last_web_signup_failure_detail",
+                    f"signin/openai status={signin_resp.status_code} preview={preview}",
+                )
                 logger.error(
-                    f"[线程 {thread_id}] [错误] web signup signin/openai 失败，状态码: {signin_resp.status_code}"
+                    f"[线程 {thread_id}] [错误] web signup signin/openai 失败，状态码: {signin_resp.status_code}，"
+                    f"响应摘要: {preview}"
                 )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
@@ -398,11 +420,20 @@ def bootstrap_web_signup_start_url(session: Any, thread_id: int) -> str:
 
             start_url = str((signin_resp.json() or {}).get("url") or "").strip()
             if not start_url:
-                logger.error(f"[线程 {thread_id}] [错误] web signup 未返回授权地址")
+                preview = response_text_preview(signin_resp, limit=500) or "(empty)"
+                setattr(
+                    session,
+                    "_last_web_signup_failure_detail",
+                    f"signin/openai missing url preview={preview}",
+                )
+                logger.error(
+                    f"[线程 {thread_id}] [错误] web signup 未返回授权地址，响应摘要: {preview}"
+                )
                 if attempt < attempts:
                     time.sleep(WEB_SIGNUP_RETRY_DELAY_SECONDS)
                 continue
 
+            setattr(session, "_last_web_signup_failure_detail", "")
             logger.info(f"[线程 {thread_id}] [信息] 已获取 web signup 授权入口")
             return start_url
         except Exception as exc:
