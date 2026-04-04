@@ -158,7 +158,6 @@ def collect_doctor_report(args: Any) -> DoctorReport:
     checks = [
         _check_config_file(args.config),
         _check_directory("active_token_dir", args.active_token_dir),
-        _check_directory("token_dir", args.token_dir),
         _check_proxy(args.proxy),
         _check_cfmail(args),
     ]
@@ -170,9 +169,7 @@ def collect_doctor_report(args: Any) -> DoctorReport:
 
 def build_status_snapshot(args: Any) -> dict[str, Any]:
     active_count = count_json_files(args.active_token_dir)
-    pool_count = count_json_files(args.token_dir)
     active_shortage = max(int(args.active_min_count) - active_count, 0)
-    pool_shortage = max(int(args.pool_min_count) - pool_count, 0)
     snapshot: dict[str, Any] = {
         "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "config_path": str(args.config or "").strip(),
@@ -184,19 +181,14 @@ def build_status_snapshot(args: Any) -> dict[str, Any]:
             "target": int(args.active_min_count),
             "shortage": active_shortage,
         },
-        "pool": {
+        "output": {
             "dir": str(args.token_dir or "").strip(),
-            "count": pool_count,
-            "target": int(args.pool_min_count),
-            "shortage": pool_shortage,
         },
         "runtime": {
-            "token_check_workers": int(args.token_check_workers),
             "register_batch_size": int(args.register_batch_size),
             "register_openai_concurrency": int(args.register_openai_concurrency),
             "register_start_delay_seconds": float(args.register_start_delay_seconds),
             "monitor_interval": int(args.monitor_interval),
-            "usage_threshold": int(args.usage_threshold),
             "detected_total_memory_mb": int(getattr(args, "detected_total_memory_mb", 0) or 0),
         },
     }
@@ -253,19 +245,15 @@ def print_status_snapshot(snapshot: dict[str, Any], *, output_json: bool = False
     print(f"邮箱服务：{snapshot.get('mail_provider', '')}")
 
     active = snapshot.get("active") or {}
-    pool = snapshot.get("pool") or {}
+    output = snapshot.get("output") or {}
     runtime = snapshot.get("runtime") or {}
     print(
         f"A目录：{active.get('count', 0)}/{active.get('target', 0)} "
         f"（缺 {active.get('shortage', 0)}） -> {active.get('dir', '')}"
     )
-    print(
-        f"B目录：{pool.get('count', 0)}/{pool.get('target', 0)} "
-        f"（缺 {pool.get('shortage', 0)}） -> {pool.get('dir', '')}"
-    )
+    print(f"注册输出目录：{output.get('dir', '')}")
     print(
         "并发："
-        f"token_check_workers={runtime.get('token_check_workers', 0)}, "
         f"register_batch_size={runtime.get('register_batch_size', 0)}, "
         f"register_openai_concurrency={runtime.get('register_openai_concurrency', 0)}"
     )

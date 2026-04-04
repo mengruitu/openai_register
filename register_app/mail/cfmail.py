@@ -31,6 +31,11 @@ TEMPMAIL_HEADERS = {
     "Referer": TEMPMAIL_BASE_URL,
 }
 OTP_CODE_PATTERN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+TEMPMAIL_CREATE_MIN_INTERVAL_SECONDS = 12.0
+TEMPMAIL_POLL_MIN_INTERVAL_SECONDS = 6.0
+TEMPMAIL_CREATE_429_RETRY_DELAYS = (15.0, 30.0, 45.0)
+TEMPMAIL_READ_429_RETRY_DELAYS = (8.0, 12.0)
+TEMPMAIL_MAX_WAIT_SECONDS = 240
 
 DEFAULT_CFMAIL_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "cfmail_accounts.json")
 DEFAULT_CFMAIL_ACCOUNTS: List[Dict[str, Any]] = [
@@ -65,6 +70,8 @@ class CfmailAccount:
 _cfmail_account_lock = threading.Lock()
 _cfmail_reload_lock = threading.Lock()
 _cfmail_failure_lock = threading.Lock()
+_tempmail_rate_lock = threading.Lock()
+_tempmail_last_request_at: Dict[str, float] = {}
 _cfmail_account_index = 0
 
 CFMAIL_CONFIG_PATH = (
@@ -376,6 +383,31 @@ def _build_request_proxies(proxy: Any) -> Any:
     return {"http": proxy, "https": proxy}
 
 
+def _tempmail_min_interval(path: str) -> float:
+    normalized = str(path or "").strip().lower()
+    return (
+        TEMPMAIL_CREATE_MIN_INTERVAL_SECONDS
+        if normalized == "/mailbox"
+        else TEMPMAIL_POLL_MIN_INTERVAL_SECONDS
+    )
+
+
+def _wait_for_tempmail_slot(path: str) -> None:
+    min_interval = _tempmail_min_interval(path)
+    if min_interval <= 0:
+        return
+
+    while True:
+        with _tempmail_rate_lock:
+            now_ts = time.monotonic()
+            last_ts = float(_tempmail_last_request_at.get(path) or 0.0)
+            wait_seconds = max(0.0, min_interval - (now_ts - last_ts))
+            if wait_seconds <= 0:
+                _tempmail_last_request_at[path] = now_ts
+                return
+        time.sleep(min(wait_seconds, 1.0))
+
+
 def _request_tempmail(
     method: str,
     path: str,
@@ -386,24 +418,45 @@ def _request_tempmail(
 ) -> Any:
     target_url = f"{TEMPMAIL_BASE_URL}{path}"
     resolved_proxies = _build_request_proxies(proxies)
+    retry_delays = (
+        TEMPMAIL_CREATE_429_RETRY_DELAYS
+        if str(path or "").strip().lower() == "/mailbox"
+        else TEMPMAIL_READ_429_RETRY_DELAYS
+    )
     last_error: Optional[Exception] = None
 
-    for candidate_proxies in ([resolved_proxies, None] if resolved_proxies else [None]):
-        try:
-            return requests.request(
-                method,
-                target_url,
-                headers=cfmail_headers(jwt=jwt, use_json=True),
-                proxies=candidate_proxies,
-                impersonate="chrome",
-                verify=False,
-                timeout=timeout,
+    for attempt_index in range(len(retry_delays) + 1):
+        _wait_for_tempmail_slot(path)
+        for candidate_proxies in ([resolved_proxies, None] if resolved_proxies else [None]):
+            try:
+                resp = requests.request(
+                    method,
+                    target_url,
+                    headers=cfmail_headers(jwt=jwt, use_json=True),
+                    proxies=candidate_proxies,
+                    impersonate="chrome",
+                    verify=False,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                last_error = exc
+                if candidate_proxies is None:
+                    break
+                logger.warning(f"[temp-mail] 代理请求失败，尝试直连回退: {exc}")
+                continue
+
+            if resp.status_code != 429:
+                return resp
+
+            if attempt_index >= len(retry_delays):
+                return resp
+
+            backoff_seconds = float(retry_delays[attempt_index])
+            logger.warning(
+                f"[temp-mail] 命中 429，{backoff_seconds:.0f} 秒后重试 {path}"
             )
-        except Exception as exc:
-            last_error = exc
-            if candidate_proxies is None:
-                break
-            logger.warning(f"[temp-mail] 代理请求失败，尝试直连回退: {exc}")
+            time.sleep(backoff_seconds)
+            break
 
     if last_error:
         raise last_error
@@ -672,7 +725,10 @@ def poll_cfmail_oai_code(
     _log_waiting_code_start(thread_id, email)
     reset_mailbox_wait_diagnostics("cfmail", email)
 
-    for _ in range(40):
+    poll_interval_seconds = TEMPMAIL_POLL_MIN_INTERVAL_SECONDS
+    max_polls = max(1, int(TEMPMAIL_MAX_WAIT_SECONDS // max(1.0, poll_interval_seconds)))
+
+    for _ in range(max_polls):
         increment_mailbox_wait_poll("cfmail", email)
         try:
             resp = _request_tempmail(
@@ -683,7 +739,7 @@ def poll_cfmail_oai_code(
                 timeout=15,
             )
             if resp.status_code != 200:
-                time.sleep(3)
+                time.sleep(poll_interval_seconds)
                 continue
 
             data = resp.json() if resp.content else {}
@@ -720,7 +776,7 @@ def poll_cfmail_oai_code(
         except Exception:
             pass
 
-        time.sleep(3)
+        time.sleep(poll_interval_seconds)
 
     mark_mailbox_wait_timeout(
         "cfmail",

@@ -13,21 +13,14 @@ _fallback_alert_lock = threading.Lock()
 _fallback_alert_sent_at: Dict[str, float] = {}
 
 
-def _monitor_status_text(
-    active_count: int,
-    pool_count: int,
-    active_target: int,
-    pool_target: int,
-) -> str:
-    return "达标" if active_count >= active_target and pool_count >= pool_target else "未达标"
+def _monitor_status_text(active_count: int, active_target: int) -> str:
+    return "达标" if active_count >= active_target else "未达标"
 
 
 def build_monitor_dingtalk_message(result: Any) -> str:
     status_text = _monitor_status_text(
         result.active_count,
-        result.pool_count,
         result.active_target,
-        result.pool_target,
     )
     replenish_text = (
         f"已触发，成功 {result.replenished_count}/{result.register_target}"
@@ -40,11 +33,7 @@ def build_monitor_dingtalk_message(result: Any) -> str:
         f"时间：{result.completed_at.strftime('%m-%d %H:%M:%S')}\n"
         f"状态：{status_text}\n"
         f"A目录：{result.active_count}/{result.active_target}（缺 {result.active_shortage}）\n"
-        f"B目录：{result.pool_count}/{result.pool_target}（缺 {result.pool_shortage}）\n"
-        f"补号：{replenish_text}\n"
-        f"B->A：{result.moved_to_active_count}\n"
-        f"删除：A {result.active_deleted_count}，B {result.pool_deleted_count}，合计 {result.deleted_count}\n"
-        f"查询失败：A {result.active_check_failed}，B {result.pool_check_failed}"
+        f"补号：{replenish_text}"
     )
 
 
@@ -61,27 +50,17 @@ def build_monitor_summary_message(results: List[Any]) -> str:
     total_register_target = sum(
         item.register_target for item in results if item.attempted_replenish
     )
-    total_deleted = sum(item.deleted_count for item in results)
-    total_active_deleted = sum(item.active_deleted_count for item in results)
-    total_pool_deleted = sum(item.pool_deleted_count for item in results)
-    total_moved_to_active = sum(item.moved_to_active_count for item in results)
-    total_active_check_failed = sum(item.active_check_failed for item in results)
-    total_pool_check_failed = sum(item.pool_check_failed for item in results)
     replenish_rounds = sum(1 for item in results if item.attempted_replenish)
     unmet_rounds = sum(
         1
         for item in results
-        if item.active_count < item.active_target or item.pool_count < item.pool_target
+        if item.active_count < item.active_target
     )
     min_active = min(item.active_count for item in results)
-    min_pool = min(item.pool_count for item in results)
     max_active = max(item.active_count for item in results)
-    max_pool = max(item.pool_count for item in results)
     latest_status = _monitor_status_text(
         last_result.active_count,
-        last_result.pool_count,
         last_result.active_target,
-        last_result.pool_target,
     )
 
     return (
@@ -90,13 +69,9 @@ def build_monitor_summary_message(results: List[Any]) -> str:
         f"周期：{first_result.completed_at.strftime('%m-%d %H:%M')} ~ {last_result.completed_at.strftime('%m-%d %H:%M')}\n"
         f"巡检轮次：{len(results)}\n"
         f"最新状态：{latest_status}\n"
-        f"最新库存：A {last_result.active_count}/{last_result.active_target}（缺 {last_result.active_shortage}），"
-        f"B {last_result.pool_count}/{last_result.pool_target}（缺 {last_result.pool_shortage}）\n"
-        f"库存区间：A {min_active} ~ {max_active}，B {min_pool} ~ {max_pool}\n"
+        f"最新库存：A {last_result.active_count}/{last_result.active_target}（缺 {last_result.active_shortage}）\n"
+        f"库存区间：A {min_active} ~ {max_active}\n"
         f"补号轮次：{replenish_rounds}，补号结果：成功 {total_replenished}/{total_register_target}\n"
-        f"B->A 合计：{total_moved_to_active}\n"
-        f"删除统计：A {total_active_deleted}，B {total_pool_deleted}，合计 {total_deleted}\n"
-        f"查询失败：A {total_active_check_failed}，B {total_pool_check_failed}\n"
         f"未达标轮次：{unmet_rounds}"
     )
 

@@ -24,15 +24,12 @@ _SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ACTIVE_TOKEN_DIR = os.path.join(_SCRIPT_DIR, "auths")
 DEFAULT_TOKEN_OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "auths_pool")
 DEFAULT_MIN_ACTIVE_COUNT = 20
-DEFAULT_MIN_POOL_COUNT = 50
-DEFAULT_USAGE_THRESHOLD = 90
 DEFAULT_CHECK_INTERVAL_SECONDS = 900
 DEFAULT_DINGTALK_SUMMARY_INTERVAL_SECONDS = 10800
-DEFAULT_REQUEST_INTERVAL_SECONDS = 2
-DEFAULT_REGISTER_BATCH_SIZE = 3
-DEFAULT_REGISTER_OPENAI_CONCURRENCY = 3
-DEFAULT_REGISTER_START_DELAY_SECONDS = 1.0
-DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 10
+DEFAULT_REGISTER_BATCH_SIZE = 1
+DEFAULT_REGISTER_OPENAI_CONCURRENCY = 1
+DEFAULT_REGISTER_START_DELAY_SECONDS = 8.0
+DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 20
 DEFAULT_DINGTALK_WEBHOOK = ""
 DEFAULT_CFMAIL_FALLBACK_PROVIDER = "tempmaillol"
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
@@ -59,11 +56,6 @@ _CONFIG_KEY_MAP: Dict[str, str] = {
     "token_dir": "token_dir",
     "active_token_dir": "active_token_dir",
     "active_min_count": "active_min_count",
-    "pool_min_count": "pool_min_count",
-    "usage_threshold": "usage_threshold",
-    "request_interval": "request_interval",
-    "token_check_workers": "token_check_workers",
-    "curl_timeout": "curl_timeout",
     "monitor_interval": "monitor_interval",
     "register_batch_size": "register_batch_size",
     "register_openai_concurrency": "register_openai_concurrency",
@@ -181,12 +173,10 @@ def apply_low_memory_tuning(args: argparse.Namespace) -> None:
     if total_memory_mb <= LOW_MEMORY_HARD_LIMIT_MB:
         max_register_concurrency = 1
         max_register_batch_size = 1
-        max_token_check_workers = 1
         profile_name = "hard"
     elif total_memory_mb <= LOW_MEMORY_SOFT_LIMIT_MB:
         max_register_concurrency = 2
         max_register_batch_size = 2
-        max_token_check_workers = 2
         profile_name = "soft"
     else:
         return
@@ -194,7 +184,6 @@ def apply_low_memory_tuning(args: argparse.Namespace) -> None:
     original_values = (
         args.register_openai_concurrency,
         args.register_batch_size,
-        args.token_check_workers,
     )
     args.register_openai_concurrency = min(
         args.register_openai_concurrency,
@@ -204,23 +193,16 @@ def apply_low_memory_tuning(args: argparse.Namespace) -> None:
         args.register_batch_size,
         max_register_batch_size,
     )
-    args.token_check_workers = min(
-        args.token_check_workers,
-        max_token_check_workers,
-    )
-
     tuned_values = (
         args.register_openai_concurrency,
         args.register_batch_size,
-        args.token_check_workers,
     )
     if tuned_values != original_values:
         logger.info(
             "[信息] 检测到低内存环境（总内存约 %s MB，profile=%s），"
-            "已自动收敛并发：register_openai_concurrency=%s，register_batch_size=%s，token_check_workers=%s",
+            "已自动收敛并发：register_openai_concurrency=%s，register_batch_size=%s",
             total_memory_mb,
             profile_name,
             args.register_openai_concurrency,
             args.register_batch_size,
-            args.token_check_workers,
         )

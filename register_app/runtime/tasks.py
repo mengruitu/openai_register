@@ -313,9 +313,7 @@ def run_monitor_loop(
             break
 
         elapsed_seconds = int(time.time() - cycle_started_at)
-        has_shortage = cycle_result is not None and (
-            cycle_result.active_shortage > 0 or cycle_result.pool_shortage > 0
-        )
+        has_shortage = cycle_result is not None and cycle_result.active_shortage > 0
         if has_shortage:
             attempted_but_failed = cycle_result.attempted_replenish and cycle_result.replenished_count == 0
             if attempted_but_failed:
@@ -324,8 +322,7 @@ def run_monitor_loop(
                 target_interval = max(SHORTAGE_FAST_RETRY_SECONDS, args.monitor_interval // 5)
             sleep_seconds = max(1, target_interval - elapsed_seconds)
             log_info(
-                f"检测到库存缺口（A 缺 {cycle_result.active_shortage}，"
-                f"B 缺 {cycle_result.pool_shortage}），缩短等待间隔，"
+                f"检测到 A 库存缺口（缺 {cycle_result.active_shortage}），缩短等待间隔，"
                 f"{sleep_seconds} 秒后进入下一轮检测"
             )
         else:

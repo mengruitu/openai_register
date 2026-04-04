@@ -1,227 +1,124 @@
 # openai_register
 
-`openai_register.py` 是一个面向 OpenAI/ChatGPT 账号池维护的自动化脚本，支持注册、双池巡检、额度检查、补号、`cfmail` 热加载和钉钉通知。
+`openai_register.py` 是一个面向 OpenAI/ChatGPT 账号池维护的自动化脚本，当前模式已精简为：
 
-这个仓库适合两类场景：
+- 维护 **A 目录** 账号池
+- 库存不足时自动补号
+- 使用 `temp-mail.org` 兼容邮箱逻辑
+- 默认慢速注册，优先稳定性
 
-- 持续维护 A/B 两级账号池
-- 临时并发补一批新号
+## 当前行为
 
-## 功能概览
+当前巡检/补号逻辑只做这些事：
 
-- 自动创建临时邮箱并完成注册流程
-- 保存 `id_token`、`access_token`、`refresh_token`、`account_id`
-- 维护两级账号池
-  - `A`：当前使用中的账号
-  - `B`：库存/备用账号
-- 巡检账号额度与可用状态
-- A/B 库存不足时自动补号
-- 支持 `cfmail` 多配置轮询与热加载
-- 支持钉钉汇总通知
+1. 统计 A 目录账号数量
+2. 若低于 `active_min_count`，直接补号到 A 目录
+3. 不做删号
+4. 不做额度查询
+5. 不维护 B 目录
 
 ## 目录说明
 
 - `openai_register.py`
-  主入口脚本
-- `register_app/`
-  业务代码主目录，按职责拆分
-  - `auth/`
-    - `oauth.py`：OAuth / signup / callback
-    - `token.py`：token 提取策略
-    - `session_refresh.py`：session / refresh_token 刷新
-  - `mail/`
-    - `providers.py`：第三方临时邮箱
-    - `cfmail.py`：自建 cfmail
-    - `dedupe.py`：邮箱去重
-    - `diagnostics.py`：OTP 等待诊断
-  - `registration/`
-    - `common.py`：注册共享辅助逻辑
-    - `mailbox.py`：邮箱路由与收码
-    - `flow.py`：注册主流程与回退
-  - `runtime/`
-    - `common.py`：runtime 共享类型、日志、持久化
-    - `tokens.py`：额度检查、刷新、A/B 清理
-    - `tasks.py`：巡检循环、补号调度
-  - `config.py`：配置与默认值
-  - `doctor.py`：轻量环境检查与状态输出
-  - `notifications.py`：钉钉通知
-  - `sentinel.py`：指纹 / sentinel
-- `monitor_config.example.json`
-  巡检配置示例
-- `cfmail_accounts.example.json`
-  `cfmail` 配置示例
-
-## 运行环境
-
-- Python 3.10+
-- 依赖见 [requirements.txt](./requirements.txt)
-
-推荐先创建虚拟环境并安装依赖：
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-```
-
-如果你直接用仓库自带脚本部署：
-
-```bash
-bash ctl.sh deps
-```
+  CLI 入口
+- `register_app/mail/cfmail.py`
+  `temp-mail.org` 兼容邮箱逻辑
+- `register_app/registration/flow.py`
+  注册主流程
+- `register_app/runtime/tasks.py`
+  A-only 补号调度
+- `register_app/config.py`
+  默认配置与配置文件映射
+- `register_app/doctor.py`
+  环境检查与状态输出
+- `register_app/notifications.py`
+  钉钉通知
 
 ## 快速开始
 
 ### 1. 准备配置
 
-将以下示例文件复制一份并去掉 `.example`：
+复制：
 
 - `monitor_config.example.json` -> `monitor_config.json`
 - `cfmail_accounts.example.json` -> `cfmail_accounts.json`
 
-然后按你的环境修改：
-
-- `monitor_config.json`
-- `cfmail_accounts.json`
-
-最关键的配置项：
-
-- `active_token_dir`
-- `token_dir`
-- `active_min_count`
-- `pool_min_count`
-- `usage_threshold`
-- `mail_provider`
-- `proxy`
-
-### 2. 直接执行一轮巡检
+### 2. 单轮补号检测
 
 ```bash
 python openai_register.py
 ```
 
-默认行为不是无限注册，而是：
-
-1. 巡检 A 目录
-2. 巡检 B 目录
-3. 从 B 补到 A
-4. 如果 A/B 不足，再自动补号
-
-### 3. 持续巡检
+### 3. 持续补号
 
 ```bash
 python openai_register.py --monitor
 ```
 
-### 4. 查看状态
+### 4. 只跑注册
+
+```bash
+python openai_register.py --register-only --once
+```
+
+### 5. 查看状态
 
 ```bash
 python openai_register.py --status
 ```
 
-### 5. 做环境检查
-
-```bash
-python openai_register.py --doctor
-```
-
-### 6. 只跑注册
-
-```bash
-python openai_register.py --register-only
-```
-
-### 7. 测试 cfmail
+### 6. 测试邮箱
 
 ```bash
 python openai_register.py --test-cfmail
 ```
 
-## 常用模式
+## monitor_config 关键配置
 
-### 单轮巡检
+当前真正有用的字段：
 
-```bash
-python openai_register.py
-```
+- `active_token_dir`
+- `active_min_count`
+- `mail_provider`
+- `proxy`
+- `monitor_interval`
+- `register_batch_size`
+- `register_openai_concurrency`
+- `register_start_delay_seconds`
+- `failure_sleep_seconds`
+- `dingtalk_webhook`
+- `dingtalk_summary_interval`
+- `cfmail_profile`
+- `cfmail_config`
 
-### 查看状态（JSON）
+## 默认节流策略
 
-```bash
-python openai_register.py --status --json
-```
+为降低 `temp-mail.org` 的 429 风险，当前默认已经放慢：
 
-### 环境检查 + 状态
+- `register_batch_size = 1`
+- `register_openai_concurrency = 1`
+- `register_start_delay_seconds = 8.0`
+- `failure_sleep_seconds = 20`
 
-```bash
-python openai_register.py --doctor --status
-```
+邮箱请求节流：
 
-### 持续巡检补号
-
-```bash
-python openai_register.py --monitor --proxy http://127.0.0.1:7890
-```
-
-### 只补一批新号
-
-```bash
-python openai_register.py --register-only --once --proxy http://127.0.0.1:7890
-```
-
-### 指定 cfmail 配置
-
-```bash
-python openai_register.py --monitor --cfmail-profile node1
-```
-
-## 巡检逻辑摘要
-
-当前巡检逻辑是：
-
-1. 读取 token 文件
-2. 如果 `access_token` 缺失或即将过期，优先尝试用 `refresh_token` 刷新
-3. 用最新 `access_token` 查询额度
-4. 根据结果决定保留、删除、或跳过
-
-判定原则：
-
-- 已确认失效时删除
-  - 例如 `account_deactivated`
-  - 或刷新后仍确认登录态失效
-- `used_percent >= usage_threshold` 时删除
-- 临时查询失败时先保留
-  - 例如超时
-  - TLS/网络抖动
-  - 接口短暂异常
-  - 返回结构异常
-
-巡检链路的网络出口现在与注册链路保持一致：
-
-- 优先使用命令行 / 配置中的 `proxy`
-- 未显式提供时，回退使用 token 文件里的 `registration_proxy_url`
-
-这意味着：
-
-- `refresh_token` 不是直接用来查额度的
-- 它的作用是先换出新的 `access_token`
-- 真正查额度时仍然使用 `access_token`
+- 创建邮箱最小间隔约 `12s`
+- 收件轮询最小间隔约 `6s`
+- 命中 `429` 会自动退避重试
 
 ## 输出结果
 
-### Token 文件
+### A 目录 token
 
-注册成功后会生成 `.json` 文件，通常包含：
+巡检补号成功后，token 会直接写入：
 
-- `id_token`
-- `access_token`
-- `refresh_token`
-- `account_id`
-- `last_refresh`
-- `email`
-- `type`
-- `expired`
+- `active_token_dir`
+
+### 注册模式输出目录
+
+`--register-only` 模式下，token 输出到：
+
+- `token_dir`
 
 ### 账号汇总
 
@@ -237,62 +134,16 @@ output/accounts.txt
 邮箱----密码----refresh_token
 ```
 
-## 配置文件
-
-### `monitor_config.json`
-
-推荐从 [monitor_config.example.json](./monitor_config.example.json) 复制。
-
-核心字段：
-
-- `active_token_dir`
-- `token_dir`
-- `active_min_count`
-- `pool_min_count`
-- `usage_threshold`
-- `monitor_interval`
-- `token_check_workers`
-- `curl_timeout`
-- `register_batch_size`
-- `register_openai_concurrency`
-- `dingtalk_webhook`
-
-### `cfmail_accounts.json`
-
-推荐从 [cfmail_accounts.example.json](./cfmail_accounts.example.json) 复制。
-
-支持：
-
-- 多 `cfmail` 配置轮询
-- 指定 profile
-- 连续失败冷却
-- 配置热加载
-
-## 日志说明
-
-当前日志策略偏向“看异常和汇总”：
-
-- 保留删除、失败、补位、补号汇总等关键日志
-- 减少正常账号逐条保留日志
-- 邮箱轮询不再输出大量 `......`
-
-这样更适合长期挂后台巡检。
-
 ## 建议使用方式
 
-长期维护账号池时，推荐：
+长期挂后台：
 
 ```bash
 python openai_register.py --monitor
 ```
 
-短时补号时，推荐：
+临时补几个号：
 
 ```bash
 python openai_register.py --register-only --once
 ```
-
-## 相关文档
-
-- [monitor_config.example.json](./monitor_config.example.json)：巡检配置示例
-- [cfmail_accounts.example.json](./cfmail_accounts.example.json)：`cfmail` 配置示例

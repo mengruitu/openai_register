@@ -1,50 +1,44 @@
 {
-    "_comment": "monitor_config.json 配置文件示例。以 _ 开头的字段为注释，会被忽略。",
-    "_usage": [
-        "将本文件复制为 monitor_config.json 并修改其中的值即可。",
-        "命令行参数优先于配置文件。配置文件中未设置的项使用代码默认值。",
-        "默认读取脚本同目录下的 monitor_config.json，也可通过 --config 指定路径。"
-    ],
+  "_comment": "A-only monitor 配置示例。以 _ 开头的字段为注释，会被忽略。",
+  "_usage": [
+    "将本文件复制为 monitor_config.json 并修改其中的值即可。",
+    "当前巡检只维护 A 目录：不做删号、不查额度、不维护 B 目录。",
+    "命令行参数优先于配置文件。配置文件中未设置的项使用代码默认值。"
+  ],
 
-    "_section_paths": "===== 目录配置 =====",
-    "active_token_dir": "/home/cpa/CLIProxyAPI/auths",
-    "token_dir": "/home/cpa/CLIProxyAPI/auths_pool",
+  "_section_paths": "===== A 目录配置 =====",
+  "active_token_dir": "/home/cpa/CLIProxyAPI/auths",
 
-    "_section_thresholds": "===== 阈值配置 =====",
-    "active_min_count": 20,
-    "pool_min_count": 50,
-    "usage_threshold": 90,
+  "_section_thresholds": "===== A 目录目标 =====",
+  "active_min_count": 20,
 
-    "_section_intervals": "===== 时间间隔（秒） =====",
-    "monitor_interval": 900,
-    "request_interval": 2,
-    "token_check_workers": 6,
-    "curl_timeout": 15,
-    "dingtalk_summary_interval": 10800,
-    "sleep_min": 10,
-    "sleep_max": 30,
-    "failure_sleep_seconds": 10,
+  "_section_intervals": "===== 时间间隔（秒） =====",
+  "monitor_interval": 900,
+  "dingtalk_summary_interval": 10800,
+  "sleep_min": 20,
+  "sleep_max": 40,
+  "failure_sleep_seconds": 20,
 
-    "_section_register": "===== 注册配置 =====",
-    "mail_provider": "cfmail",
-    "register_batch_size": 3,
-    "register_openai_concurrency": 3,
-    "register_start_delay_seconds": 1.0,
+  "_section_register": "===== 注册配置（默认放慢） =====",
+  "mail_provider": "cfmail",
+  "register_batch_size": 1,
+  "register_openai_concurrency": 1,
+  "register_start_delay_seconds": 8.0,
 
-    "_section_cfmail": "===== cfmail 配置 =====",
-    "cfmail_profile": "auto",
-    "cfmail_config": "",
-    "cfmail_fail_threshold": 3,
-    "cfmail_cooldown_seconds": 300,
+  "_section_cfmail": "===== temp-mail 兼容配置 =====",
+  "cfmail_profile": "auto",
+  "cfmail_config": "",
+  "cfmail_fail_threshold": 3,
+  "cfmail_cooldown_seconds": 300,
 
-    "_section_notify": "===== 通知配置 =====",
-    "dingtalk_webhook": "",
-    "dingtalk_fallback_interval": 900,
+  "_section_notify": "===== 通知配置 =====",
+  "dingtalk_webhook": "",
+  "dingtalk_fallback_interval": 900,
 
-    "_section_proxy": "===== 代理配置 =====",
-    "proxy": "",
+  "_section_proxy": "===== 代理配置 =====",
+  "proxy": "",
 
-    "_section_flags": "===== 开关（true/false） =====",
-    "monitor": true,
-    "auto_continue_non_us": true
+  "_section_flags": "===== 开关（true/false） =====",
+  "monitor": true,
+  "auto_continue_non_us": true
 }

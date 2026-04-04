@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """OpenAI 自动注册与账号巡检脚本。
 
-支持多种临时邮箱服务，自动完成注册流程并维护双目录 Token 池。
+支持多种临时邮箱服务，自动完成注册流程并维护 A 目录账号池。
 
 本文件仅作为 CLI 入口：
 - 核心注册流程 → register_app/registration/
@@ -48,14 +48,11 @@ from register_app.config import (
     DEFAULT_DINGTALK_SUMMARY_INTERVAL_SECONDS,
     DEFAULT_DINGTALK_WEBHOOK,
     DEFAULT_MIN_ACTIVE_COUNT,
-    DEFAULT_MIN_POOL_COUNT,
     DEFAULT_REGISTER_BATCH_SIZE,
     DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS,
     DEFAULT_REGISTER_OPENAI_CONCURRENCY,
     DEFAULT_REGISTER_START_DELAY_SECONDS,
-    DEFAULT_REQUEST_INTERVAL_SECONDS,
     DEFAULT_TOKEN_OUTPUT_DIR,
-    DEFAULT_USAGE_THRESHOLD,
     apply_config_to_args,
     apply_low_memory_tuning,
     load_config_file,
@@ -63,7 +60,6 @@ from register_app.config import (
 from register_app.registration import run_with_fallback
 from register_app.mail.providers import MAILTM_BASE
 from register_app.runtime import (
-    DEFAULT_TOKEN_CHECK_WORKERS,
     log_info,
     run_monitor_loop,
     worker,
@@ -142,7 +138,7 @@ def main() -> None:
     parser.add_argument(
         "--token-dir",
         default=DEFAULT_TOKEN_OUTPUT_DIR,
-        help="B 目录 / Token 输出目录",
+        help="注册模式 Token 输出目录",
     )
     parser.add_argument(
         "--active-token-dir",
@@ -156,39 +152,9 @@ def main() -> None:
         help="A 目录最少保留数量",
     )
     parser.add_argument(
-        "--pool-min-count",
-        type=int,
-        default=DEFAULT_MIN_POOL_COUNT,
-        help="B 目录最少保留数量",
-    )
-    parser.add_argument(
-        "--usage-threshold",
-        type=int,
-        default=DEFAULT_USAGE_THRESHOLD,
-        help="账号已用比例达到该值后视为不可用",
-    )
-    parser.add_argument(
-        "--request-interval",
-        type=int,
-        default=DEFAULT_REQUEST_INTERVAL_SECONDS,
-        help="检测账号时每次请求之间的等待秒数",
-    )
-    parser.add_argument(
-        "--token-check-workers",
-        type=int,
-        default=DEFAULT_TOKEN_CHECK_WORKERS,
-        help="巡检额度查询并发数",
-    )
-    parser.add_argument(
-        "--curl-timeout",
-        type=int,
-        default=15,
-        help="额度检测接口超时时间（秒）",
-    )
-    parser.add_argument(
         "--monitor",
         action="store_true",
-        help="持续巡检模式：每隔一段时间检查 A/B 数量并自动补号",
+        help="持续巡检模式：每隔一段时间检查 A 目录数量并自动补号",
     )
     parser.add_argument(
         "--monitor-once",
@@ -198,7 +164,7 @@ def main() -> None:
     parser.add_argument(
         "--register-only",
         action="store_true",
-        help="仅执行原来的注册逻辑，不做 A/B 检测",
+        help="仅执行注册逻辑，不做 A 目录补号检测",
     )
     parser.add_argument(
         "--monitor-interval",
@@ -295,11 +261,6 @@ def main() -> None:
     sleep_max = max(sleep_min, args.sleep_max)
     args.failure_sleep_seconds = max(0, args.failure_sleep_seconds)
     args.active_min_count = max(1, args.active_min_count)
-    args.pool_min_count = max(0, args.pool_min_count)
-    args.usage_threshold = max(1, args.usage_threshold)
-    args.request_interval = max(0, args.request_interval)
-    args.token_check_workers = max(1, args.token_check_workers)
-    args.curl_timeout = max(1, args.curl_timeout)
     args.monitor_interval = max(1, args.monitor_interval)
     args.dingtalk_summary_interval = max(1, args.dingtalk_summary_interval)
     args.dingtalk_fallback_interval = max(0, args.dingtalk_fallback_interval)
@@ -425,9 +386,9 @@ def main() -> None:
         sys.exit(0 if ok else 1)
 
     # 默认行为：
-    # - 直接执行脚本：跑一轮巡检（monitor_once）
-    # - --monitor：持续巡检
-    # - --register-only：跳过巡检，直接进入原始注册模式
+    # - 直接执行脚本：跑一轮 A 目录补号检测（monitor_once）
+    # - --monitor：持续巡检 A 目录
+    # - --register-only：跳过巡检，直接进入注册模式
     run_single_monitor = not args.register_only and not args.monitor
 
     if args.monitor or args.monitor_once or run_single_monitor:
@@ -444,7 +405,7 @@ def main() -> None:
                 f"选择={args.cfmail_profile}"
             )
         log_info(
-            f"巡检模式启动：A目录={args.active_token_dir}，B目录={args.token_dir}，A阈值={args.active_min_count}，B阈值={args.pool_min_count}，巡检间隔={args.monitor_interval}秒，额度查询并发={args.token_check_workers}，注册并发={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
+            f"巡检模式启动：A目录={args.active_token_dir}，A阈值={args.active_min_count}，巡检间隔={args.monitor_interval}秒，注册并发={args.register_openai_concurrency}，批次={args.register_batch_size}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
         )
         run_monitor_loop(
             args,
