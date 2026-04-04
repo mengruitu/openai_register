@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import builtins
-import concurrent.futures
 import os
 import random
 import threading
@@ -24,11 +23,6 @@ from .common import (
     log_info,
     log_warn,
     persist_registration_result,
-)
-from .tokens import (
-    cleanup_active_tokens,
-    cleanup_pool_tokens,
-    move_pool_tokens_to_active,
 )
 
 
@@ -145,171 +139,76 @@ def register_accounts(
 
 def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycleResult:
     os.makedirs(args.active_token_dir, exist_ok=True)
-    os.makedirs(args.token_dir, exist_ok=True)
 
-    log_info("========== 开始执行账号检测 ==========")
-
-    cleanup_args_a = (
-        args.active_token_dir,
-        args.usage_threshold,
-        args.request_interval,
-        args.curl_timeout,
-        args.token_check_workers,
-        args.proxy,
-    )
-    cleanup_args_b = (
-        args.token_dir,
-        args.usage_threshold,
-        args.request_interval,
-        args.curl_timeout,
-        args.token_check_workers,
-        args.proxy,
-    )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as cleanup_executor:
-        future_a = cleanup_executor.submit(cleanup_active_tokens, *cleanup_args_a)
-        future_b = cleanup_executor.submit(cleanup_pool_tokens, *cleanup_args_b)
-        kept_count, deleted_count, check_failed = future_a.result()
-        pool_kept_count, pool_deleted_count, pool_check_failed = future_b.result()
-
-    log_info(f"A 清理完成：保留 {kept_count}，删除 {deleted_count}，查询失败 {check_failed}")
-    log_info(
-        f"B 清理完成：保留 {pool_kept_count}，删除 {pool_deleted_count}，查询失败 {pool_check_failed}"
-    )
-
-    moved_before_register, deleted_from_pool_before = move_pool_tokens_to_active(
-        args.active_token_dir,
-        args.token_dir,
-        args.active_min_count,
-        args.usage_threshold,
-        args.request_interval,
-        args.curl_timeout,
-        args.token_check_workers,
-        args.proxy,
-    )
-    if moved_before_register > 0:
-        log_info(f"首次从 B 补充到 A 共 {moved_before_register} 个")
+    log_info("========== 开始执行 A 目录补号检测 ==========")
+    log_info("当前已禁用删号、额度查询、B->A 搬运、B 目录补号；本轮仅维护 A 目录")
 
     active_count = count_json_files(args.active_token_dir)
-    pool_count = count_json_files(args.token_dir)
     active_shortage = max(args.active_min_count - active_count, 0)
-    pool_shortage = max(args.pool_min_count - pool_count, 0)
-    register_target = active_shortage + pool_shortage
+    register_target = active_shortage
     log_info(
-        f"当前库存统计：A={active_count}/{args.active_min_count}（缺 {active_shortage}），"
-        f"B={pool_count}/{args.pool_min_count}（缺 {pool_shortage}）"
+        f"当前库存统计：A={active_count}/{args.active_min_count}（缺 {active_shortage}）；B 目录已忽略"
     )
+
     replenished_count = 0
     replenished_to_active = 0
-    replenished_to_pool = 0
-    moved_after_register = 0
-    deleted_from_pool_after = 0
 
     if register_target > 0:
         log_warn(
-            f"检测到库存不足：A={active_count}/{args.active_min_count}，B={pool_count}/{args.pool_min_count}，准备补号 {register_target} 个"
+            f"检测到 A 库存不足：A={active_count}/{args.active_min_count}，准备补号 {register_target} 个"
         )
-        if active_shortage > 0:
-            log_info(f"A 目录存在缺口，优先直补 A：计划补 {active_shortage} 个到 {args.active_token_dir}")
-            replenished_to_active = register_accounts(
-                active_shortage,
-                args.proxy,
-                args.mail_provider,
-                args.mailtm_api_base,
-                args.active_token_dir,
-                args.register_batch_size,
-                args.register_openai_concurrency,
-                args.register_start_delay_seconds,
-                args.auto_continue_non_us,
-                register_runner,
-                args.dingtalk_webhook,
-                args.dingtalk_fallback_interval,
-            )
-            replenished_count += replenished_to_active
-            log_info(f"A 直补完成：计划补 {active_shortage} 个，实际成功 {replenished_to_active} 个")
-            active_count = count_json_files(args.active_token_dir)
-            pool_count = count_json_files(args.token_dir)
-
-        remaining_active_shortage = max(args.active_min_count - active_count, 0)
-        remaining_pool_shortage = max(args.pool_min_count - pool_count, 0)
-        remaining_register_target = remaining_active_shortage + remaining_pool_shortage
-        if remaining_register_target > 0:
-            log_info(
-                f"继续补充 B 目录：A 剩余缺口 {remaining_active_shortage}，"
-                f"B 剩余缺口 {remaining_pool_shortage}，计划补 {remaining_register_target} 个到 {args.token_dir}"
-            )
-            replenished_to_pool = register_accounts(
-                remaining_register_target,
-                args.proxy,
-                args.mail_provider,
-                args.mailtm_api_base,
-                args.token_dir,
-                args.register_batch_size,
-                args.register_openai_concurrency,
-                args.register_start_delay_seconds,
-                args.auto_continue_non_us,
-                register_runner,
-                args.dingtalk_webhook,
-                args.dingtalk_fallback_interval,
-            )
-            replenished_count += replenished_to_pool
-
+        log_info(f"A 目录存在缺口，直接补号到 A：计划补 {active_shortage} 个到 {args.active_token_dir}")
+        replenished_to_active = register_accounts(
+            active_shortage,
+            args.proxy,
+            args.mail_provider,
+            args.mailtm_api_base,
+            args.active_token_dir,
+            args.register_batch_size,
+            args.register_openai_concurrency,
+            args.register_start_delay_seconds,
+            args.auto_continue_non_us,
+            register_runner,
+            args.dingtalk_webhook,
+            args.dingtalk_fallback_interval,
+        )
+        replenished_count += replenished_to_active
         log_info(
-            f"注册补号完成：总计划补 {register_target} 个，"
-            f"A 直补成功 {replenished_to_active} 个，"
-            f"B 补号成功 {replenished_to_pool} 个，"
-            f"总成功 {replenished_count} 个"
+            f"A 补号完成：总计划补 {register_target} 个，"
+            f"A 补号成功 {replenished_to_active} 个"
         )
-        if replenished_count > 0:
-            moved_after_register, deleted_from_pool_after = move_pool_tokens_to_active(
-                args.active_token_dir,
-                args.token_dir,
-                args.active_min_count,
-                args.usage_threshold,
-                args.request_interval,
-                args.curl_timeout,
-                args.token_check_workers,
-                args.proxy,
-            )
-            if moved_after_register > 0:
-                log_info(f"补号后再次从 B 补充到 A 共 {moved_after_register} 个")
     else:
         log_info(
-            f"A/B 均已达标：A={active_count}/{args.active_min_count}，B={pool_count}/{args.pool_min_count}，本轮不补号"
+            f"A 已达标：A={active_count}/{args.active_min_count}，本轮不补号"
         )
 
     final_active_count = count_json_files(args.active_token_dir)
-    final_pool_count = count_json_files(args.token_dir)
     final_active_shortage = max(args.active_min_count - final_active_count, 0)
-    final_pool_shortage = max(args.pool_min_count - final_pool_count, 0)
-    total_deleted_count = (
-        deleted_count + pool_deleted_count + deleted_from_pool_before + deleted_from_pool_after
+
+    log_info(
+        f"本轮汇总：删 A=0，删 B=0，B→A=0，注册成功={replenished_count}"
     )
     log_info(
-        f"本轮汇总：删 A={deleted_count}，删 B={pool_deleted_count + deleted_from_pool_before + deleted_from_pool_after}，"
-        f"B→A={moved_before_register + moved_after_register}，注册成功={replenished_count}"
+        f"检测结束：A={final_active_count}/{args.active_min_count}（缺 {final_active_shortage}），B 目录已忽略，补号={replenished_count}"
     )
-    log_info(
-        f"检测结束：A={final_active_count}/{args.active_min_count}（缺 {final_active_shortage}），"
-        f"B={final_pool_count}/{args.pool_min_count}（缺 {final_pool_shortage}），补号={replenished_count}"
-    )
-    log_info("========== 账号检测执行完成 ==========")
+    log_info("========== A 目录补号检测执行完成 ==========")
     return MonitorCycleResult(
         completed_at=datetime.now(),
         active_count=final_active_count,
-        pool_count=final_pool_count,
+        pool_count=0,
         active_target=args.active_min_count,
-        pool_target=args.pool_min_count,
+        pool_target=0,
         active_shortage=final_active_shortage,
-        pool_shortage=final_pool_shortage,
+        pool_shortage=0,
         attempted_replenish=register_target > 0,
         register_target=register_target,
         replenished_count=replenished_count,
-        deleted_count=total_deleted_count,
-        active_deleted_count=deleted_count,
-        pool_deleted_count=pool_deleted_count + deleted_from_pool_before + deleted_from_pool_after,
-        moved_to_active_count=moved_before_register + moved_after_register,
-        active_check_failed=check_failed,
-        pool_check_failed=pool_check_failed,
+        deleted_count=0,
+        active_deleted_count=0,
+        pool_deleted_count=0,
+        moved_to_active_count=0,
+        active_check_failed=0,
+        pool_check_failed=0,
     )
 
 
