@@ -3,11 +3,12 @@
   "_usage": [
     "将本文件复制为 monitor_config.json 并修改其中的值即可。",
     "当前巡检只维护 A 目录：不做删号、不查额度、不维护 B 目录。",
+    "不要再使用旧版字段或参数：pool_min_count / usage_threshold。",
     "命令行参数优先于配置文件。配置文件中未设置的项使用代码默认值。"
   ],
 
   "_section_paths": "===== A 目录配置 =====",
-  "active_token_dir": "/home/cpa/CLIProxyAPI/auths",
+  "active_token_dir": "/data/openai_register/auths",
 
   "_section_thresholds": "===== A 目录目标 =====",
   "active_min_count": 20,
@@ -27,7 +28,7 @@
 
   "_section_cfmail": "===== temp-mail 兼容配置 =====",
   "cfmail_profile": "auto",
-  "cfmail_config": "",
+  "cfmail_config": "/data/openai_register/cfmail_accounts.json",
   "cfmail_fail_threshold": 3,
   "cfmail_cooldown_seconds": 300,
 

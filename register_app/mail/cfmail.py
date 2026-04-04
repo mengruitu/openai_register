@@ -1,12 +1,16 @@
+import concurrent.futures
+import email
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from email.header import decode_header
 from typing import Any, Dict, List, Optional, Set
 
 from curl_cffi import requests
@@ -179,11 +183,30 @@ def _normalize_cfmail_account(raw: Dict[str, Any]) -> Optional[CfmailAccount]:
     if not name:
         name = DEFAULT_CFMAIL_PROFILE_NAME
 
+    worker_domain_raw = raw.get("worker_domain") or raw.get("WORKER_DOMAIN")
+    email_domain_raw = raw.get("email_domain") or raw.get("EMAIL_DOMAIN")
+    admin_password_raw = raw.get("admin_password") or raw.get("ADMIN_PASSWORD")
+
+    if (
+        worker_domain_raw is None
+        and email_domain_raw is None
+        and admin_password_raw is None
+    ):
+        worker_domain = DEFAULT_CFMAIL_WORKER_DOMAIN
+        email_domain = DEFAULT_CFMAIL_EMAIL_DOMAIN
+        admin_password = DEFAULT_CFMAIL_ADMIN_PASSWORD
+    else:
+        worker_domain = normalize_host(worker_domain_raw or "")
+        email_domain = normalize_host(email_domain_raw or "")
+        admin_password = str(admin_password_raw or "").strip()
+        if not worker_domain or not email_domain or not admin_password:
+            return None
+
     return CfmailAccount(
         name=name,
-        worker_domain=DEFAULT_CFMAIL_WORKER_DOMAIN,
-        email_domain=DEFAULT_CFMAIL_EMAIL_DOMAIN,
-        admin_password=DEFAULT_CFMAIL_ADMIN_PASSWORD,
+        worker_domain=worker_domain,
+        email_domain=email_domain,
+        admin_password=admin_password,
     )
 
 
@@ -203,10 +226,24 @@ def build_cfmail_accounts(raw_accounts: List[Dict[str, Any]]) -> List[CfmailAcco
         seen_names.add(key)
         accounts.append(account)
 
+    env_worker_domain = normalize_host(os.getenv("CFMAIL_WORKER_DOMAIN", ""))
+    env_email_domain = normalize_host(os.getenv("CFMAIL_EMAIL_DOMAIN", ""))
+    env_admin_password = str(os.getenv("CFMAIL_ADMIN_PASSWORD", "")).strip()
     env_profile_name = (
         str(os.getenv("CFMAIL_PROFILE_NAME", DEFAULT_CFMAIL_PROFILE_NAME)).strip()
         or DEFAULT_CFMAIL_PROFILE_NAME
     )
+    if env_worker_domain and env_email_domain and env_admin_password:
+        env_account = CfmailAccount(
+            name=env_profile_name,
+            worker_domain=env_worker_domain,
+            email_domain=env_email_domain,
+            admin_password=env_admin_password,
+        )
+        env_key = env_account.name.lower()
+        accounts = [account for account in accounts if account.name.lower() != env_key]
+        accounts.insert(0, env_account)
+
     if not accounts:
         accounts = [_default_cfmail_account(env_profile_name)]
 
@@ -270,7 +307,7 @@ def record_cfmail_failure(account_name: str, reason: str = "") -> None:
 def set_cfmail_accounts(accounts: List[CfmailAccount]) -> None:
     global CFMAIL_ACCOUNTS, _cfmail_account_index
     normalized_accounts = [
-        _default_cfmail_account(getattr(account, "name", DEFAULT_CFMAIL_PROFILE_NAME))
+        account
         for account in (accounts or [])
         if getattr(account, "name", "")
     ]
@@ -360,7 +397,7 @@ def reload_cfmail_accounts_if_needed(force: bool = False) -> bool:
         new_names = cfmail_account_names()
         if force or old_names != new_names:
             logger.info(
-                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [信息] cfmail 已切换为 temp-mail.org 兼容模式：{new_names}"
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [信息] cfmail 配置已生效：{new_names}"
             )
         return True
 
@@ -381,6 +418,68 @@ def _build_request_proxies(proxy: Any) -> Any:
     if isinstance(proxy, dict):
         return proxy
     return {"http": proxy, "https": proxy}
+
+
+def _normalize_api_base(api_base: str) -> str:
+    value = str(api_base or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if value.startswith(("https://", "http://")):
+        return value
+    return f"https://{normalize_host(value)}"
+
+
+def _is_tempmail_account(account: Optional[CfmailAccount]) -> bool:
+    if not account:
+        return True
+    return (
+        normalize_host(account.worker_domain) == normalize_host(DEFAULT_CFMAIL_WORKER_DOMAIN)
+        and normalize_host(account.email_domain) == normalize_host(DEFAULT_CFMAIL_EMAIL_DOMAIN)
+        and str(account.admin_password or "").strip() == DEFAULT_CFMAIL_ADMIN_PASSWORD
+    )
+
+
+def _is_tempmail_api_base(api_base: str) -> bool:
+    normalized = _normalize_api_base(api_base)
+    if not normalized:
+        return normalize_host(CFMAIL_WORKER_DOMAIN) == normalize_host(DEFAULT_CFMAIL_WORKER_DOMAIN)
+    return normalize_host(normalized) == normalize_host(TEMPMAIL_BASE_URL)
+
+
+def _request_cfmail_api(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    proxies: Any = None,
+    timeout: int = 15,
+) -> Any:
+    resolved_proxies = _build_request_proxies(proxies)
+    last_error: Optional[Exception] = None
+
+    for candidate_proxies in ([resolved_proxies, None] if resolved_proxies else [None]):
+        try:
+            return requests.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                proxies=candidate_proxies,
+                impersonate="chrome",
+                timeout=timeout,
+            )
+        except Exception as exc:
+            last_error = exc
+            if candidate_proxies is None:
+                break
+            logger.warning(f"[cfmail] 代理请求失败，尝试直连回退: {exc}")
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"请求 cfmail 失败: {url}")
 
 
 def _tempmail_min_interval(path: str) -> float:
@@ -533,6 +632,60 @@ def _extract_cfmail_subject_and_content(message: Dict[str, Any]) -> tuple[str, s
     return subject, content
 
 
+def _decode_mime_header_value(value: str) -> str:
+    parts = []
+    for chunk, charset in decode_header(str(value or "")):
+        if isinstance(chunk, bytes):
+            parts.append(chunk.decode(charset or "utf-8", errors="replace"))
+        else:
+            parts.append(str(chunk))
+    return "".join(parts)
+
+
+def _decode_cfmail_message_content(raw: str) -> str:
+    try:
+        message_obj = email.message_from_string(str(raw or ""))
+    except Exception:
+        return str(raw or "")
+
+    parts: List[str] = []
+    subject = _decode_mime_header_value(message_obj.get("Subject", ""))
+    if subject:
+        parts.append(subject)
+
+    iter_parts = message_obj.walk() if message_obj.is_multipart() else [message_obj]
+    for part in iter_parts:
+        if getattr(part, "is_multipart", lambda: False)():
+            continue
+
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            payload = str(part.get_payload() or "").encode("utf-8", errors="ignore")
+
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            decoded = payload.decode(charset, errors="replace")
+        except Exception:
+            decoded = payload.decode("utf-8", errors="replace")
+
+        if decoded:
+            parts.append(decoded)
+
+    content = "\n".join(part for part in parts if part)
+    return content or str(raw or "")
+
+
+def _extract_cfmail_raw_subject_and_content(raw: str) -> tuple[str, str]:
+    try:
+        message_obj = email.message_from_string(str(raw or ""))
+    except Exception:
+        return "", str(raw or "")
+
+    subject = _decode_mime_header_value(message_obj.get("Subject", "")).strip()
+    content = _decode_cfmail_message_content(raw)
+    return subject, content
+
+
 def _extract_cfmail_oai_code(subject: str, content: str) -> str:
     text = "\n".join([str(subject or ""), str(content or "")])
     patterns = [
@@ -560,10 +713,66 @@ def _test_single_cfmail_account(
     account: CfmailAccount, proxy: Optional[str] = None
 ) -> bool:
     logger.info(f"\n[cfmail测试] 开始测试配置: {account.name}")
-    logger.info(f"[cfmail测试] temp-mail base={TEMPMAIL_BASE_URL}")
+    if _is_tempmail_account(account):
+        logger.info(f"[cfmail测试] temp-mail base={TEMPMAIL_BASE_URL}")
+        try:
+            create_resp = _request_tempmail("POST", "/mailbox", proxies=proxy, timeout=20)
+            if create_resp.status_code != 200:
+                logger.info(
+                    f"[cfmail测试] 失败：创建邮箱返回 {create_resp.status_code}，响应={create_resp.text[:300]}"
+                )
+                return False
 
+            data = create_resp.json() if create_resp.content else {}
+            address = str(data.get("mailbox") or data.get("address") or data.get("email") or "").strip()
+            jwt = str(data.get("token") or "").strip()
+            if not address or not jwt:
+                logger.info("[cfmail测试] 失败：创建邮箱成功但返回 mailbox/token 不完整")
+                return False
+
+            logger.info(f"[cfmail测试] 创建成功: {address}")
+
+            poll_resp = _request_tempmail(
+                "GET",
+                "/messages",
+                jwt=jwt,
+                proxies=proxy,
+                timeout=20,
+            )
+            if poll_resp.status_code != 200:
+                logger.info(
+                    f"[cfmail测试] 失败：轮询接口返回 {poll_resp.status_code}，响应={poll_resp.text[:300]}"
+                )
+                return False
+
+            poll_data = poll_resp.json() if poll_resp.content else {}
+            messages = _extract_message_list(poll_data)
+            logger.info(f"[cfmail测试] 轮询成功: count={len(messages)}")
+            return True
+        except Exception as e:
+            logger.info(f"[cfmail测试] 失败：{account.name} 测试异常: {e}")
+            return False
+
+    logger.info(
+        f"[cfmail测试] worker_domain={account.worker_domain} email_domain={account.email_domain}"
+    )
     try:
-        create_resp = _request_tempmail("POST", "/mailbox", proxies=proxy, timeout=20)
+        local = f"codextest{secrets.token_hex(4)}"
+        create_resp = _request_cfmail_api(
+            "POST",
+            f"https://{account.worker_domain}/admin/new_address",
+            headers={
+                "x-admin-auth": account.admin_password,
+                **cfmail_headers(use_json=True),
+            },
+            json_body={
+                "enablePrefix": True,
+                "name": local,
+                "domain": account.email_domain,
+            },
+            proxies=proxy,
+            timeout=20,
+        )
         if create_resp.status_code != 200:
             logger.info(
                 f"[cfmail测试] 失败：创建邮箱返回 {create_resp.status_code}，响应={create_resp.text[:300]}"
@@ -571,18 +780,19 @@ def _test_single_cfmail_account(
             return False
 
         data = create_resp.json() if create_resp.content else {}
-        address = str(data.get("mailbox") or data.get("address") or data.get("email") or "").strip()
-        jwt = str(data.get("token") or "").strip()
+        address = str(data.get("address") or "").strip()
+        jwt = str(data.get("jwt") or "").strip()
         if not address or not jwt:
-            logger.info("[cfmail测试] 失败：创建邮箱成功但返回 mailbox/token 不完整")
+            logger.info("[cfmail测试] 失败：创建邮箱成功但返回 address/jwt 不完整")
             return False
 
         logger.info(f"[cfmail测试] 创建成功: {address}")
 
-        poll_resp = _request_tempmail(
+        poll_resp = _request_cfmail_api(
             "GET",
-            "/messages",
-            jwt=jwt,
+            f"https://{account.worker_domain}/api/mails",
+            params={"limit": 5, "offset": 0},
+            headers=cfmail_headers(jwt=jwt, use_json=True),
             proxies=proxy,
             timeout=20,
         )
@@ -593,8 +803,8 @@ def _test_single_cfmail_account(
             return False
 
         poll_data = poll_resp.json() if poll_resp.content else {}
-        messages = _extract_message_list(poll_data)
-        logger.info(f"[cfmail测试] 轮询成功: count={len(messages)}")
+        count = poll_data.get("count", 0) if isinstance(poll_data, dict) else 0
+        logger.info(f"[cfmail测试] 轮询成功: count={count}")
         return True
     except Exception as e:
         logger.info(f"[cfmail测试] 失败：{account.name} 测试异常: {e}")
@@ -627,8 +837,17 @@ def run_cfmail_self_test(
     logger.info(
         f"[cfmail测试] 共需测试 {len(selected_accounts)} 个配置: {cfmail_account_names(selected_accounts)}"
     )
-
-    passed = sum(1 for account in selected_accounts if _test_single_cfmail_account(account, proxy))
+    if len(selected_accounts) == 1:
+        passed = 1 if _test_single_cfmail_account(selected_accounts[0], proxy) else 0
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(selected_accounts), 4),
+        ) as executor:
+            futures = [
+                executor.submit(_test_single_cfmail_account, account, proxy)
+                for account in selected_accounts
+            ]
+            passed = sum(1 for future in concurrent.futures.as_completed(futures) if future.result())
     logger.info(
         f"\n[cfmail测试] 测试完成：成功 {passed} / {len(selected_accounts)}，失败 {len(selected_accounts) - passed}"
     )
@@ -646,60 +865,142 @@ def create_cfmail_mailbox(
         )
         return None
 
+    if _is_tempmail_account(selected_account):
+        try:
+            resp = _request_tempmail("POST", "/mailbox", proxies=proxies, timeout=15)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[线程 {thread_id}] [警告] temp-mail 邮箱创建失败，状态码: {resp.status_code}，响应: {resp.text[:300]}"
+                )
+                record_cfmail_failure(selected_account.name, f"mailbox status={resp.status_code}")
+                return None
+
+            data = resp.json() if resp.content else {}
+            email = str(data.get("mailbox") or data.get("address") or data.get("email") or "").strip()
+            token = str(data.get("token") or "").strip()
+            if not email or not token:
+                logger.warning(f"[线程 {thread_id}] [警告] temp-mail 返回数据不完整")
+                record_cfmail_failure(selected_account.name, "mailbox incomplete data")
+                return None
+
+            logger.info(
+                f"[线程 {thread_id}] [信息] 使用 temp-mail.org 兼容配置[{selected_account.name}]: {email}"
+            )
+            record_cfmail_success(selected_account.name)
+            return TempMailbox(
+                email=email,
+                provider="cfmail",
+                token=token,
+                api_base=TEMPMAIL_BASE_URL,
+                domain=email.split("@", 1)[-1] if "@" in email else DEFAULT_CFMAIL_EMAIL_DOMAIN,
+                config_name=selected_account.name,
+            )
+        except Exception as e:
+            logger.warning(f"[线程 {thread_id}] [警告] 请求 temp-mail API 出错: {e}")
+            record_cfmail_failure(selected_account.name, f"mailbox exception: {e}")
+            return None
+
     try:
-        resp = _request_tempmail("POST", "/mailbox", proxies=proxies, timeout=15)
+        local = f"oc{secrets.token_hex(5)}"
+        resp = _request_cfmail_api(
+            "POST",
+            f"https://{selected_account.worker_domain}/admin/new_address",
+            headers={
+                "x-admin-auth": selected_account.admin_password,
+                **cfmail_headers(use_json=True),
+            },
+            json_body={
+                "enablePrefix": True,
+                "name": local,
+                "domain": selected_account.email_domain,
+            },
+            proxies=proxies,
+            timeout=15,
+        )
         if resp.status_code != 200:
             logger.warning(
-                f"[线程 {thread_id}] [警告] temp-mail 邮箱创建失败，状态码: {resp.status_code}，响应: {resp.text[:300]}"
+                f"[线程 {thread_id}] [警告] 自建邮箱[{selected_account.name}]创建失败，状态码: {resp.status_code}，响应: {resp.text[:300]}"
             )
-            record_cfmail_failure(selected_account.name, f"mailbox status={resp.status_code}")
+            record_cfmail_failure(selected_account.name, f"new_address status={resp.status_code}")
             return None
 
         data = resp.json() if resp.content else {}
-        email = str(data.get("mailbox") or data.get("address") or data.get("email") or "").strip()
-        token = str(data.get("token") or "").strip()
-        if not email or not token:
-            logger.warning(f"[线程 {thread_id}] [警告] temp-mail 返回数据不完整")
-            record_cfmail_failure(selected_account.name, "mailbox incomplete data")
+        email = str(data.get("address") or "").strip()
+        jwt = str(data.get("jwt") or "").strip()
+        if not email or not jwt:
+            logger.warning(f"[线程 {thread_id}] [警告] 自建邮箱[{selected_account.name}]返回数据不完整")
+            record_cfmail_failure(selected_account.name, "new_address incomplete data")
             return None
 
-        logger.info(
-            f"[线程 {thread_id}] [信息] cfmail 已禁用，当前改用 temp-mail.org: {email}"
-        )
+        record_cfmail_success(selected_account.name)
         return TempMailbox(
             email=email,
             provider="cfmail",
-            token=token,
-            api_base=TEMPMAIL_BASE_URL,
-            domain=email.split("@", 1)[-1] if "@" in email else DEFAULT_CFMAIL_EMAIL_DOMAIN,
+            token=jwt,
+            api_base=f"https://{selected_account.worker_domain}",
+            domain=selected_account.email_domain,
             config_name=selected_account.name,
         )
     except Exception as e:
-        logger.warning(f"[线程 {thread_id}] [警告] 请求 temp-mail API 出错: {e}")
-        record_cfmail_failure(selected_account.name, f"mailbox exception: {e}")
+        logger.warning(f"[线程 {thread_id}] [警告] 请求自建邮箱[{selected_account.name}] API 出错: {e}")
+        record_cfmail_failure(selected_account.name, f"new_address exception: {e}")
         return None
 
 
 def list_cfmail_message_ids(
     *, api_base: str, token: str, email: str, proxies: Any = None
 ) -> Set[str]:
-    _ = api_base, email
+    resolved_api_base = _normalize_api_base(api_base)
     if not token:
         return set()
 
+    if not resolved_api_base:
+        worker_domain = normalize_host(CFMAIL_WORKER_DOMAIN)
+        resolved_api_base = f"https://{worker_domain}" if worker_domain else ""
+    if not resolved_api_base:
+        return set()
+
+    if _is_tempmail_api_base(resolved_api_base):
+        try:
+            resp = _request_tempmail(
+                "GET",
+                "/messages",
+                jwt=token,
+                proxies=proxies,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return set()
+            data = resp.json() if resp.content else {}
+            messages = _extract_message_list(data)
+            return {_message_uid(msg) for msg in messages}
+        except Exception:
+            return set()
+
     try:
-        resp = _request_tempmail(
+        resp = _request_cfmail_api(
             "GET",
-            "/messages",
-            jwt=token,
+            f"{resolved_api_base}/api/mails",
+            params={"limit": 20, "offset": 0},
+            headers=cfmail_headers(jwt=token, use_json=True),
             proxies=proxies,
             timeout=15,
         )
         if resp.status_code != 200:
             return set()
         data = resp.json() if resp.content else {}
-        messages = _extract_message_list(data)
-        return {_message_uid(msg) for msg in messages}
+        messages = data.get("results", []) if isinstance(data, dict) else []
+        if not isinstance(messages, list):
+            return set()
+        return {
+            str((msg.get("id") or msg.get("createdAt") or "")).strip()
+            for msg in messages
+            if isinstance(msg, dict)
+            and (
+                not str(msg.get("address") or "").strip()
+                or str(msg.get("address") or "").strip().lower() == email.strip().lower()
+            )
+        }
     except Exception:
         return set()
 
@@ -714,9 +1015,16 @@ def poll_cfmail_oai_code(
     skip_message_ids: Optional[Set[str]] = None,
     skip_codes: Optional[Set[str]] = None,
 ) -> str:
-    _ = api_base
+    resolved_api_base = _normalize_api_base(api_base)
     if not token:
         logger.error(f"[线程 {thread_id}] [错误] temp-mail token 为空，无法轮询邮件")
+        return ""
+
+    if not resolved_api_base:
+        worker_domain = normalize_host(CFMAIL_WORKER_DOMAIN)
+        resolved_api_base = f"https://{worker_domain}" if worker_domain else ""
+    if not resolved_api_base:
+        logger.error(f"[线程 {thread_id}] [错误] cfmail api_base 为空，无法轮询邮件")
         return ""
 
     seen_ids: Set[str] = set(str(x).strip() for x in (skip_message_ids or set()) if str(x).strip())
@@ -725,58 +1033,122 @@ def poll_cfmail_oai_code(
     _log_waiting_code_start(thread_id, email)
     reset_mailbox_wait_diagnostics("cfmail", email)
 
-    poll_interval_seconds = TEMPMAIL_POLL_MIN_INTERVAL_SECONDS
-    max_polls = max(1, int(TEMPMAIL_MAX_WAIT_SECONDS // max(1.0, poll_interval_seconds)))
+    if _is_tempmail_api_base(resolved_api_base):
+        poll_interval_seconds = TEMPMAIL_POLL_MIN_INTERVAL_SECONDS
+        max_polls = max(1, int(TEMPMAIL_MAX_WAIT_SECONDS // max(1.0, poll_interval_seconds)))
 
-    for _ in range(max_polls):
-        increment_mailbox_wait_poll("cfmail", email)
-        try:
-            resp = _request_tempmail(
-                "GET",
-                "/messages",
-                jwt=token,
-                proxies=proxies,
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                time.sleep(poll_interval_seconds)
-                continue
-
-            data = resp.json() if resp.content else {}
-            messages = _extract_message_list(data)
-            note_mailbox_messages_scanned("cfmail", email, len(messages))
-
-            for msg in messages:
-                msg_id = _message_uid(msg)
-                if not msg_id or msg_id in seen_ids:
-                    continue
-                seen_ids.add(msg_id)
-
-                subject, decoded_content = _extract_cfmail_subject_and_content(msg)
-                lowered_subject = subject.lower()
-                lowered_content = decoded_content.lower()
-                if any(
-                    marker in lowered_subject or marker in lowered_content
-                    for marker in CFMAIL_REMINDER_MARKERS
-                ):
+        for _ in range(max_polls):
+            increment_mailbox_wait_poll("cfmail", email)
+            try:
+                resp = _request_tempmail(
+                    "GET",
+                    "/messages",
+                    jwt=token,
+                    proxies=proxies,
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    time.sleep(poll_interval_seconds)
                     continue
 
-                code = _extract_cfmail_oai_code(subject, decoded_content)
-                if not code:
-                    if not _contains_cfmail_keyword(subject, decoded_content):
+                data = resp.json() if resp.content else {}
+                messages = _extract_message_list(data)
+                note_mailbox_messages_scanned("cfmail", email, len(messages))
+
+                for msg in messages:
+                    msg_id = _message_uid(msg)
+                    if not msg_id or msg_id in seen_ids:
                         continue
+                    seen_ids.add(msg_id)
+
+                    subject, decoded_content = _extract_cfmail_subject_and_content(msg)
+                    lowered_subject = subject.lower()
+                    lowered_content = decoded_content.lower()
+                    if any(
+                        marker in lowered_subject or marker in lowered_content
+                        for marker in CFMAIL_REMINDER_MARKERS
+                    ):
+                        continue
+
                     code = _extract_cfmail_oai_code(subject, decoded_content)
+                    if not code:
+                        if not _contains_cfmail_keyword(subject, decoded_content):
+                            continue
+                        code = _extract_cfmail_oai_code(subject, decoded_content)
 
-                if code:
-                    if code in ignored_codes:
+                    if code:
+                        if code in ignored_codes:
+                            continue
+                        mark_mailbox_wait_matched("cfmail", email, code=code)
+                        _log_waiting_code_success(thread_id, code)
+                        return code
+            except Exception:
+                pass
+
+            time.sleep(poll_interval_seconds)
+    else:
+        for _ in range(40):
+            increment_mailbox_wait_poll("cfmail", email)
+            try:
+                resp = _request_cfmail_api(
+                    "GET",
+                    f"{resolved_api_base}/api/mails",
+                    params={"limit": 10, "offset": 0},
+                    headers=cfmail_headers(jwt=token, use_json=True),
+                    proxies=proxies,
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    time.sleep(3)
+                    continue
+
+                data = resp.json() if resp.content else {}
+                messages = data.get("results", []) if isinstance(data, dict) else []
+                if not isinstance(messages, list):
+                    time.sleep(3)
+                    continue
+                note_mailbox_messages_scanned("cfmail", email, len(messages))
+
+                for msg in messages:
+                    if not isinstance(msg, dict):
                         continue
-                    mark_mailbox_wait_matched("cfmail", email, code=code)
-                    _log_waiting_code_success(thread_id, code)
-                    return code
-        except Exception:
-            pass
 
-        time.sleep(poll_interval_seconds)
+                    msg_id = str(msg.get("id") or msg.get("createdAt") or "").strip()
+                    if not msg_id or msg_id in seen_ids:
+                        continue
+                    seen_ids.add(msg_id)
+
+                    recipient = str(msg.get("address") or "").strip().lower()
+                    raw = str(msg.get("raw") or "")
+                    metadata = msg.get("metadata") or {}
+                    subject, decoded_content = _extract_cfmail_raw_subject_and_content(raw)
+
+                    if recipient and recipient != email.strip().lower():
+                        continue
+                    lowered_subject = subject.lower()
+                    lowered_content = decoded_content.lower()
+                    if any(
+                        marker in lowered_subject or marker in lowered_content
+                        for marker in CFMAIL_REMINDER_MARKERS
+                    ):
+                        continue
+
+                    if not _contains_cfmail_keyword(recipient, subject, decoded_content):
+                        metadata_text = json.dumps(metadata, ensure_ascii=False) if metadata else ""
+                        if not _contains_cfmail_keyword(metadata_text):
+                            continue
+
+                    code = _extract_cfmail_oai_code(subject, decoded_content)
+                    if code:
+                        if code in ignored_codes:
+                            continue
+                        mark_mailbox_wait_matched("cfmail", email, code=code)
+                        _log_waiting_code_success(thread_id, code)
+                        return code
+            except Exception:
+                pass
+
+            time.sleep(3)
 
     mark_mailbox_wait_timeout(
         "cfmail",

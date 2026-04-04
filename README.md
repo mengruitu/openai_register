@@ -4,7 +4,7 @@
 
 - 维护 **A 目录** 账号池
 - 库存不足时自动补号
-- 使用 `temp-mail.org` 兼容邮箱逻辑
+- 支持 `temp-mail.org` 兼容邮箱和自建 cfmail worker
 - 默认慢速注册，优先稳定性
 
 ## 当前行为
@@ -22,7 +22,7 @@
 - `openai_register.py`
   CLI 入口
 - `register_app/mail/cfmail.py`
-  `temp-mail.org` 兼容邮箱逻辑
+  `temp-mail.org` / 自建 cfmail worker 邮箱逻辑
 - `register_app/registration/flow.py`
   注册主流程
 - `register_app/runtime/tasks.py`
@@ -71,6 +71,36 @@ python openai_register.py --status
 
 ```bash
 python openai_register.py --test-cfmail
+```
+
+### 7. cfmail 配置说明
+
+- 默认 temp-mail.org 兼容模式：
+  - `worker_domain = web2.temp-mail.org`
+  - `email_domain = temp-mail.org`
+  - `admin_password = disabled`
+- 自建 cfmail worker 模式：
+  - 在 `cfmail_accounts.json` 中填写真实的 `worker_domain / email_domain / admin_password`
+
+## systemd 服务模板
+
+当前 `monitor.service` 对应的启动方式：
+
+```ini
+ExecStart=/data/openai_register/.venv/bin/python /data/openai_register/openai_register.py --monitor --config /data/openai_register/monitor_config.json
+```
+
+注意：旧版参数已经移除，不要再在 service 或 override 里追加：
+
+- `--pool-min-count`
+- `--usage-threshold`
+
+修改 unit 后请执行：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart openai-register
+sudo systemctl status openai-register
 ```
 
 ## monitor_config 关键配置

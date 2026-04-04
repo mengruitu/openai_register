@@ -9,8 +9,8 @@ Type=simple
 User=root
 WorkingDirectory=/data/openai_register
 # 请先执行 bash ctl.sh deps 或 bash ctl.sh install 创建 .venv
-# 如需代理、阈值、自定义配置文件，请修改 monitor_config.json
-# 可追加 --dingtalk-webhook <URL> 设置钉钉通知
+# 当前服务为 A-only 巡检模式；运行参数统一放在 monitor_config.json
+# 不要再追加旧版参数：--pool-min-count / --usage-threshold
 ExecStart=/data/openai_register/.venv/bin/python /data/openai_register/openai_register.py --monitor --config /data/openai_register/monitor_config.json
 Restart=always
 RestartSec=10
