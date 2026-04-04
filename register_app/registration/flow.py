@@ -48,7 +48,6 @@ from .common import (
     _post_create_account_with_retry,
     _preview_response_text,
     _response_json_object,
-    get_auto_proxy,
 )
 from .mailbox import (
     get_mailbox_message_snapshot,
@@ -148,16 +147,9 @@ def run(
 
         if loc in ("CN", "HK"):
             if builtins.yasal_bypass_ip_choice:
-                logger.warning(f"[线程 {thread_id}] [警告] 当前地区 {loc} 风险较高，尝试自动检测本地代理")
-                if not proxy:
-                    auto_p = get_auto_proxy()
-                    if auto_p:
-                        proxies = {"http": auto_p, "https": auto_p}
-                        s.proxies = proxies
-                        result.metadata["registration_proxy_url"] = auto_p
-                        logger.info(f"[线程 {thread_id}] [信息] 已自动启用本地代理: {auto_p}")
-                    else:
-                        logger.warning(f"[线程 {thread_id}] [警告] 未检测到可用本地代理端口，将继续直连")
+                logger.warning(
+                    f"[线程 {thread_id}] [警告] 当前地区 {loc} 风险较高，但未显式设置代理；按直连继续执行"
+                )
             else:
                 return _fail(
                     "network_check",
