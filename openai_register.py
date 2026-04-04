@@ -14,6 +14,8 @@ import argparse
 import builtins
 import json
 import logging
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -68,6 +70,136 @@ from register_app.runtime import (
 logger = logging.getLogger("openai_register")
 
 builtins.yasal_bypass_ip_choice = True
+
+
+def _resolve_cfmail_process_profiles(selected_profile: str) -> list[str]:
+    accounts = get_cfmail_accounts()
+    if not accounts:
+        return []
+
+    profile_name = str(selected_profile or "auto").strip() or "auto"
+    if profile_name.lower() != "auto":
+        matched = _select_cfmail_account(profile_name)
+        return [matched.name] if matched else []
+
+    return [account.name for account in accounts if str(account.name or "").strip()]
+
+
+def _build_cfmail_profile_worker_command(
+    args: argparse.Namespace,
+    *,
+    profile_name: str,
+    sleep_min: int,
+    sleep_max: int,
+) -> list[str]:
+    command = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--config",
+        str(args.config),
+        "--register-only",
+        "--mail-provider",
+        "cfmail",
+        "--cfmail-config",
+        str(args.cfmail_config),
+        "--cfmail-profile",
+        str(profile_name),
+        "--sleep-min",
+        str(sleep_min),
+        "--sleep-max",
+        str(sleep_max),
+        "--failure-sleep-seconds",
+        str(args.failure_sleep_seconds),
+        "--mailtm-api-base",
+        str(args.mailtm_api_base),
+        "--token-dir",
+        str(args.token_dir),
+        "--register-openai-concurrency",
+        "1",
+        "--register-start-delay-seconds",
+        "0",
+        "--dingtalk-fallback-interval",
+        str(args.dingtalk_fallback_interval),
+        "--cfmail-fail-threshold",
+        str(args.cfmail_fail_threshold),
+        "--cfmail-cooldown-seconds",
+        str(args.cfmail_cooldown_seconds),
+    ]
+
+    if args.proxy:
+        command.extend(["--proxy", str(args.proxy)])
+    if args.once:
+        command.append("--once")
+    if args.auto_continue_non_us:
+        command.append("--auto-continue-non-us")
+    if args.dingtalk_webhook:
+        command.extend(["--dingtalk-webhook", str(args.dingtalk_webhook)])
+
+    return command
+
+
+def _run_cfmail_profile_processes(
+    args: argparse.Namespace,
+    *,
+    sleep_min: int,
+    sleep_max: int,
+) -> bool:
+    profile_names = _resolve_cfmail_process_profiles(args.cfmail_profile)
+    if len(profile_names) <= 1:
+        return False
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    processes: list[tuple[str, subprocess.Popen]] = []
+    log_info(
+        f"cfmail 多配置注册模式启动：共 {len(profile_names)} 个独立进程，配置={', '.join(profile_names)}"
+    )
+
+    try:
+        for index, profile_name in enumerate(profile_names, start=1):
+            command = _build_cfmail_profile_worker_command(
+                args,
+                profile_name=profile_name,
+                sleep_min=sleep_min,
+                sleep_max=sleep_max,
+            )
+            process = subprocess.Popen(command, cwd=script_dir)
+            processes.append((profile_name, process))
+            log_info(
+                f"[父进程] 已启动 cfmail 子进程 #{index}：profile={profile_name} pid={process.pid}"
+            )
+            if args.register_start_delay_seconds > 0 and index < len(profile_names):
+                time.sleep(args.register_start_delay_seconds)
+
+        while processes:
+            alive_processes: list[tuple[str, subprocess.Popen]] = []
+            for profile_name, process in processes:
+                return_code = process.poll()
+                if return_code is None:
+                    alive_processes.append((profile_name, process))
+                    continue
+                log_info(
+                    f"[父进程] cfmail 子进程已退出：profile={profile_name} pid={process.pid} code={return_code}"
+                )
+
+            if not alive_processes:
+                break
+
+            processes = alive_processes
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("\n[信息] 收到中断信号，准备停止所有 cfmail 子进程")
+        for _profile_name, process in processes:
+            if process.poll() is not None:
+                continue
+            process.terminate()
+        deadline = time.time() + 10
+        for _profile_name, process in processes:
+            remaining_seconds = max(0.0, deadline - time.time())
+            try:
+                process.wait(timeout=remaining_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    return True
 
 
 def main() -> None:
@@ -427,7 +559,18 @@ def main() -> None:
         )
     logger.info(startup_message)
 
-    worker_count = min(3, args.register_openai_concurrency)
+    if (
+        args.mail_provider == "cfmail"
+        and args.cfmail_profile.lower() == "auto"
+        and _run_cfmail_profile_processes(
+            args,
+            sleep_min=sleep_min,
+            sleep_max=sleep_max,
+        )
+    ):
+        return
+
+    worker_count = 1 if args.mail_provider == "cfmail" else min(3, args.register_openai_concurrency)
     providers_list = [args.mail_provider for _ in range(worker_count)]
     threads = []
 
