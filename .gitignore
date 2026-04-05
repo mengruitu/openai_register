@@ -34,3 +34,7 @@ monitor_config.json
 
 # 测试/调试
 debug/
+
+output/
+emails.txt
+test_oauth.py
