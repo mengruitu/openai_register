@@ -1,0 +1,29 @@
+{
+  "_comment": "cfmail 配置示例。支持两种格式：1) 直接数组 [{...}]；2) 外层对象 {\"accounts\": [{...}]}（即本文件格式）。",
+  "_how_to_fill": [
+    "当前版本同时支持两种模式：1) temp-mail.org 兼容模式；2) 自建 cfmail worker 模式。",
+    "建议将本文件放在 /data/openai_register/cfmail_accounts.json，并在 monitor_config.json 中通过 cfmail_config 指向它。",
+    "name: 配置名（建议必填），例如 temp-mail-org、us-node-1。名称不可重复，重复时仅保留首个。",
+    "enabled: 可选，默认 true。设为 false 表示保留配置但暂不参与轮询。",
+    "temp-mail.org 兼容模式：worker_domain=web2.temp-mail.org，email_domain=temp-mail.org，admin_password=disabled。",
+    "自建 cfmail worker 模式：填写真实 worker_domain / email_domain / admin_password，代码会请求 https://<worker_domain>/admin/new_address 和 /api/mails。",
+    "支持热加载：运行中修改本文件后，下一轮检测会自动生效，无需重启。",
+    "auto 模式下会按顺序轮询配置；若未配置任何可用项，会回退到默认 temp-mail.org 配置。"
+  ],
+  "accounts": [
+    {
+      "name": "temp-mail-org",
+      "worker_domain": "web2.temp-mail.org",
+      "email_domain": "temp-mail.org",
+      "admin_password": "disabled",
+      "enabled": true
+    },
+    {
+      "name": "us-node-1",
+      "worker_domain": "apimail.example.com",
+      "email_domain": "example.com",
+      "admin_password": "replace-me",
+      "enabled": false
+    }
+  ]
+}
