@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from ..notifications import build_monitor_summary_message, send_dingtalk_alert
+from ..proxy import resolve_registration_proxy
 from .common import (
     DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
     MonitorCycleResult,
@@ -28,6 +29,8 @@ from .common import (
 
 def register_single_account(
     proxy: Optional[str],
+    proxy_api_url: Optional[str],
+    proxy_api_scheme: str,
     provider_key: str,
     thread_id: int,
     mailtm_base: str,
@@ -37,8 +40,13 @@ def register_single_account(
     dingtalk_fallback_interval_seconds: int = DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
 ) -> bool:
     try:
-        result, _used_provider = register_runner(
+        runtime_proxy = resolve_registration_proxy(
             proxy,
+            proxy_api_url,
+            proxy_api_scheme=proxy_api_scheme,
+        )
+        result, _used_provider = register_runner(
+            runtime_proxy,
             provider_key,
             thread_id,
             mailtm_base,
@@ -60,6 +68,8 @@ def register_single_account(
 def register_accounts(
     target_count: int,
     proxy: Optional[str],
+    proxy_api_url: Optional[str],
+    proxy_api_scheme: str,
     provider_key: str,
     mailtm_base: str,
     token_dir: str,
@@ -102,6 +112,8 @@ def register_accounts(
                 nonlocal batch_success_count
                 is_success = register_single_account(
                     proxy,
+                    proxy_api_url,
+                    proxy_api_scheme,
                     provider_key,
                     tid,
                     mailtm_base,
@@ -161,6 +173,8 @@ def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycl
         replenished_to_active = register_accounts(
             active_shortage,
             args.proxy,
+            args.proxy_api_url,
+            args.proxy_api_scheme,
             args.mail_provider,
             args.mailtm_api_base,
             args.active_token_dir,
@@ -215,6 +229,8 @@ def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycl
 def worker(
     thread_id: int,
     proxy: Optional[str],
+    proxy_api_url: Optional[str],
+    proxy_api_scheme: str,
     once: bool,
     sleep_min: int,
     sleep_max: int,
@@ -235,8 +251,13 @@ def worker(
         log_info(f"[线程 {thread_id}] 开始第 {count} 次任务（邮箱服务: {provider_key}）")
 
         try:
-            result, used_provider = register_runner(
+            runtime_proxy = resolve_registration_proxy(
                 proxy,
+                proxy_api_url,
+                proxy_api_scheme=proxy_api_scheme,
+            )
+            result, used_provider = register_runner(
+                runtime_proxy,
                 provider_key,
                 thread_id,
                 mailtm_base,

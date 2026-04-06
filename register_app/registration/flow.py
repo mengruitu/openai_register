@@ -24,6 +24,8 @@ from ..mail.cfmail import (
     reload_cfmail_accounts_if_needed as _reload_cfmail_accounts_if_needed,
 )
 from ..mail.dedupe import get_mailbox_dedupe_store
+from ..mail.imap_mail import remove_imap_account
+from ..result_store import append_register_failed, append_success_no_token
 from ..config import DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS
 from ..mail.providers import TempMailbox
 from ..sentinel import random_impersonate, request_sentinel_header
@@ -103,6 +105,24 @@ def run(
 
     def _resp_detail(resp: Any, limit: int = 500) -> str:
         return _preview_response_text(resp, limit=limit) or "(empty)"
+
+    def _persist_attempt_outcome(attempt_result: RegistrationAttemptResult) -> None:
+        payload = {
+            "email": attempt_result.email,
+            "provider": attempt_result.provider_key,
+            "stage": attempt_result.stage,
+            "error_code": attempt_result.error_code,
+            "error_message": attempt_result.error_message,
+            "metadata": attempt_result.metadata,
+        }
+        if attempt_result.stage in {"token_finalize", "add_phone_gate"}:
+            append_success_no_token(payload)
+            logger.info(
+                f"[线程 {thread_id}] [信息] 已记录“注册成功但未拿到 token”到 output/register_success_no_token.txt"
+            )
+            return
+        append_register_failed(payload)
+        logger.info(f"[线程 {thread_id}] [信息] 已记录注册失败到 output/register_failed.txt")
 
     if provider_key == "cfmail":
         _reload_cfmail_accounts_if_needed()
@@ -508,7 +528,13 @@ def run(
 
         if post_create_continue_url:
             _set_stage("token_continue_url")
-            token_json = try_token_via_continue_url(s, oauth, post_create_continue_url, thread_id)
+            token_json = try_token_via_continue_url(
+                s,
+                oauth,
+                post_create_continue_url,
+                thread_id,
+                proxies=proxies,
+            )
             if token_json:
                 token_source = "create_account_continue"
 
@@ -522,13 +548,24 @@ def run(
             _set_stage("token_workspace_select")
             auth_cookie = str(s.cookies.get("oai-client-auth-session") or "").strip()
             if auth_cookie:
-                token_json = try_token_via_workspace_select(s, oauth, auth_cookie, thread_id)
+                token_json = try_token_via_workspace_select(
+                    s,
+                    oauth,
+                    auth_cookie,
+                    thread_id,
+                    proxies=proxies,
+                )
                 if token_json:
                     token_source = "workspace_select"
 
         if not token_json:
             _set_stage("token_existing_session")
-            token_json = try_token_via_existing_session(s, oauth, thread_id)
+            token_json = try_token_via_existing_session(
+                s,
+                oauth,
+                thread_id,
+                proxies=proxies,
+            )
             if token_json:
                 token_source = "existing_session"
 
@@ -605,6 +642,14 @@ def run(
         logger.info(f"[线程 {thread_id}] [提示] 本轮失败，下一轮将继续重试")
         return _fail("exception", "unhandled_exception", str(e))
     finally:
+        if not result.success:
+            _persist_attempt_outcome(result)
+        if mailbox and mailbox.provider == "imap" and mailbox.email and mailbox.password:
+            removed = remove_imap_account(mailbox.email, mailbox.password)
+            if removed:
+                logger.info(f"[线程 {thread_id}] [信息] 已删除 emails.txt 中的已处理邮箱: {mailbox.email}")
+            else:
+                logger.warning(f"[线程 {thread_id}] [警告] 未能从 emails.txt 删除邮箱: {mailbox.email}")
         if reserved_mailbox_email:
             mailbox_dedupe_store.release(reserved_mailbox_email)
 

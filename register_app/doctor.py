@@ -18,6 +18,18 @@ from .runtime import count_json_files
 TRACE_URL = "https://cloudflare.com/cdn-cgi/trace"
 
 
+def _console_prefix() -> str:
+    return datetime.now().astimezone().strftime("[%Y-%m-%d %H:%M:%S]")
+
+
+def _print_console_line(message: str = "") -> None:
+    prefix = _console_prefix()
+    if message:
+        print(f"{prefix} {message}")
+    else:
+        print(prefix)
+
+
 @dataclass(frozen=True)
 class DoctorCheck:
     name: str
@@ -174,6 +186,8 @@ def build_status_snapshot(args: Any) -> dict[str, Any]:
         "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "config_path": str(args.config or "").strip(),
         "proxy": str(args.proxy or "").strip(),
+        "proxy_api_url": str(getattr(args, "proxy_api_url", "") or "").strip(),
+        "proxy_api_scheme": str(getattr(args, "proxy_api_scheme", "http") or "http").strip(),
         "mail_provider": str(args.mail_provider or "").strip(),
         "active": {
             "dir": str(args.active_token_dir or "").strip(),
@@ -224,13 +238,13 @@ def print_doctor_report(report: DoctorReport, *, output_json: bool = False) -> N
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
-    print("doctor 检查结果")
-    print(f"时间：{report.checked_at}")
+    _print_console_line("doctor 检查结果")
+    _print_console_line(f"时间：{report.checked_at}")
     for item in report.checks:
-        print(f"[{item.status.upper()}] {item.name}: {item.summary}")
+        _print_console_line(f"[{item.status.upper()}] {item.name}: {item.summary}")
         if item.detail:
-            print(f"  └─ {item.detail}")
-    print(f"汇总：error={report.error_count} warn={report.warn_count}")
+            _print_console_line(f"  └─ {item.detail}")
+    _print_console_line(f"汇总：error={report.error_count} warn={report.warn_count}")
 
 
 def print_status_snapshot(snapshot: dict[str, Any], *, output_json: bool = False) -> None:
@@ -238,21 +252,23 @@ def print_status_snapshot(snapshot: dict[str, Any], *, output_json: bool = False
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
         return
 
-    print("当前状态")
-    print(f"时间：{snapshot.get('checked_at', '')}")
-    print(f"配置：{snapshot.get('config_path', '') or '(默认/未指定)'}")
-    print(f"代理：{snapshot.get('proxy', '') or '(未显式设置)'}")
-    print(f"邮箱服务：{snapshot.get('mail_provider', '')}")
+    _print_console_line("当前状态")
+    _print_console_line(f"时间：{snapshot.get('checked_at', '')}")
+    _print_console_line(f"配置：{snapshot.get('config_path', '') or '(默认/未指定)'}")
+    _print_console_line(f"代理：{snapshot.get('proxy', '') or '(未显式设置)'}")
+    if snapshot.get("proxy_api_url"):
+        _print_console_line(f"代理API：{snapshot.get('proxy_api_url', '')} (scheme={snapshot.get('proxy_api_scheme', 'http')})")
+    _print_console_line(f"邮箱服务：{snapshot.get('mail_provider', '')}")
 
     active = snapshot.get("active") or {}
     output = snapshot.get("output") or {}
     runtime = snapshot.get("runtime") or {}
-    print(
+    _print_console_line(
         f"A目录：{active.get('count', 0)}/{active.get('target', 0)} "
         f"（缺 {active.get('shortage', 0)}） -> {active.get('dir', '')}"
     )
-    print(f"注册输出目录：{output.get('dir', '')}")
-    print(
+    _print_console_line(f"注册输出目录：{output.get('dir', '')}")
+    _print_console_line(
         "并发："
         f"register_batch_size={runtime.get('register_batch_size', 0)}, "
         f"register_openai_concurrency={runtime.get('register_openai_concurrency', 0)}"
@@ -260,7 +276,7 @@ def print_status_snapshot(snapshot: dict[str, Any], *, output_json: bool = False
     if snapshot.get("cfmail"):
         cfmail = snapshot["cfmail"]
         account_names = ",".join(item.get("name", "") for item in cfmail.get("accounts", []))
-        print(
+        _print_console_line(
             f"cfmail：profile={cfmail.get('profile_mode', '')} "
             f"selected={cfmail.get('selected', '') or '(auto)'} "
             f"accounts=[{account_names}]"

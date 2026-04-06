@@ -59,6 +59,7 @@ from register_app.config import (
     apply_low_memory_tuning,
     load_config_file,
 )
+from register_app.proxy import resolve_registration_proxy
 from register_app.registration import run_with_fallback
 from register_app.mail.providers import MAILTM_BASE
 from register_app.runtime import (
@@ -128,6 +129,9 @@ def _build_cfmail_profile_worker_command(
 
     if args.proxy:
         command.extend(["--proxy", str(args.proxy)])
+    if getattr(args, "proxy_api_url", ""):
+        command.extend(["--proxy-api-url", str(args.proxy_api_url)])
+        command.extend(["--proxy-api-scheme", str(args.proxy_api_scheme)])
     if args.once:
         command.append("--once")
     if args.auto_continue_non_us:
@@ -212,6 +216,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
+    )
+    parser.add_argument(
+        "--proxy-api-url",
+        default="",
+        help="住宅代理提取 API；配置后每次注册前都会重新提取一条新代理",
+    )
+    parser.add_argument(
+        "--proxy-api-scheme",
+        default="http",
+        choices=["http", "socks5", "socks5h"],
+        help="代理 API 返回 host:port 时使用的协议前缀，默认 http",
     )
     parser.add_argument("--once", action="store_true", help="注册模式只运行一次")
     parser.add_argument(
@@ -402,6 +417,13 @@ def main() -> None:
     args.cfmail_fail_threshold = max(1, args.cfmail_fail_threshold)
     args.cfmail_cooldown_seconds = max(0, args.cfmail_cooldown_seconds)
     apply_low_memory_tuning(args)
+    args.proxy_api_url = str(args.proxy_api_url or "").strip()
+    args.proxy_api_scheme = str(args.proxy_api_scheme or "http").strip().lower() or "http"
+    args.proxy = resolve_registration_proxy(
+        args.proxy,
+        None,
+        proxy_api_scheme=args.proxy_api_scheme,
+    )
     args.cfmail_profile = str(args.cfmail_profile or "auto").strip() or "auto"
     args.cfmail_profile_name = (
         str(args.cfmail_profile_name or "custom").strip() or "custom"
@@ -537,7 +559,7 @@ def main() -> None:
                 f"选择={args.cfmail_profile}"
             )
         log_info(
-            f"巡检模式启动：A目录={args.active_token_dir}，A阈值={args.active_min_count}，巡检间隔={args.monitor_interval}秒，注册并发={args.register_openai_concurrency}，批次={args.register_batch_size}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒{cfmail_desc}"
+            f"巡检模式启动：A目录={args.active_token_dir}，A阈值={args.active_min_count}，巡检间隔={args.monitor_interval}秒，注册并发={args.register_openai_concurrency}，批次={args.register_batch_size}，错峰={args.register_start_delay_seconds:.1f}秒，钉钉汇总间隔={args.dingtalk_summary_interval}秒，代理模式={'API动态提取' if args.proxy_api_url else (args.proxy or '直连')}{cfmail_desc}"
         )
         run_monitor_loop(
             args,
@@ -550,7 +572,7 @@ def main() -> None:
         builtins.yasal_bypass_ip_choice = True
 
     startup_message = (
-        f"[信息] 脚本启动：注册并发上限={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，邮箱服务={args.mail_provider}，Token目录={args.token_dir}"
+        f"[信息] 脚本启动：注册并发上限={args.register_openai_concurrency}，错峰={args.register_start_delay_seconds:.1f}秒，邮箱服务={args.mail_provider}，Token目录={args.token_dir}，代理模式={'API动态提取' if args.proxy_api_url else (args.proxy or '直连')}"
     )
     if args.mail_provider == "cfmail":
         startup_message += (
@@ -581,6 +603,8 @@ def main() -> None:
             args=(
                 i,
                 args.proxy,
+                args.proxy_api_url,
+                args.proxy_api_scheme,
                 args.once,
                 sleep_min,
                 sleep_max,

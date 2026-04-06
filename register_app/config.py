@@ -45,6 +45,8 @@ DEFAULT_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "monitor_config.json")
 # ---------------------------------------------------------------------------
 _CONFIG_KEY_MAP: Dict[str, str] = {
     "proxy": "proxy",
+    "proxy_api_url": "proxy_api_url",
+    "proxy_api_scheme": "proxy_api_scheme",
     "mail_provider": "mail_provider",
     "cfmail_profile": "cfmail_profile",
     "cfmail_config": "cfmail_config",

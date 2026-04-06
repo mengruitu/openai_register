@@ -155,6 +155,53 @@ def reload_imap_accounts() -> None:
         _imap_account_index = 0
 
 
+def remove_imap_account(
+    email_addr: str,
+    auth_code: str,
+    filepath: str = DEFAULT_EMAILS_FILE,
+) -> bool:
+    """从 emails.txt 删除一个已处理的 IMAP 账号，并重载账号池。"""
+    path = str(filepath or "").strip()
+    email_value = str(email_addr or "").strip()
+    auth_value = str(auth_code or "").strip()
+    if not path or not email_value or not auth_value or not os.path.exists(path):
+        return False
+
+    removed = False
+    with _imap_account_lock:
+        try:
+            with open(path, "r", encoding="utf-8") as file_obj:
+                lines = file_obj.readlines()
+
+            new_lines: List[str] = []
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not removed and line and not line.startswith("#"):
+                    parts = line.split("----")
+                    if len(parts) >= 2:
+                        candidate_email = parts[0].strip()
+                        candidate_auth = parts[1].strip()
+                        if candidate_email == email_value and candidate_auth == auth_value:
+                            removed = True
+                            continue
+                new_lines.append(raw_line)
+
+            if removed:
+                with open(path, "w", encoding="utf-8") as file_obj:
+                    file_obj.writelines(new_lines)
+
+                global _imap_accounts, _imap_accounts_loaded, _imap_account_index
+                _imap_accounts = _load_emails_file(path)
+                _imap_accounts_loaded = True
+                _imap_account_index = 0
+                logger.info(f"[IMAP] 已从 emails.txt 删除已处理账号: {email_value}")
+        except Exception as exc:
+            logger.warning(f"[IMAP] 删除 emails.txt 账号失败 ({email_value}): {exc}")
+            return False
+
+    return removed
+
+
 def get_imap_accounts() -> List[ImapAccount]:
     """获取当前已加载的 IMAP 邮箱账号列表。"""
     _ensure_accounts_loaded()
