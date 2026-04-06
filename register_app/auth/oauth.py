@@ -532,6 +532,8 @@ def submit_callback_url(
         "type": "codex",
         "expired": expired_rfc3339,
     }
+    print("---------------测试提取---------------")
+    print(config)
 
     return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
 

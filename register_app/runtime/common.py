@@ -207,7 +207,7 @@ def persist_registration_result(
         _rotate_accounts_file(accounts_path)
         with open(accounts_path, "a", encoding="utf-8") as file_obj:
             file_obj.write(f"{raw_email}----{password}----{refresh_token}\n")
-
+        
     return file_name, raw_email
 
 
