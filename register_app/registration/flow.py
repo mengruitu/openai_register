@@ -24,7 +24,8 @@ from ..mail.cfmail import (
     reload_cfmail_accounts_if_needed as _reload_cfmail_accounts_if_needed,
 )
 from ..mail.dedupe import get_mailbox_dedupe_store
-from ..mail.imap_mail import remove_imap_account
+from ..mail.api_mail import remove_api_mail_account
+from ..mail.imap_mail import remove_imap_account, remove_imap_ms_account
 from ..result_store import append_register_failed, append_success_no_token
 from ..config import DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS
 from ..mail.providers import TempMailbox
@@ -650,6 +651,18 @@ def run(
                 logger.info(f"[线程 {thread_id}] [信息] 已删除 emails.txt 中的已处理邮箱: {mailbox.email}")
             else:
                 logger.warning(f"[线程 {thread_id}] [警告] 未能从 emails.txt 删除邮箱: {mailbox.email}")
+        if mailbox and mailbox.provider == "imap_ms" and mailbox.email and mailbox.password:
+            removed = remove_imap_ms_account(mailbox.email, mailbox.password)
+            if removed:
+                logger.info(f"[线程 {thread_id}] [信息] 已删除 ms_emails.txt 中的已处理邮箱: {mailbox.email}")
+            else:
+                logger.warning(f"[线程 {thread_id}] [警告] 未能从 ms_emails.txt 删除邮箱: {mailbox.email}")
+        if mailbox and mailbox.provider == "api_mail" and mailbox.email and mailbox.password and mailbox.api_base:
+            removed = remove_api_mail_account(mailbox.email, mailbox.password, mailbox.api_base)
+            if removed:
+                logger.info(f"[线程 {thread_id}] [信息] 已删除 api_emails.txt 中的已处理邮箱: {mailbox.email}")
+            else:
+                logger.warning(f"[线程 {thread_id}] [警告] 未能从 api_emails.txt 删除邮箱: {mailbox.email}")
         if reserved_mailbox_email:
             mailbox_dedupe_store.release(reserved_mailbox_email)
 

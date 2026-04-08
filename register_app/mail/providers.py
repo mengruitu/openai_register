@@ -36,6 +36,9 @@ class TempMailbox:
     sid_token: str = ""
     password: str = ""
     config_name: str = ""
+    imap_port: int = 0
+    oauth_client_id: str = ""
+    oauth_refresh_token: str = ""
 
 
 def _contains_mail_keyword(*parts: Any) -> bool:

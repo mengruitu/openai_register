@@ -10,10 +10,20 @@ from ..mail.cfmail import (
     list_cfmail_message_ids as _list_cfmail_message_ids,
     poll_cfmail_oai_code as _poll_cfmail_oai_code,
 )
+from ..mail.api_mail import (
+    create_api_mailbox as _create_api_mailbox,
+    list_api_message_ids as _list_api_message_ids,
+    poll_api_oai_code as _poll_api_oai_code,
+)
 from ..mail.imap_mail import (
+    DEFAULT_IMAP_PORT,
+    DEFAULT_MS_IMAP_PORT,
     create_imap_mailbox as _create_imap_mailbox,
+    create_imap_ms_mailbox as _create_imap_ms_mailbox,
     list_imap_message_ids as _list_imap_message_ids,
+    list_imap_ms_message_ids as _list_imap_ms_message_ids,
     poll_imap_oai_code as _poll_imap_oai_code,
+    poll_imap_ms_oai_code as _poll_imap_ms_oai_code,
 )
 from ..mail.providers import (
     MAILTM_BASE,
@@ -62,8 +72,12 @@ def get_temp_mailbox(
         mailbox = create_dropmail_mailbox(proxies=proxies, thread_id=thread_id)
     elif provider_key == "cfmail":
         mailbox = _create_cfmail_mailbox(proxies=proxies, thread_id=thread_id)
+    elif provider_key == "api_mail":
+        mailbox = _create_api_mailbox(proxies=proxies, thread_id=thread_id)
     elif provider_key == "imap":
         mailbox = _create_imap_mailbox(proxies=proxies, thread_id=thread_id)
+    elif provider_key == "imap_ms":
+        mailbox = _create_imap_ms_mailbox(proxies=proxies, thread_id=thread_id)
     else:
         logger.error(f"[线程 {thread_id}] [错误] 不支持的临时邮箱服务: {provider_key}")
         return None
@@ -95,6 +109,13 @@ def get_mailbox_message_snapshot(
                 email=mailbox.email,
                 proxies=proxies,
             )
+        if mailbox.provider == "api_mail":
+            return _list_api_message_ids(
+                email_addr=mailbox.email,
+                password=mailbox.password,
+                api_url=mailbox.api_base,
+                proxies=proxies,
+            )
         if mailbox.provider == "mailtm":
             return list_hydra_message_ids(
                 api_base=mailbox.api_base,
@@ -115,6 +136,17 @@ def get_mailbox_message_snapshot(
                 email_addr=mailbox.email,
                 auth_code=mailbox.password,
                 imap_host=mailbox.api_base,
+                imap_port=mailbox.imap_port or DEFAULT_IMAP_PORT,
+                proxies=proxies,
+            )
+        if mailbox.provider == "imap_ms":
+            return _list_imap_ms_message_ids(
+                email_addr=mailbox.email,
+                password=mailbox.password,
+                client_id=mailbox.oauth_client_id,
+                refresh_token=mailbox.oauth_refresh_token,
+                imap_host=mailbox.api_base,
+                imap_port=mailbox.imap_port or DEFAULT_MS_IMAP_PORT,
                 proxies=proxies,
             )
     except Exception as exc:
@@ -141,6 +173,19 @@ def get_oai_code(
             api_base=mailbox.api_base,
             token=mailbox.token,
             email=mailbox.email,
+            thread_id=thread_id,
+            proxies=proxies,
+            skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
+        )
+    if mailbox.provider == "api_mail":
+        if not mailbox.api_base:
+            logger.error(f"[线程 {thread_id}] [错误] {mailbox.provider} API 为空，无法读取邮件")
+            return ""
+        return _poll_api_oai_code(
+            email_addr=mailbox.email,
+            password=mailbox.password,
+            api_url=mailbox.api_base,
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,
@@ -205,6 +250,25 @@ def get_oai_code(
             email_addr=mailbox.email,
             auth_code=mailbox.password,
             imap_host=mailbox.api_base,
+            imap_port=mailbox.imap_port or DEFAULT_IMAP_PORT,
+            thread_id=thread_id,
+            proxies=proxies,
+            skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
+        )
+    if mailbox.provider == "imap_ms":
+        if not mailbox.password or not mailbox.oauth_client_id or not mailbox.oauth_refresh_token:
+            logger.error(
+                f"[线程 {thread_id}] [错误] {mailbox.provider} OAuth 参数不完整，无法读取邮件"
+            )
+            return ""
+        return _poll_imap_ms_oai_code(
+            email_addr=mailbox.email,
+            password=mailbox.password,
+            client_id=mailbox.oauth_client_id,
+            refresh_token=mailbox.oauth_refresh_token,
+            imap_host=mailbox.api_base,
+            imap_port=mailbox.imap_port or DEFAULT_MS_IMAP_PORT,
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,

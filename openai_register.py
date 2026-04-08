@@ -244,8 +244,8 @@ def main() -> None:
     parser.add_argument(
         "--mail-provider",
         default="cfmail",
-        choices=["cfmail", "tempmaillol", "mailtm", "tempmailio", "dropmail", "imap"],
-        help="邮箱服务（cfmail / tempmaillol / mailtm / tempmailio / dropmail / imap）",
+        choices=["cfmail", "tempmaillol", "mailtm", "tempmailio", "dropmail", "imap", "imap_ms", "api_mail"],
+        help="邮箱服务（cfmail / tempmaillol / mailtm / tempmailio / dropmail / imap / imap_ms / api_mail）",
     )
     parser.add_argument(
         "--cfmail-profile",

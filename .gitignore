@@ -41,4 +41,6 @@ debug/
 
 output/
 emails.txt
+api_emails.txt
+ms_emails.txt
 test_oauth.py

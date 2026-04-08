@@ -121,6 +121,13 @@ sudo systemctl status openai-register
 - `cfmail_profile`
 - `cfmail_config`
 
+补充说明：
+
+- `mail_provider=imap` 继续读取项目根目录 `emails.txt`
+- `mail_provider=imap_ms` 读取项目根目录 `ms_emails.txt`
+- `ms_emails.txt` 格式为 `邮箱----密码----client_id----refresh_token`
+- 也支持扩展格式 `邮箱----密码----client_id----refresh_token----IMAP服务器----端口`
+
 ## 默认节流策略
 
 为降低 `temp-mail.org` 的 429 风险，当前默认已经放慢：
