@@ -20,7 +20,7 @@ from .common import (
     _response_json_object,
     get_auto_proxy,
 )
-from .flow import _provider_fallback_chain, run, run_with_fallback
+from .flow import _provider_fallback_chain, run, run_with_fallback, run_with_fallback_detailed
 from .mailbox import (
     MAILTM_BASE,
     TempMailbox,
@@ -55,4 +55,5 @@ __all__ = [
     "get_temp_mailbox",
     "run",
     "run_with_fallback",
+    "run_with_fallback_detailed",
 ]

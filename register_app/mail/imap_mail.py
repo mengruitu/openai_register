@@ -41,6 +41,7 @@ from .diagnostics import (
     reset_mailbox_wait_diagnostics,
 )
 from .providers import TempMailbox
+from ..workspace_context import get_workspace_context
 
 logger = logging.getLogger("openai_register")
 
@@ -89,6 +90,8 @@ class ImapAccount:
     imap_host: str = DEFAULT_IMAP_HOST
     imap_port: int = DEFAULT_IMAP_PORT
     use_ssl: bool = DEFAULT_IMAP_SSL
+    source_file: str = ""
+    source_line: str = ""
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,8 @@ class MicrosoftImapAccount:
     imap_host: str = DEFAULT_MS_IMAP_HOST
     imap_port: int = DEFAULT_MS_IMAP_PORT
     use_ssl: bool = DEFAULT_MS_IMAP_SSL
+    source_file: str = ""
+    source_line: str = ""
 
 
 _imap_account_lock = threading.Lock()
@@ -111,6 +116,17 @@ _ms_imap_account_lock = threading.Lock()
 _ms_imap_account_index = 0
 _ms_imap_accounts: List[MicrosoftImapAccount] = []
 _ms_imap_accounts_loaded = False
+_ms_imap_workspace_indices: dict[str, int] = {}
+
+
+def _resolve_ms_emails_file(filepath: str = DEFAULT_MS_EMAILS_FILE) -> str:
+    path = str(filepath or "").strip()
+    if path and path != DEFAULT_MS_EMAILS_FILE:
+        return path
+    context = get_workspace_context()
+    if context and context.ms_emails_file:
+        return str(context.ms_emails_file).strip()
+    return DEFAULT_MS_EMAILS_FILE
 
 
 def _load_emails_file(filepath: str = DEFAULT_EMAILS_FILE) -> List[ImapAccount]:
@@ -169,7 +185,7 @@ def _load_emails_file(filepath: str = DEFAULT_EMAILS_FILE) -> List[ImapAccount]:
 
 def _load_ms_emails_file(filepath: str = DEFAULT_MS_EMAILS_FILE) -> List[MicrosoftImapAccount]:
     """从 ms_emails.txt 文件加载微软 IMAP 邮箱账号列表。"""
-    path = str(filepath or "").strip()
+    path = _resolve_ms_emails_file(filepath)
     if not path or not os.path.exists(path):
         logger.warning(f"[IMAP_MS] 邮箱账号文件不存在: {path}")
         return []
@@ -247,6 +263,9 @@ def _ensure_accounts_loaded() -> None:
 
 def _ensure_ms_accounts_loaded() -> None:
     """确保微软 IMAP 邮箱账号已加载（懒加载）。"""
+    context = get_workspace_context()
+    if context and context.ms_emails_file:
+        return
     global _ms_imap_accounts, _ms_imap_accounts_loaded
     if _ms_imap_accounts_loaded:
         return
@@ -268,6 +287,12 @@ def reload_imap_accounts() -> None:
 
 def reload_imap_ms_accounts() -> None:
     """强制重新加载微软 IMAP 邮箱账号文件。"""
+    context = get_workspace_context()
+    if context and context.ms_emails_file:
+        path = _resolve_ms_emails_file()
+        with _ms_imap_account_lock:
+            _ms_imap_workspace_indices[path] = 0
+        return
     global _ms_imap_accounts, _ms_imap_accounts_loaded, _ms_imap_account_index
     with _ms_imap_account_lock:
         _ms_imap_accounts = _load_ms_emails_file()
@@ -328,7 +353,7 @@ def remove_imap_ms_account(
     filepath: str = DEFAULT_MS_EMAILS_FILE,
 ) -> bool:
     """从 ms_emails.txt 删除一个已处理的微软 IMAP 账号，并重载账号池。"""
-    path = str(filepath or "").strip()
+    path = _resolve_ms_emails_file(filepath)
     email_value = str(email_addr or "").strip()
     password_value = str(password or "").strip()
     if not path or not email_value or not password_value or not os.path.exists(path):
@@ -357,10 +382,14 @@ def remove_imap_ms_account(
                 with open(path, "w", encoding="utf-8") as file_obj:
                     file_obj.writelines(new_lines)
 
-                global _ms_imap_accounts, _ms_imap_accounts_loaded, _ms_imap_account_index
-                _ms_imap_accounts = _load_ms_emails_file(path)
-                _ms_imap_accounts_loaded = True
-                _ms_imap_account_index = 0
+                context = get_workspace_context()
+                if context and context.ms_emails_file:
+                    _ms_imap_workspace_indices[path] = 0
+                else:
+                    global _ms_imap_accounts, _ms_imap_accounts_loaded, _ms_imap_account_index
+                    _ms_imap_accounts = _load_ms_emails_file(path)
+                    _ms_imap_accounts_loaded = True
+                    _ms_imap_account_index = 0
                 logger.info(f"[IMAP_MS] 已从 ms_emails.txt 删除已处理账号: {email_value}")
         except Exception as exc:
             logger.warning(f"[IMAP_MS] 删除 ms_emails.txt 账号失败 ({email_value}): {exc}")
@@ -377,6 +406,9 @@ def get_imap_accounts() -> List[ImapAccount]:
 
 def get_imap_ms_accounts() -> List[MicrosoftImapAccount]:
     """获取当前已加载的微软 IMAP 邮箱账号列表。"""
+    context = get_workspace_context()
+    if context and context.ms_emails_file:
+        return _load_ms_emails_file(context.ms_emails_file)
     _ensure_ms_accounts_loaded()
     return list(_ms_imap_accounts)
 
@@ -395,8 +427,116 @@ def select_imap_account() -> Optional[ImapAccount]:
         return account
 
 
+def take_imap_account(filepath: str = DEFAULT_EMAILS_FILE) -> Optional[ImapAccount]:
+    """原子领取一个传统 IMAP 账号，并立即从文件中移除，防止并发重复使用。"""
+    path = str(filepath or "").strip()
+    if not path or not os.path.exists(path):
+        logger.warning(f"[IMAP] 邮箱账号文件不存在: {path}")
+        return None
+
+    with _imap_account_lock:
+        try:
+            with open(path, "r", encoding="utf-8") as file_obj:
+                lines = file_obj.readlines()
+
+            selected_account: Optional[ImapAccount] = None
+            new_lines: List[str] = []
+            for line_no, raw_line in enumerate(lines, start=1):
+                line = raw_line.strip()
+                if selected_account is None and line and not line.startswith("#"):
+                    parts = line.split("----")
+                    if len(parts) < 2:
+                        logger.warning(f"[IMAP] emails.txt 第 {line_no} 行格式无效，已跳过: {line}")
+                        new_lines.append(raw_line)
+                        continue
+                    email_addr = parts[0].strip()
+                    auth_code = parts[1].strip()
+                    if not email_addr or not auth_code:
+                        logger.warning(f"[IMAP] emails.txt 第 {line_no} 行邮箱或授权码为空，已跳过")
+                        new_lines.append(raw_line)
+                        continue
+                    imap_host = parts[2].strip() if len(parts) > 2 and parts[2].strip() else DEFAULT_IMAP_HOST
+                    imap_port = DEFAULT_IMAP_PORT
+                    if len(parts) > 3 and parts[3].strip():
+                        try:
+                            imap_port = int(parts[3].strip())
+                        except ValueError:
+                            pass
+                    selected_account = ImapAccount(
+                        email=email_addr,
+                        auth_code=auth_code,
+                        imap_host=imap_host,
+                        imap_port=imap_port,
+                        source_file=path,
+                        source_line=line,
+                    )
+                    continue
+                new_lines.append(raw_line)
+
+            if selected_account is None:
+                return None
+
+            with open(path, "w", encoding="utf-8") as file_obj:
+                file_obj.writelines(new_lines)
+
+            global _imap_accounts, _imap_accounts_loaded, _imap_account_index
+            _imap_accounts = _load_emails_file(path)
+            _imap_accounts_loaded = True
+            _imap_account_index = 0
+            logger.info(f"[IMAP] 已领取并移除邮箱账号: {selected_account.email}")
+            return selected_account
+        except Exception as exc:
+            logger.warning(f"[IMAP] 领取 emails.txt 账号失败: {exc}")
+            return None
+
+
+def return_imap_account(
+    email_addr: str,
+    auth_code: str,
+    *,
+    filepath: str = DEFAULT_EMAILS_FILE,
+    source_line: str = "",
+) -> bool:
+    path = str(filepath or "").strip()
+    if not path:
+        return False
+
+    line = str(source_line or "").strip()
+    if not line:
+        line = f"{str(email_addr or '').strip()}----{str(auth_code or '').strip()}"
+    if not line:
+        return False
+
+    with _imap_account_lock:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as file_obj:
+                file_obj.write(line + "\n")
+            global _imap_accounts, _imap_accounts_loaded, _imap_account_index
+            _imap_accounts = _load_emails_file(path)
+            _imap_accounts_loaded = True
+            _imap_account_index = 0
+            logger.info(f"[IMAP] 已将邮箱账号放回未使用池: {email_addr}")
+            return True
+        except Exception as exc:
+            logger.warning(f"[IMAP] 放回 emails.txt 账号失败 ({email_addr}): {exc}")
+            return False
+
+
 def select_imap_ms_account() -> Optional[MicrosoftImapAccount]:
     """轮询选择下一个可用的微软 IMAP 邮箱账号。"""
+    context = get_workspace_context()
+    if context and context.ms_emails_file:
+        path = _resolve_ms_emails_file(context.ms_emails_file)
+        accounts = _load_ms_emails_file(path)
+        with _ms_imap_account_lock:
+            if not accounts:
+                return None
+            index = _ms_imap_workspace_indices.get(path, 0) % len(accounts)
+            account = accounts[index]
+            _ms_imap_workspace_indices[path] = (index + 1) % len(accounts)
+            return account
+
     global _ms_imap_account_index
     _ensure_ms_accounts_loaded()
 
@@ -407,6 +547,122 @@ def select_imap_ms_account() -> Optional[MicrosoftImapAccount]:
         account = _ms_imap_accounts[index]
         _ms_imap_account_index = (index + 1) % len(_ms_imap_accounts)
         return account
+
+
+def take_imap_ms_account(filepath: str = DEFAULT_MS_EMAILS_FILE) -> Optional[MicrosoftImapAccount]:
+    """原子领取一个微软账号，并立即从 ms_emails.txt 中移除，防止并发重复使用。"""
+    path = _resolve_ms_emails_file(filepath)
+    if not path or not os.path.exists(path):
+        logger.warning(f"[IMAP_MS] 邮箱账号文件不存在: {path}")
+        return None
+
+    with _ms_imap_account_lock:
+        try:
+            with open(path, "r", encoding="utf-8") as file_obj:
+                lines = file_obj.readlines()
+
+            selected_account: Optional[MicrosoftImapAccount] = None
+            new_lines: List[str] = []
+            for line_no, raw_line in enumerate(lines, start=1):
+                line = raw_line.strip()
+                if selected_account is None and line and not line.startswith("#"):
+                    parts = line.split("----")
+                    if len(parts) not in (4, 6):
+                        logger.warning(f"[IMAP_MS] ms_emails.txt 第 {line_no} 行格式无效，已跳过: {line}")
+                        new_lines.append(raw_line)
+                        continue
+                    email_addr = parts[0].strip()
+                    password = parts[1].strip()
+                    client_id = parts[2].strip()
+                    refresh_token = parts[3].strip()
+                    if not email_addr or not password or not client_id or not refresh_token:
+                        logger.warning(f"[IMAP_MS] ms_emails.txt 第 {line_no} 行存在空字段，已跳过")
+                        new_lines.append(raw_line)
+                        continue
+                    imap_host = DEFAULT_MS_IMAP_HOST
+                    imap_port = DEFAULT_MS_IMAP_PORT
+                    if len(parts) == 6:
+                        imap_host = parts[4].strip() or DEFAULT_MS_IMAP_HOST
+                        port_value = parts[5].strip()
+                        if port_value:
+                            try:
+                                imap_port = int(port_value)
+                                if imap_port <= 0:
+                                    raise ValueError
+                            except ValueError:
+                                logger.warning(
+                                    f"[IMAP_MS] ms_emails.txt 第 {line_no} 行端口无效，已跳过: {line}"
+                                )
+                                new_lines.append(raw_line)
+                                continue
+                    selected_account = MicrosoftImapAccount(
+                        email=email_addr,
+                        password=password,
+                        client_id=client_id,
+                        refresh_token=refresh_token,
+                        imap_host=imap_host,
+                        imap_port=imap_port,
+                        source_file=path,
+                        source_line=line,
+                    )
+                    continue
+                new_lines.append(raw_line)
+
+            if selected_account is None:
+                return None
+
+            with open(path, "w", encoding="utf-8") as file_obj:
+                file_obj.writelines(new_lines)
+
+            context = get_workspace_context()
+            if context and context.ms_emails_file:
+                _ms_imap_workspace_indices[path] = 0
+            else:
+                global _ms_imap_accounts, _ms_imap_accounts_loaded, _ms_imap_account_index
+                _ms_imap_accounts = _load_ms_emails_file(path)
+                _ms_imap_accounts_loaded = True
+                _ms_imap_account_index = 0
+            logger.info(f"[IMAP_MS] 已领取并移除微软邮箱账号: {selected_account.email}")
+            return selected_account
+        except Exception as exc:
+            logger.warning(f"[IMAP_MS] 领取 ms_emails.txt 账号失败: {exc}")
+            return None
+
+
+def return_imap_ms_account(
+    email_addr: str,
+    password: str,
+    *,
+    filepath: str = DEFAULT_MS_EMAILS_FILE,
+    source_line: str = "",
+) -> bool:
+    path = _resolve_ms_emails_file(filepath)
+    if not path:
+        return False
+
+    line = str(source_line or "").strip()
+    if not line:
+        return False
+
+    with _ms_imap_account_lock:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as file_obj:
+                file_obj.write(line + "\n")
+
+            context = get_workspace_context()
+            if context and context.ms_emails_file:
+                _ms_imap_workspace_indices[path] = 0
+            else:
+                global _ms_imap_accounts, _ms_imap_accounts_loaded, _ms_imap_account_index
+                _ms_imap_accounts = _load_ms_emails_file(path)
+                _ms_imap_accounts_loaded = True
+                _ms_imap_account_index = 0
+            logger.info(f"[IMAP_MS] 已将微软邮箱账号放回未使用池: {email_addr}")
+            return True
+        except Exception as exc:
+            logger.warning(f"[IMAP_MS] 放回 ms_emails.txt 账号失败 ({email_addr}): {exc}")
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +704,22 @@ def _extract_otp_from_parts(*parts: Any) -> str:
         if match:
             return match.group(1)
     return ""
+
+
+def _imap_login_email(email_addr: str) -> str:
+    """Return the canonical mailbox login for IMAP while preserving alias usage elsewhere."""
+    value = str(email_addr or "").strip()
+    if not value or "@" not in value:
+        return value
+
+    local_part, domain = value.split("@", 1)
+    if "+" not in local_part:
+        return value
+
+    canonical_local = local_part.split("+", 1)[0].strip()
+    if not canonical_local or not domain.strip():
+        return value
+    return f"{canonical_local}@{domain.strip()}"
 
 
 def _decode_mime_header(value: str) -> str:
@@ -506,16 +778,19 @@ def _logout_quietly(conn: Optional[imaplib.IMAP4]) -> None:
 
 def _connect_imap(account: ImapAccount) -> Optional[imaplib.IMAP4]:
     """建立传统 IMAP 连接并登录。"""
+    login_email = _imap_login_email(account.email)
     try:
         if account.use_ssl:
             conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(account.imap_host, account.imap_port)
         else:
             conn = imaplib.IMAP4(account.imap_host, account.imap_port)
 
-        conn.login(account.email, account.auth_code)
+        conn.login(login_email, account.auth_code)
         return conn
     except Exception as e:
-        logger.warning(f"[IMAP] 连接或登录失败 ({account.email}@{account.imap_host}): {e}")
+        logger.warning(
+            f"[IMAP] 连接或登录失败 ({account.email}->{login_email}@{account.imap_host}): {e}"
+        )
         return None
 
 
@@ -570,6 +845,7 @@ def _connect_imap_ms(account: MicrosoftImapAccount) -> Optional[imaplib.IMAP4]:
     if not access_token:
         return None
 
+    login_email = _imap_login_email(account.email)
     conn: Optional[imaplib.IMAP4] = None
     try:
         if account.use_ssl:
@@ -577,11 +853,13 @@ def _connect_imap_ms(account: MicrosoftImapAccount) -> Optional[imaplib.IMAP4]:
         else:
             conn = imaplib.IMAP4(account.imap_host, account.imap_port)
 
-        auth_string = f"user={account.email}\x01auth=Bearer {access_token}\x01\x01"
+        auth_string = f"user={login_email}\x01auth=Bearer {access_token}\x01\x01"
         conn.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
         return conn
     except Exception as exc:
-        logger.warning(f"[IMAP_MS] 连接或登录失败 ({account.email}@{account.imap_host}): {exc}")
+        logger.warning(
+            f"[IMAP_MS] 连接或登录失败 ({account.email}->{login_email}@{account.imap_host}): {exc}"
+        )
         _logout_quietly(conn)
         return None
 
@@ -711,7 +989,7 @@ def create_imap_mailbox(
     """从 emails.txt 中选取一个邮箱账号，创建传统 IMAP 类型的 TempMailbox。"""
     _ = proxies
 
-    account = select_imap_account()
+    account = take_imap_account()
     if not account:
         logger.error(
             f"[线程 {thread_id}] [错误] 没有可用的 IMAP 邮箱账号，"
@@ -740,6 +1018,7 @@ def create_imap_mailbox(
         password=account.auth_code,
         config_name=f"imap:{account.imap_host}",
         imap_port=account.imap_port,
+        source_removed=True,
     )
 
 
@@ -749,7 +1028,7 @@ def create_imap_ms_mailbox(
     """从 ms_emails.txt 中选取一个邮箱账号，创建微软 IMAP 类型的 TempMailbox。"""
     _ = proxies
 
-    account = select_imap_ms_account()
+    account = take_imap_ms_account()
     if not account:
         logger.error(
             f"[线程 {thread_id}] [错误] 没有可用的微软 IMAP 邮箱账号，"
@@ -779,6 +1058,7 @@ def create_imap_ms_mailbox(
         imap_port=account.imap_port,
         oauth_client_id=account.client_id,
         oauth_refresh_token=account.refresh_token,
+        source_removed=True,
     )
 
 

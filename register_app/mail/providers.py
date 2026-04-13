@@ -39,6 +39,9 @@ class TempMailbox:
     imap_port: int = 0
     oauth_client_id: str = ""
     oauth_refresh_token: str = ""
+    source_removed: bool = False
+    source_file: str = ""
+    source_line: str = ""
 
 
 def _contains_mail_keyword(*parts: Any) -> bool:

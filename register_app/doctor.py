@@ -13,6 +13,7 @@ from curl_cffi import requests
 
 from .config import load_config_file
 from .mail.cfmail import cfmail_account_names, get_cfmail_accounts, select_cfmail_account
+from .proxy_pool import build_proxy_pool_snapshot
 from .runtime import count_json_files
 
 TRACE_URL = "https://cloudflare.com/cdn-cgi/trace"
@@ -207,6 +208,20 @@ def build_status_snapshot(args: Any) -> dict[str, Any]:
         },
     }
 
+    if bool(getattr(args, "proxy_pool_enabled", False)):
+        proxy_pool_snapshot = build_proxy_pool_snapshot()
+        proxy_pool_snapshot["enabled"] = True
+        proxy_pool_snapshot["configured_state_path"] = str(
+            getattr(args, "proxy_pool_state_path", "") or ""
+        ).strip()
+        proxy_pool_snapshot["configured_consumers_path"] = str(
+            getattr(args, "proxy_pool_consumers_path", "") or ""
+        ).strip()
+        proxy_pool_snapshot["target_multiplier"] = int(
+            getattr(args, "proxy_pool_target_multiplier", 0) or 0
+        )
+        snapshot["proxy_pool"] = proxy_pool_snapshot
+
     if str(args.mail_provider or "").strip().lower() == "cfmail":
         accounts = get_cfmail_accounts()
         selected = select_cfmail_account(args.cfmail_profile)
@@ -258,6 +273,15 @@ def print_status_snapshot(snapshot: dict[str, Any], *, output_json: bool = False
     _print_console_line(f"代理：{snapshot.get('proxy', '') or '(未显式设置)'}")
     if snapshot.get("proxy_api_url"):
         _print_console_line(f"代理API：{snapshot.get('proxy_api_url', '')} (scheme={snapshot.get('proxy_api_scheme', 'http')})")
+    if snapshot.get("proxy_pool"):
+        proxy_pool = snapshot["proxy_pool"]
+        _print_console_line(
+            f"共享IP池：enabled={proxy_pool.get('enabled', False)} "
+            f"runtime_active={proxy_pool.get('runtime_active', False)} "
+            f"available={proxy_pool.get('available_count', 0)} "
+            f"target={proxy_pool.get('target_count', 0)} "
+            f"consumers={proxy_pool.get('active_consumer_count', 0)}"
+        )
     _print_console_line(f"邮箱服务：{snapshot.get('mail_provider', '')}")
 
     active = snapshot.get("active") or {}

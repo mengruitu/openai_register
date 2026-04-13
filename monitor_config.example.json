@@ -26,6 +26,21 @@
   "register_openai_concurrency": 1,
   "register_start_delay_seconds": 8.0,
 
+  "_section_register_only_r2": "===== register-only 收尾上传到 Cloudflare R2 =====",
+  "_r2_usage": [
+    "仅在 --register-only 模式下生效；monitor / monitor-once 不会触发。",
+    "register-only 所有线程自然结束后，会把 token_dir 下现存的全部 JSON 逐个上传到 R2。",
+    "只有当这一批 JSON 全部上传成功后，才会自动删除 token_dir 里的本地 JSON。"
+  ],
+  "r2_enabled": false,
+  "r2_account_id": "",
+  "r2_bucket": "",
+  "r2_access_key_id": "",
+  "r2_secret_access_key": "",
+  "r2_prefix": "openai-register",
+  "r2_retry_count": 2,
+  "r2_retry_delay_seconds": 3.0,
+
   "_section_cfmail": "===== temp-mail 兼容配置 =====",
   "cfmail_profile": "auto",
   "cfmail_config": "/data/openai_register/cfmail_accounts.json",
@@ -38,6 +53,14 @@
 
   "_section_proxy": "===== 代理配置 =====",
   "proxy": "",
+  "proxy_api_url": "",
+  "proxy_api_scheme": "http",
+  "proxy_pool_enabled": false,
+  "proxy_pool_consumer_ttl_seconds": 120,
+  "proxy_pool_heartbeat_interval_seconds": 15,
+  "proxy_pool_state_path": "/data/openai_register/state/proxy_pool.json",
+  "proxy_pool_consumers_path": "/data/openai_register/state/proxy_pool_consumers.json",
+  "proxy_pool_target_multiplier": 2,
 
   "_section_flags": "===== 开关（true/false） =====",
   "monitor": true,

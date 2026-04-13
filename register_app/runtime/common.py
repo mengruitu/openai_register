@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import logging
 import os
@@ -10,10 +11,11 @@ import re
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 DEFAULT_TOKEN_CHECK_WORKERS = 2
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
@@ -63,7 +65,7 @@ if not any(type(handler) is logging.StreamHandler for handler in logger.handlers
     )
     logger.addHandler(console_handler)
 
-RegisterRunner = Callable[..., tuple[Optional[tuple[str, str]], str]]
+RegisterRunner = Callable[..., tuple[Optional[tuple[str, str]], str, Any]]
 ReloadCfmailHook = Callable[[], None]
 
 
@@ -94,6 +96,205 @@ class TokenUsageCheck:
     check_failed: bool
     reason: str = ""
     refreshed: bool = False
+
+
+@dataclass
+class RegisterModeStats:
+    provider_key: str
+    configured_threads: int
+    token_dir: str
+    initial_mailbox_total: int = 0
+    remaining_mailbox_total: int = 0
+    max_mailboxes_to_use: int = 0
+    started_at: float = field(default_factory=time.time)
+    finished_at: float = 0.0
+    attempt_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    environment_failure_count: int = 0
+    generated_files_count: int = 0
+    last_success_email: str = ""
+    last_output_file: str = ""
+    thread_attempts: Counter[int] = field(default_factory=Counter)
+    thread_successes: Counter[int] = field(default_factory=Counter)
+    thread_failures: Counter[int] = field(default_factory=Counter)
+    thread_environment_failures: Counter[int] = field(default_factory=Counter)
+    success_providers: Counter[str] = field(default_factory=Counter)
+    failure_providers: Counter[str] = field(default_factory=Counter)
+    failure_reasons: Counter[str] = field(default_factory=Counter)
+    consumed_mailbox_count: int = 0
+    reserved_mailbox_slots: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record_success(
+        self,
+        *,
+        thread_id: int,
+        used_provider: str,
+        email: str,
+        output_file: str,
+    ) -> None:
+        provider = str(used_provider or "").strip() or "unknown"
+        with self._lock:
+            self.attempt_count += 1
+            self.success_count += 1
+            self.generated_files_count += 1
+            self.last_success_email = str(email or "").strip()
+            self.last_output_file = str(output_file or "").strip()
+            self.thread_attempts[thread_id] += 1
+            self.thread_successes[thread_id] += 1
+            self.success_providers[provider] += 1
+
+    def record_environment_failure(
+        self,
+        *,
+        thread_id: int,
+        used_provider: str,
+        reason: str = "",
+    ) -> None:
+        provider = str(used_provider or "").strip() or "unknown"
+        failure_reason = str(reason or "").strip() or "environment_failure"
+        with self._lock:
+            self.environment_failure_count += 1
+            self.thread_environment_failures[thread_id] += 1
+            self.failure_providers[provider] += 1
+            self.failure_reasons[failure_reason] += 1
+
+    def record_failure(
+        self,
+        *,
+        thread_id: int,
+        used_provider: str,
+        reason: str = "",
+    ) -> None:
+        provider = str(used_provider or "").strip() or "unknown"
+        failure_reason = str(reason or "").strip() or "unknown_failure"
+        with self._lock:
+            self.attempt_count += 1
+            self.failure_count += 1
+            self.thread_attempts[thread_id] += 1
+            self.thread_failures[thread_id] += 1
+            self.failure_providers[provider] += 1
+            self.failure_reasons[failure_reason] += 1
+
+    def try_reserve_mailbox_slot(self) -> bool:
+        with self._lock:
+            if self.max_mailboxes_to_use <= 0:
+                return True
+            if self.consumed_mailbox_count + self.reserved_mailbox_slots >= self.max_mailboxes_to_use:
+                return False
+            self.reserved_mailbox_slots += 1
+            return True
+
+    def complete_mailbox_slot(self, *, consumed: bool) -> None:
+        with self._lock:
+            if self.max_mailboxes_to_use > 0 and self.reserved_mailbox_slots > 0:
+                self.reserved_mailbox_slots -= 1
+            if consumed:
+                self.consumed_mailbox_count += 1
+
+    def set_remaining_mailboxes(self, remaining: int) -> None:
+        with self._lock:
+            self.remaining_mailbox_total = max(0, int(remaining))
+
+    def mark_finished(self) -> None:
+        with self._lock:
+            self.finished_at = time.time()
+
+    @staticmethod
+    def _display_width(value: str) -> int:
+        width = 0
+        for ch in str(value):
+            width += 2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1
+        return width
+
+    @classmethod
+    def _pad_cell(cls, value: str, width: int) -> str:
+        text = str(value)
+        padding = max(0, width - cls._display_width(text))
+        return text + (" " * padding)
+
+    @classmethod
+    def _format_table(cls, headers: list[str], rows: list[list[str]]) -> list[str]:
+        widths = [cls._display_width(str(item)) for item in headers]
+        for row in rows:
+            for index, item in enumerate(row):
+                widths[index] = max(widths[index], cls._display_width(str(item)))
+
+        def _line(left: str, fill: str, mid: str, right: str) -> str:
+            return left + mid.join(fill * (width + 2) for width in widths) + right
+
+        def _row(items: list[str]) -> str:
+            return "| " + " | ".join(cls._pad_cell(str(item), widths[index]) for index, item in enumerate(items)) + " |"
+
+        output = [_line("+", "-", "+", "+"), _row(headers), _line("+", "-", "+", "+")]
+        for row in rows:
+            output.append(_row(row))
+        output.append(_line("+", "-", "+", "+"))
+        return output
+
+    def summary_lines(self) -> list[str]:
+        with self._lock:
+            started_ts = self.started_at
+            finished_ts = self.finished_at or time.time()
+            started_at_text = datetime.fromtimestamp(started_ts).astimezone().isoformat(timespec="seconds")
+            finished_at_text = datetime.fromtimestamp(finished_ts).astimezone().isoformat(timespec="seconds")
+            duration_seconds = max(0, int(finished_ts - started_ts))
+            used_mailboxes = max(0, int(self.initial_mailbox_total) - int(self.remaining_mailbox_total))
+            mailbox_failures = max(0, used_mailboxes - self.success_count)
+            mailbox_success_rate = (self.success_count / used_mailboxes * 100.0) if used_mailboxes > 0 else 0.0
+            thread_ids = sorted(
+                set(self.thread_attempts)
+                | set(self.thread_successes)
+                | set(self.thread_failures)
+                | set(self.thread_environment_failures)
+            )
+            lines = ["========== 注册模式统计 =========="]
+
+            summary_rows = [[
+                self.provider_key,
+                str(self.configured_threads),
+                str(self.initial_mailbox_total),
+                str(self.remaining_mailbox_total),
+                str(used_mailboxes),
+                str(self.success_count),
+                str(mailbox_failures),
+                str(self.environment_failure_count),
+                f"{mailbox_success_rate:.1f}%",
+                str(self.generated_files_count),
+                f"{duration_seconds}s",
+            ]]
+            lines.append("总览：")
+            lines.extend(
+                self._format_table(
+                    ["服务", "线程", "初始邮箱", "剩余邮箱", "已消耗", "成功", "耗邮箱失败", "环境失败", "成功率", "JSON", "耗时"],
+                    summary_rows,
+                )
+            )
+            lines.append(f"开始：{started_at_text}")
+            lines.append(f"结束：{finished_at_text}")
+            if self.last_success_email:
+                lines.append(f"最后成功邮箱：{self.last_success_email}")
+            if self.failure_reasons:
+                reason_summary = ", ".join(
+                    f"{reason}={count}" for reason, count in self.failure_reasons.most_common(3)
+                )
+                lines.append(f"主要失败原因：{reason_summary}")
+            if thread_ids:
+                thread_rows = [
+                    [
+                        str(tid),
+                        str(self.thread_attempts.get(tid, 0)),
+                        str(self.thread_successes.get(tid, 0)),
+                        str(self.thread_failures.get(tid, 0)),
+                        str(self.thread_environment_failures.get(tid, 0)),
+                    ]
+                    for tid in thread_ids
+                ]
+                lines.append("线程明细：")
+                lines.extend(self._format_table(["线程", "尝试", "成功", "耗邮箱失败", "环境失败"], thread_rows))
+            lines.append("================================")
+            return lines
 
 
 def log_info(message: str) -> None:

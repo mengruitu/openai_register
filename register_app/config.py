@@ -33,12 +33,20 @@ DEFAULT_REGISTER_FAILURE_EXTRA_SLEEP_SECONDS = 20
 DEFAULT_DINGTALK_WEBHOOK = ""
 DEFAULT_CFMAIL_FALLBACK_PROVIDER = "tempmaillol"
 DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS = 900
+DEFAULT_R2_PREFIX = "openai-register"
+DEFAULT_R2_RETRY_COUNT = 2
+DEFAULT_R2_RETRY_DELAY_SECONDS = 3.0
+DEFAULT_PROXY_POOL_CONSUMER_TTL_SECONDS = 120
+DEFAULT_PROXY_POOL_HEARTBEAT_INTERVAL_SECONDS = 15
+DEFAULT_PROXY_POOL_TARGET_MULTIPLIER = 2
 CREATE_ACCOUNT_MAX_ATTEMPTS = 2
 CREATE_ACCOUNT_RETRY_DELAY_SECONDS = 2
 LOW_MEMORY_SOFT_LIMIT_MB = 2560
 LOW_MEMORY_HARD_LIMIT_MB = 1536
 
 DEFAULT_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "monitor_config.json")
+DEFAULT_PROXY_POOL_STATE_PATH = os.path.join(_SCRIPT_DIR, "state", "proxy_pool.json")
+DEFAULT_PROXY_POOL_CONSUMERS_PATH = os.path.join(_SCRIPT_DIR, "state", "proxy_pool_consumers.json")
 
 # ---------------------------------------------------------------------------
 # 配置文件中的 key 到 argparse dest 的映射
@@ -62,6 +70,7 @@ _CONFIG_KEY_MAP: Dict[str, str] = {
     "register_batch_size": "register_batch_size",
     "register_openai_concurrency": "register_openai_concurrency",
     "register_start_delay_seconds": "register_start_delay_seconds",
+    "max_mailboxes_to_use": "max_mailboxes_to_use",
     "dingtalk_webhook": "dingtalk_webhook",
     "dingtalk_summary_interval": "dingtalk_summary_interval",
     "dingtalk_fallback_interval": "dingtalk_fallback_interval",
@@ -70,6 +79,18 @@ _CONFIG_KEY_MAP: Dict[str, str] = {
     "failure_sleep_seconds": "failure_sleep_seconds",
     "cfmail_fail_threshold": "cfmail_fail_threshold",
     "cfmail_cooldown_seconds": "cfmail_cooldown_seconds",
+    "r2_account_id": "r2_account_id",
+    "r2_bucket": "r2_bucket",
+    "r2_access_key_id": "r2_access_key_id",
+    "r2_secret_access_key": "r2_secret_access_key",
+    "r2_prefix": "r2_prefix",
+    "r2_retry_count": "r2_retry_count",
+    "r2_retry_delay_seconds": "r2_retry_delay_seconds",
+    "proxy_pool_consumer_ttl_seconds": "proxy_pool_consumer_ttl_seconds",
+    "proxy_pool_heartbeat_interval_seconds": "proxy_pool_heartbeat_interval_seconds",
+    "proxy_pool_state_path": "proxy_pool_state_path",
+    "proxy_pool_consumers_path": "proxy_pool_consumers_path",
+    "proxy_pool_target_multiplier": "proxy_pool_target_multiplier",
 }
 
 # 布尔型参数（配置文件里 true/false）
@@ -80,6 +101,8 @@ _CONFIG_BOOL_KEYS = {
     "auto_continue_non_us",
     "once",
     "test_cfmail",
+    "r2_enabled",
+    "proxy_pool_enabled",
 }
 
 

@@ -24,8 +24,13 @@ from ..mail.cfmail import (
     reload_cfmail_accounts_if_needed as _reload_cfmail_accounts_if_needed,
 )
 from ..mail.dedupe import get_mailbox_dedupe_store
-from ..mail.api_mail import remove_api_mail_account
-from ..mail.imap_mail import remove_imap_account, remove_imap_ms_account
+from ..mail.api_mail import remove_api_mail_account, return_api_mail_account
+from ..mail.imap_mail import (
+    remove_imap_account,
+    remove_imap_ms_account,
+    return_imap_account,
+    return_imap_ms_account,
+)
 from ..result_store import append_register_failed, append_success_no_token
 from ..config import DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS
 from ..mail.providers import TempMailbox
@@ -60,6 +65,50 @@ from .mailbox import (
 
 logger = logging.getLogger("openai_register")
 
+
+def _should_return_mailbox_to_pool(attempt: RegistrationAttemptResult) -> bool:
+    stage = str(attempt.stage or "").strip().lower()
+    error_code = str(attempt.error_code or "").strip().lower()
+    detail = str((attempt.metadata or {}).get("failure_detail") or "").strip().lower()
+    message = str(attempt.error_message or "").strip().lower()
+
+    if error_code == "signup_start_url_missing" and "403" in detail:
+        return True
+    if stage == "signup_start" and "csrf status=403" in detail:
+        return True
+    if stage == "signup_start" and "403" in message:
+        return True
+    return False
+
+
+def _return_mailbox_to_unused_pool(mailbox: Optional[TempMailbox]) -> bool:
+    if mailbox is None or not mailbox.source_removed:
+        return False
+
+    if mailbox.provider == "imap":
+        return return_imap_account(
+            mailbox.email,
+            mailbox.password,
+            filepath=mailbox.source_file,
+            source_line=mailbox.source_line,
+        )
+    if mailbox.provider in {"imap_ms", "ms_mail_g", "ms_mail"}:
+        return return_imap_ms_account(
+            mailbox.email,
+            mailbox.password,
+            filepath=mailbox.source_file,
+            source_line=mailbox.source_line,
+        )
+    if mailbox.provider == "api_mail":
+        return return_api_mail_account(
+            mailbox.email,
+            mailbox.password,
+            mailbox.api_base,
+            filepath=mailbox.source_file,
+            source_line=mailbox.source_line,
+        )
+    return False
+
 # ---------------------------------------------------------------------------
 # 核心注册主流程
 # ---------------------------------------------------------------------------
@@ -72,7 +121,7 @@ def run(
     1. 检测出口 / 代理
     2. 创建临时邮箱（含去重）
     3. OpenAI 注册 / 已有账号 OTP 校验
-    4. 多策略提取 token，并补充丰富元数据
+    4. 优先复用当前注册 session 提取 token，失败后再走密码重登录链路
     """
     result = RegistrationAttemptResult(
         provider_key=str(provider_key or "").strip().lower(),
@@ -526,8 +575,12 @@ def run(
 
         token_json = None
         token_source = ""
+        token_password_login_debug: dict[str, Any] = {}
+        token_password_login_first_debug: dict[str, Any] = {}
+        token_password_login_retry_debug: dict[str, Any] = {}
 
         if post_create_continue_url:
+            logger.info(f"[线程 {thread_id}] [信息] 优先尝试沿用 create_account 返回的 continue_url 提取 token")
             _set_stage("token_continue_url")
             token_json = try_token_via_continue_url(
                 s,
@@ -541,7 +594,11 @@ def run(
 
         if not token_json:
             _set_stage("token_session_cookie")
-            token_json = try_token_via_session_cookie(s, thread_id, proxy_url=proxy or "")
+            token_json = try_token_via_session_cookie(
+                s,
+                thread_id,
+                proxy_url=proxy or "",
+            )
             if token_json:
                 token_source = "session_cookie"
 
@@ -577,6 +634,9 @@ def run(
                 token_source = "session_api"
 
         if not token_json:
+            logger.info(
+                f"[线程 {thread_id}] [信息] 当前注册 session 未提取到 token，回退到账号密码重登录链路"
+            )
             _set_stage("token_password_login")
             token_json = try_token_via_password_login(
                 email=email,
@@ -589,9 +649,46 @@ def run(
                 thread_id=thread_id,
                 get_oai_code_fn=get_oai_code,
                 get_mailbox_message_snapshot_fn=get_mailbox_message_snapshot,
+                debug_sink=token_password_login_debug,
             )
             if token_json:
                 token_source = "password_login"
+            else:
+                password_login_continue_url = str(
+                    token_password_login_debug.get("continue_url") if token_password_login_debug else ""
+                ).strip()
+                if password_login_continue_url and "add-phone" in password_login_continue_url.lower():
+                    token_password_login_first_debug = token_password_login_debug
+                    logger.info(
+                        f"[线程 {thread_id}] [信息] 密码重登录返回 add-phone，按当前环境再重试一遍登录取 token"
+                    )
+                    token_password_login_retry_debug = {}
+                    token_json = try_token_via_password_login(
+                        email=email,
+                        password=password,
+                        mailbox=mailbox,
+                        used_codes={code} if code else set(),
+                        oauth=oauth,
+                        proxies=proxies,
+                        impersonate=current_impersonate,
+                        thread_id=thread_id,
+                        get_oai_code_fn=get_oai_code,
+                        get_mailbox_message_snapshot_fn=get_mailbox_message_snapshot,
+                        debug_sink=token_password_login_retry_debug,
+                    )
+                    if token_json:
+                        token_source = "password_login_retry"
+                        token_password_login_debug = token_password_login_retry_debug
+                    elif token_password_login_retry_debug:
+                        token_password_login_debug = token_password_login_retry_debug
+
+                if not token_json:
+                    if token_password_login_first_debug:
+                        result.metadata["token_password_login_debug_first"] = token_password_login_first_debug
+                    if token_password_login_retry_debug:
+                        result.metadata["token_password_login_debug_retry"] = token_password_login_retry_debug
+                    if token_password_login_debug:
+                        result.metadata["token_password_login_debug"] = token_password_login_debug
 
         if token_json:
             result.metadata["token_source"] = token_source or "unknown"
@@ -631,7 +728,48 @@ def run(
                 post_create_gate=post_create_gate,
             )
 
-        logger.error(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token")
+        password_login_continue_url = str(
+            token_password_login_debug.get("continue_url") if token_password_login_debug else ""
+        ).strip()
+        if (
+            not post_create_gate
+            and password_login_continue_url
+            and "add-phone" in password_login_continue_url.lower()
+        ):
+            post_create_gate = "add_phone"
+            result.metadata["password_login_continue_url"] = password_login_continue_url
+
+        if post_create_gate == "add_phone":
+            deferred_credentials = {
+                "email": email,
+                "password": password,
+                "registration_proxy_url": proxy or "",
+                "registration_fingerprint_profile": current_impersonate,
+                "mailbox": {
+                    **_mailbox_public_metadata(mailbox),
+                    "token": str(mailbox.token or "").strip(),
+                    "sid_token": str(mailbox.sid_token or "").strip(),
+                },
+            }
+            return _fail(
+                "add_phone_gate",
+                "post_create_add_phone_gate",
+                "注册流程已走到 add-phone gate，当前自动 token 提取失败",
+                deferred_credentials=deferred_credentials,
+                post_create_continue_url=post_create_continue_url,
+                post_create_gate=post_create_gate,
+            )
+
+        token_login_final_error = str(
+            token_password_login_debug.get("final_error_code") if token_password_login_debug else ""
+        ).strip()
+        if token_login_final_error:
+            logger.error(
+                f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token；"
+                f"token_password_login_final_error={token_login_final_error}"
+            )
+        else:
+            logger.error(f"[线程 {thread_id}] [错误] 已完成注册，但仍未能获取 OAuth token")
         return _fail(
             "token_finalize",
             "token_extraction_failed",
@@ -645,19 +783,26 @@ def run(
     finally:
         if not result.success:
             _persist_attempt_outcome(result)
-        if mailbox and mailbox.provider == "imap" and mailbox.email and mailbox.password:
+            if _should_return_mailbox_to_pool(result):
+                returned = _return_mailbox_to_unused_pool(mailbox)
+                result.metadata["mailbox_returned_to_pool"] = returned
+                if returned and mailbox and mailbox.email:
+                    logger.info(f"[线程 {thread_id}] [信息] 因入口/IP 风控失败，已将邮箱放回未使用池: {mailbox.email}")
+                elif mailbox and mailbox.email:
+                    logger.warning(f"[线程 {thread_id}] [警告] 入口/IP 风控失败，但放回邮箱池失败: {mailbox.email}")
+        if mailbox and mailbox.provider == "imap" and mailbox.email and mailbox.password and not mailbox.source_removed:
             removed = remove_imap_account(mailbox.email, mailbox.password)
             if removed:
                 logger.info(f"[线程 {thread_id}] [信息] 已删除 emails.txt 中的已处理邮箱: {mailbox.email}")
             else:
                 logger.warning(f"[线程 {thread_id}] [警告] 未能从 emails.txt 删除邮箱: {mailbox.email}")
-        if mailbox and mailbox.provider == "imap_ms" and mailbox.email and mailbox.password:
+        if mailbox and mailbox.provider in {"imap_ms", "ms_mail_g", "ms_mail"} and mailbox.email and mailbox.password and not mailbox.source_removed:
             removed = remove_imap_ms_account(mailbox.email, mailbox.password)
             if removed:
                 logger.info(f"[线程 {thread_id}] [信息] 已删除 ms_emails.txt 中的已处理邮箱: {mailbox.email}")
             else:
                 logger.warning(f"[线程 {thread_id}] [警告] 未能从 ms_emails.txt 删除邮箱: {mailbox.email}")
-        if mailbox and mailbox.provider == "api_mail" and mailbox.email and mailbox.password and mailbox.api_base:
+        if mailbox and mailbox.provider == "api_mail" and mailbox.email and mailbox.password and mailbox.api_base and not mailbox.source_removed:
             removed = remove_api_mail_account(mailbox.email, mailbox.password, mailbox.api_base)
             if removed:
                 logger.info(f"[线程 {thread_id}] [信息] 已删除 api_emails.txt 中的已处理邮箱: {mailbox.email}")
@@ -690,17 +835,44 @@ def run_with_fallback(
     dingtalk_webhook: str = "",
     dingtalk_fallback_interval_seconds: int = DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
 ) -> Tuple[Optional[Tuple[str, str]], str]:
+    result, used_provider, _attempt = run_with_fallback_detailed(
+        proxy,
+        provider_key,
+        thread_id,
+        mailtm_base,
+        dingtalk_webhook=dingtalk_webhook,
+        dingtalk_fallback_interval_seconds=dingtalk_fallback_interval_seconds,
+    )
+    return result, used_provider
+
+
+def run_with_fallback_detailed(
+    proxy: Optional[str],
+    provider_key: str,
+    thread_id: int,
+    mailtm_base: str,
+    *,
+    dingtalk_webhook: str = "",
+    dingtalk_fallback_interval_seconds: int = DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
+) -> Tuple[Optional[Tuple[str, str]], str, RegistrationAttemptResult]:
     """兼容旧接口名；当前不再执行任何保底邮箱回退。"""
     _ = dingtalk_webhook, dingtalk_fallback_interval_seconds
     provider_chain = _provider_fallback_chain(provider_key)
     last_used_provider = str(provider_key or "").strip().lower()
+    last_attempt = RegistrationAttemptResult(
+        provider_key=last_used_provider,
+        stage="not_started",
+        error_code="not_started",
+        error_message="未开始执行",
+    )
 
     for index, candidate_provider in enumerate(provider_chain):
         last_used_provider = candidate_provider
 
         attempt = run(proxy, candidate_provider, thread_id, mailtm_base)
+        last_attempt = attempt
         if attempt.success:
-            return attempt.as_legacy_result(), candidate_provider
+            return attempt.as_legacy_result(), candidate_provider, attempt
 
         logger.warning(
             f"[线程 {thread_id}] [警告] 使用邮箱服务 {candidate_provider} 的注册尝试失败："
@@ -709,10 +881,11 @@ def run_with_fallback(
             f", message={attempt.error_message or 'unknown'}"
         )
 
-    return None, last_used_provider
+    return None, last_used_provider, last_attempt
 
 __all__ = [
     "_provider_fallback_chain",
     "run",
     "run_with_fallback",
+    "run_with_fallback_detailed",
 ]

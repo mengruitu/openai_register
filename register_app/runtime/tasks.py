@@ -12,9 +12,11 @@ from typing import Any, Optional
 
 from ..notifications import build_monitor_summary_message, send_dingtalk_alert
 from ..proxy import resolve_registration_proxy
+from ..proxy_pool import ProxyPoolExhaustedError
 from .common import (
     DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
     MonitorCycleResult,
+    RegisterModeStats,
     RegisterRunner,
     ReloadCfmailHook,
     SHORTAGE_FAIL_RETRY_SECONDS,
@@ -26,11 +28,17 @@ from .common import (
     persist_registration_result,
 )
 
+MAILBOX_EXHAUSTED_ERROR_CODES = {
+    "mailbox_unavailable",
+    "mailbox_duplicate_exhausted",
+}
+
 
 def register_single_account(
     proxy: Optional[str],
     proxy_api_url: Optional[str],
     proxy_api_scheme: str,
+    proxy_pool_enabled: bool,
     provider_key: str,
     thread_id: int,
     mailtm_base: str,
@@ -44,8 +52,9 @@ def register_single_account(
             proxy,
             proxy_api_url,
             proxy_api_scheme=proxy_api_scheme,
+            proxy_pool_enabled=proxy_pool_enabled,
         )
-        result, _used_provider = register_runner(
+        result, _used_provider, _attempt = register_runner(
             runtime_proxy,
             provider_key,
             thread_id,
@@ -60,6 +69,9 @@ def register_single_account(
         token_json, password = result
         persist_registration_result(token_json, password, thread_id, token_dir)
         return True
+    except ProxyPoolExhaustedError as exc:
+        log_warn(f"补号任务 #{thread_id} 因代理池无可用 IP 而结束: {exc}")
+        return False
     except Exception as exc:
         log_error(f"补号任务 #{thread_id} 异常: {exc}")
         return False
@@ -70,6 +82,8 @@ def register_accounts(
     proxy: Optional[str],
     proxy_api_url: Optional[str],
     proxy_api_scheme: str,
+    proxy_pool_enabled: bool,
+    stop_event: Optional[threading.Event],
     provider_key: str,
     mailtm_base: str,
     token_dir: str,
@@ -95,6 +109,9 @@ def register_accounts(
     max_attempts = max(target_count * 4, target_count + batch_size)
 
     while success_count < target_count and attempts < max_attempts:
+        if stop_event is not None and stop_event.is_set():
+            log_info("检测到停止信号，当前补号批次不再启动新线程")
+            break
         current_batch_size = min(
             batch_size,
             register_openai_concurrency,
@@ -110,10 +127,13 @@ def register_accounts(
 
             def _task(tid: int = current_thread_id) -> None:
                 nonlocal batch_success_count
+                if stop_event is not None and stop_event.is_set():
+                    return
                 is_success = register_single_account(
                     proxy,
                     proxy_api_url,
                     proxy_api_scheme,
+                    proxy_pool_enabled,
                     provider_key,
                     tid,
                     mailtm_base,
@@ -130,10 +150,23 @@ def register_accounts(
             thread.start()
             threads.append(thread)
             if register_start_delay_seconds > 0 and index + 1 < current_batch_size:
-                time.sleep(register_start_delay_seconds)
+                if stop_event is not None:
+                    if stop_event.wait(register_start_delay_seconds):
+                        break
+                else:
+                    time.sleep(register_start_delay_seconds)
 
-        for thread in threads:
-            thread.join()
+        try:
+            for thread in threads:
+                thread.join()
+        except KeyboardInterrupt:
+            log_info("收到中断信号，等待当前补号线程安全退出")
+            builtins.openai_register_stop_requested = True
+            if stop_event is not None:
+                stop_event.set()
+            for thread in threads:
+                thread.join()
+            break
 
         attempts += current_batch_size
         batch_success = batch_success_count
@@ -141,7 +174,10 @@ def register_accounts(
         log_info(f"补号批次完成：本批成功 {batch_success} 个，累计成功 {success_count}/{target_count}")
 
         if batch_success == 0 and success_count < target_count:
-            time.sleep(10)
+            if stop_event is not None and stop_event.wait(10):
+                break
+            if stop_event is None:
+                time.sleep(10)
 
     if success_count < target_count:
         log_warn(f"目标补号 {target_count} 个，实际仅补充成功 {success_count} 个")
@@ -175,6 +211,8 @@ def run_monitor_cycle(args: Any, register_runner: RegisterRunner) -> MonitorCycl
             args.proxy,
             args.proxy_api_url,
             args.proxy_api_scheme,
+            bool(getattr(args, "proxy_pool_enabled", False)),
+            getattr(args, "runtime_stop_event", None),
             args.mail_provider,
             args.mailtm_api_base,
             args.active_token_dir,
@@ -231,6 +269,8 @@ def worker(
     proxy: Optional[str],
     proxy_api_url: Optional[str],
     proxy_api_scheme: str,
+    proxy_pool_enabled: bool,
+    stop_event: Optional[threading.Event],
     once: bool,
     sleep_min: int,
     sleep_max: int,
@@ -242,9 +282,20 @@ def worker(
     reload_cfmail_accounts: Optional[ReloadCfmailHook] = None,
     dingtalk_webhook: str = "",
     dingtalk_fallback_interval_seconds: int = DEFAULT_DINGTALK_FALLBACK_INTERVAL_SECONDS,
+    stats: Optional[RegisterModeStats] = None,
 ) -> None:
     count = 0
     while True:
+        if stop_event is not None and stop_event.is_set():
+            log_info(f"[线程 {thread_id}] 检测到停止信号，当前线程结束")
+            break
+        if stats is not None and not stats.try_reserve_mailbox_slot():
+            log_info(
+                f"[线程 {thread_id}] 已达到最多消耗邮箱数量（{stats.max_mailboxes_to_use}），当前线程自动结束"
+            )
+            break
+
+        consumed_mailbox = False
         if provider_key == "cfmail" and reload_cfmail_accounts:
             reload_cfmail_accounts()
         count += 1
@@ -255,8 +306,9 @@ def worker(
                 proxy,
                 proxy_api_url,
                 proxy_api_scheme=proxy_api_scheme,
+                proxy_pool_enabled=proxy_pool_enabled,
             )
-            result, used_provider = register_runner(
+            result, used_provider, attempt = register_runner(
                 runtime_proxy,
                 provider_key,
                 thread_id,
@@ -264,6 +316,9 @@ def worker(
                 dingtalk_webhook=dingtalk_webhook,
                 dingtalk_fallback_interval_seconds=dingtalk_fallback_interval_seconds,
             )
+            consumed_mailbox = bool(result) or bool((getattr(attempt, "metadata", {}) or {}).get("mailbox_email"))
+            if bool((getattr(attempt, "metadata", {}) or {}).get("mailbox_returned_to_pool")):
+                consumed_mailbox = False
 
             is_success = False
             if result:
@@ -278,14 +333,66 @@ def worker(
                     f"[线程 {thread_id}] 账号信息已追加到 output/accounts.txt，"
                     f"Token 已保存到: {file_name}（邮箱服务: {used_provider}）"
                 )
+                if stats is not None:
+                    stats.record_success(
+                        thread_id=thread_id,
+                        used_provider=used_provider,
+                        email=_raw_email,
+                        output_file=file_name,
+                    )
                 is_success = True
             else:
                 log_warn(f"[线程 {thread_id}] 本轮任务未成功")
+                error_code = str(getattr(attempt, "error_code", "") or "").strip()
+                if error_code in MAILBOX_EXHAUSTED_ERROR_CODES:
+                    log_info(
+                        f"[线程 {thread_id}] 没有可用邮箱可领取，当前线程自动结束"
+                    )
+                    break
+                if stats is not None:
+                    if consumed_mailbox:
+                        stats.record_failure(
+                            thread_id=thread_id,
+                            used_provider=used_provider,
+                            reason=error_code or "registration_failed",
+                        )
+                    else:
+                        stats.record_environment_failure(
+                            thread_id=thread_id,
+                            used_provider=used_provider,
+                            reason=error_code or "registration_failed",
+                        )
+        except ProxyPoolExhaustedError as exc:
+            log_info(f"[线程 {thread_id}] 代理池无可用 IP，当前线程自动结束: {exc}")
+            if stats is not None:
+                stats.record_environment_failure(
+                    thread_id=thread_id,
+                    used_provider=provider_key,
+                    reason="proxy_pool_exhausted",
+                )
+            break
         except Exception as exc:
             log_error(f"[线程 {thread_id}] 发生未捕获异常: {exc}")
+            if stats is not None:
+                if consumed_mailbox:
+                    stats.record_failure(
+                        thread_id=thread_id,
+                        used_provider=provider_key,
+                        reason=f"exception:{type(exc).__name__}",
+                    )
+                else:
+                    stats.record_environment_failure(
+                        thread_id=thread_id,
+                        used_provider=provider_key,
+                        reason=f"exception:{type(exc).__name__}",
+                    )
             is_success = False
+            consumed_mailbox = False
+        finally:
+            if stats is not None:
+                stats.complete_mailbox_slot(consumed=consumed_mailbox)
 
-        if once:
+        if once or (stop_event is not None and stop_event.is_set()):
             break
 
         wait_time = random.randint(sleep_min, sleep_max)
@@ -293,7 +400,11 @@ def worker(
             log_info(f"[线程 {thread_id}] 本轮失败，额外等待 {failure_sleep_seconds} 秒后重试")
             wait_time += max(0, failure_sleep_seconds)
 
-        time.sleep(wait_time)
+        if stop_event is not None:
+            if stop_event.wait(wait_time):
+                break
+        else:
+            time.sleep(wait_time)
 
 
 def run_monitor_loop(

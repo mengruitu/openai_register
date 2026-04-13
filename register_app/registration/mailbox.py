@@ -25,6 +25,16 @@ from ..mail.imap_mail import (
     poll_imap_oai_code as _poll_imap_oai_code,
     poll_imap_ms_oai_code as _poll_imap_ms_oai_code,
 )
+from ..mail.ms_mail_g import (
+    create_ms_mail_g_mailbox as _create_ms_mail_g_mailbox,
+    list_ms_mail_g_message_ids as _list_ms_mail_g_message_ids,
+    poll_ms_mail_g_oai_code as _poll_ms_mail_g_oai_code,
+)
+from ..mail.ms_mail import (
+    create_ms_mail_mailbox as _create_ms_mail_mailbox,
+    list_ms_mail_message_ids as _list_ms_mail_message_ids,
+    poll_ms_mail_oai_code as _poll_ms_mail_oai_code,
+)
 from ..mail.providers import (
     MAILTM_BASE,
     TempMailbox,
@@ -78,6 +88,10 @@ def get_temp_mailbox(
         mailbox = _create_imap_mailbox(proxies=proxies, thread_id=thread_id)
     elif provider_key == "imap_ms":
         mailbox = _create_imap_ms_mailbox(proxies=proxies, thread_id=thread_id)
+    elif provider_key == "ms_mail_g":
+        mailbox = _create_ms_mail_g_mailbox(proxies=proxies, thread_id=thread_id)
+    elif provider_key == "ms_mail":
+        mailbox = _create_ms_mail_mailbox(proxies=proxies, thread_id=thread_id)
     else:
         logger.error(f"[线程 {thread_id}] [错误] 不支持的临时邮箱服务: {provider_key}")
         return None
@@ -147,6 +161,22 @@ def get_mailbox_message_snapshot(
                 refresh_token=mailbox.oauth_refresh_token,
                 imap_host=mailbox.api_base,
                 imap_port=mailbox.imap_port or DEFAULT_MS_IMAP_PORT,
+                proxies=proxies,
+            )
+        if mailbox.provider == "ms_mail_g":
+            return _list_ms_mail_g_message_ids(
+                email_addr=mailbox.email,
+                password=mailbox.password,
+                client_id=mailbox.oauth_client_id,
+                refresh_token=mailbox.oauth_refresh_token,
+                proxies=proxies,
+            )
+        if mailbox.provider == "ms_mail":
+            return _list_ms_mail_message_ids(
+                email_addr=mailbox.email,
+                password=mailbox.password,
+                client_id=mailbox.oauth_client_id,
+                refresh_token=mailbox.oauth_refresh_token,
                 proxies=proxies,
             )
     except Exception as exc:
@@ -269,6 +299,38 @@ def get_oai_code(
             refresh_token=mailbox.oauth_refresh_token,
             imap_host=mailbox.api_base,
             imap_port=mailbox.imap_port or DEFAULT_MS_IMAP_PORT,
+            thread_id=thread_id,
+            proxies=proxies,
+            skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
+        )
+    if mailbox.provider == "ms_mail_g":
+        if not mailbox.password or not mailbox.oauth_client_id or not mailbox.oauth_refresh_token:
+            logger.error(
+                f"[线程 {thread_id}] [错误] {mailbox.provider} OAuth 参数不完整，无法读取邮件"
+            )
+            return ""
+        return _poll_ms_mail_g_oai_code(
+            email_addr=mailbox.email,
+            password=mailbox.password,
+            client_id=mailbox.oauth_client_id,
+            refresh_token=mailbox.oauth_refresh_token,
+            thread_id=thread_id,
+            proxies=proxies,
+            skip_message_ids=skip_message_ids,
+            skip_codes=skip_codes,
+        )
+    if mailbox.provider == "ms_mail":
+        if not mailbox.password or not mailbox.oauth_client_id or not mailbox.oauth_refresh_token:
+            logger.error(
+                f"[线程 {thread_id}] [错误] {mailbox.provider} OAuth 参数不完整，无法读取邮件"
+            )
+            return ""
+        return _poll_ms_mail_oai_code(
+            email_addr=mailbox.email,
+            password=mailbox.password,
+            client_id=mailbox.oauth_client_id,
+            refresh_token=mailbox.oauth_refresh_token,
             thread_id=thread_id,
             proxies=proxies,
             skip_message_ids=skip_message_ids,

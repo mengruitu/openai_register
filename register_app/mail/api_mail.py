@@ -32,6 +32,8 @@ class ApiMailAccount:
     email: str
     password: str
     api_url: str
+    source_file: str = ""
+    source_line: str = ""
 
 
 _account_lock = threading.Lock()
@@ -143,6 +145,95 @@ def select_api_mail_account() -> Optional[ApiMailAccount]:
         return account
 
 
+def take_api_mail_account(filepath: str = DEFAULT_API_EMAILS_FILE) -> Optional[ApiMailAccount]:
+    path = str(filepath or "").strip()
+    if not path or not os.path.exists(path):
+        logger.warning(f"[API_MAIL] 账号文件不存在: {path}")
+        return None
+
+    with _account_lock:
+        try:
+            with open(path, "r", encoding="utf-8") as file_obj:
+                lines = file_obj.readlines()
+
+            selected_account: Optional[ApiMailAccount] = None
+            new_lines: List[str] = []
+            for line_no, raw_line in enumerate(lines, start=1):
+                line = raw_line.strip()
+                if selected_account is None and line and not line.startswith("#"):
+                    parts = line.split("----")
+                    if len(parts) < 3:
+                        logger.warning(f"[API_MAIL] api_emails.txt 第 {line_no} 行格式无效，已跳过: {line}")
+                        new_lines.append(raw_line)
+                        continue
+                    email = parts[0].strip()
+                    password = parts[1].strip()
+                    api_url = parts[2].strip()
+                    if not email or not password or not api_url:
+                        logger.warning(f"[API_MAIL] api_emails.txt 第 {line_no} 行存在空字段，已跳过")
+                        new_lines.append(raw_line)
+                        continue
+                    selected_account = ApiMailAccount(
+                        email=email,
+                        password=password,
+                        api_url=api_url,
+                        source_file=path,
+                        source_line=line,
+                    )
+                    continue
+                new_lines.append(raw_line)
+
+            if selected_account is None:
+                return None
+
+            with open(path, "w", encoding="utf-8") as file_obj:
+                file_obj.writelines(new_lines)
+
+            global _accounts, _accounts_loaded, _account_index
+            _accounts = _load_api_emails_file(path)
+            _accounts_loaded = True
+            _account_index = 0
+            logger.info(f"[API_MAIL] 已领取并移除账号: {selected_account.email}")
+            return selected_account
+        except Exception as exc:
+            logger.warning(f"[API_MAIL] 领取账号失败: {exc}")
+            return None
+
+
+def return_api_mail_account(
+    email_addr: str,
+    password: str,
+    api_url: str,
+    *,
+    filepath: str = DEFAULT_API_EMAILS_FILE,
+    source_line: str = "",
+) -> bool:
+    path = str(filepath or "").strip()
+    if not path:
+        return False
+
+    line = str(source_line or "").strip()
+    if not line:
+        line = f"{str(email_addr or '').strip()}----{str(password or '').strip()}----{str(api_url or '').strip()}"
+    if not line:
+        return False
+
+    with _account_lock:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as file_obj:
+                file_obj.write(line + "\n")
+            global _accounts, _accounts_loaded, _account_index
+            _accounts = _load_api_emails_file(path)
+            _accounts_loaded = True
+            _account_index = 0
+            logger.info(f"[API_MAIL] 已将账号放回未使用池: {email_addr}")
+            return True
+        except Exception as exc:
+            logger.warning(f"[API_MAIL] 放回账号失败 ({email_addr}): {exc}")
+            return False
+
+
 def _fetch_api_mail_content(api_url: str, proxies: Any = None, timeout: int = 15) -> str:
     started_at = time.time()
     safe_api = str(api_url or "").strip()
@@ -171,7 +262,7 @@ def _message_id_from_content(content: str) -> str:
 
 
 def create_api_mailbox(proxies: Any = None, thread_id: int = 0) -> Optional[TempMailbox]:
-    account = select_api_mail_account()
+    account = take_api_mail_account()
     if not account:
         logger.error(f"[线程 {thread_id}] [错误] 没有可用的 API 邮箱账号，请检查 api_emails.txt")
         return None
@@ -182,6 +273,9 @@ def create_api_mailbox(proxies: Any = None, thread_id: int = 0) -> Optional[Temp
         api_base=account.api_url,
         password=account.password,
         config_name="api_mail",
+        source_removed=True,
+        source_file=account.source_file,
+        source_line=account.source_line,
     )
 
 

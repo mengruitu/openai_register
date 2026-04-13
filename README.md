@@ -38,10 +38,10 @@
 
 ### 1. 准备配置
 
-复制：
+实际运行统一使用 `monitor_config.json` 和 `cfmail_accounts.json`。
 
-- `monitor_config.example.json` -> `monitor_config.json`
-- `cfmail_accounts.example.json` -> `cfmail_accounts.json`
+- `monitor_config.example.json` 只是初始化模板，需要内容时再手动参考或复制到 `monitor_config.json`
+- `cfmail_accounts.example.json` 只是初始化模板，需要内容时再手动参考或复制到 `cfmail_accounts.json`
 
 ### 2. 单轮补号检测
 
@@ -120,6 +120,14 @@ sudo systemctl status openai-register
 - `dingtalk_summary_interval`
 - `cfmail_profile`
 - `cfmail_config`
+- `proxy_api_url`
+- `proxy_api_scheme`
+- `proxy_pool_enabled`
+- `proxy_pool_consumer_ttl_seconds`
+- `proxy_pool_heartbeat_interval_seconds`
+- `proxy_pool_state_path`
+- `proxy_pool_consumers_path`
+- `proxy_pool_target_multiplier`
 
 补充说明：
 
@@ -127,6 +135,48 @@ sudo systemctl status openai-register
 - `mail_provider=imap_ms` 读取项目根目录 `ms_emails.txt`
 - `ms_emails.txt` 格式为 `邮箱----密码----client_id----refresh_token`
 - 也支持扩展格式 `邮箱----密码----client_id----refresh_token----IMAP服务器----端口`
+
+## 共享 IP 池
+
+如果你开启了 `proxy_pool_enabled=true`：
+
+- 所有注册模式共用一个本地文件型代理池
+- 程序不再每次注册都直接请求 `proxy_api_url`
+- 后台会根据当前所有活跃进程的总线程数持续补货
+- 默认目标是保持 `可用 IP >= 2 x 全局线程数`
+- 池空且补货失败时，只结束当前线程，不整体降并发
+
+相关配置字段：
+
+- `proxy_api_url`
+- `proxy_api_scheme`
+- `proxy_pool_enabled`
+- `proxy_pool_consumer_ttl_seconds`
+- `proxy_pool_heartbeat_interval_seconds`
+- `proxy_pool_state_path`
+- `proxy_pool_consumers_path`
+- `proxy_pool_target_multiplier`
+
+## register-only 收尾上传到 R2
+
+如果你开启了 `r2_enabled=true`，则只有 `--register-only` 会在所有线程自然结束后触发收尾上传：
+
+- 扫描 `token_dir` 下当前现存的全部 JSON
+- 按单个 JSON 对象上传到 Cloudflare R2
+- 对象 key 结构为 `{r2_prefix}/register-only/{local_date}/count-{N}/{filename}`
+- 只有当这一批 JSON 全部上传成功后，才会删除本地 `token_dir` 中对应 JSON
+- 任意文件在重试后仍失败，则本地 JSON 全部保留
+
+相关配置字段：
+
+- `r2_enabled`
+- `r2_account_id`
+- `r2_bucket`
+- `r2_access_key_id`
+- `r2_secret_access_key`
+- `r2_prefix`
+- `r2_retry_count`
+- `r2_retry_delay_seconds`
 
 ## 默认节流策略
 
@@ -156,6 +206,15 @@ sudo systemctl status openai-register
 `--register-only` 模式下，token 输出到：
 
 - `token_dir`
+
+若同时启用了 `r2_enabled=true`：
+
+- 所有注册线程自然结束后，会上传 `token_dir` 中当下全部 JSON 到 R2
+- 全部上传成功后，会自动删除这批本地 JSON
+- `output/accounts.txt` 不会上传，也不会删除
+
+当前版本在注册成功后，会直接进入“账号密码重登录”链提取 token，
+不再先尝试 continue_url、session cookie、workspace 或 chatgpt session 前置取 token 流程。
 
 ### 账号汇总
 

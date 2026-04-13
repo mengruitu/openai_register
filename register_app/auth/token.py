@@ -109,6 +109,117 @@ def _extract_session_token(session: Any) -> str:
     return ""
 
 
+def _response_header_value(resp: Any, key: str) -> str:
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return ""
+    try:
+        value = headers.get(key)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    try:
+        for header_key, header_value in headers.items():
+            if str(header_key).strip().lower() == key.lower():
+                return str(header_value).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _response_json_object(resp: Any) -> Dict[str, Any]:
+    if resp is None:
+        return {}
+    try:
+        payload = resp.json() if getattr(resp, "content", b"") else {}
+    except Exception:
+        payload = _parse_json_object(str(getattr(resp, "text", "") or ""))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _response_debug_snapshot(resp: Any, *, preview_limit: int = 240) -> Dict[str, Any]:
+    if resp is None:
+        return {"status_code": "no_response"}
+
+    payload = _response_json_object(resp)
+    snapshot: Dict[str, Any] = {
+        "status_code": getattr(resp, "status_code", "unknown"),
+        "final_url": str(getattr(resp, "url", "") or "").strip(),
+        "content_type": _response_header_value(resp, "content-type"),
+        "location": _response_header_value(resp, "location"),
+        "preview": response_text_preview(resp, limit=preview_limit),
+    }
+
+    continue_url = extract_continue_url_from_response(resp)
+    if continue_url:
+        snapshot["continue_url"] = continue_url
+
+    page_obj = payload.get("page") if isinstance(payload.get("page"), dict) else {}
+    page_type = str(page_obj.get("type") or "").strip()
+    if page_type:
+        snapshot["page_type"] = page_type
+
+    error_obj = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    error_code = str(
+        error_obj.get("code")
+        or error_obj.get("error")
+        or payload.get("code")
+        or payload.get("error")
+        or ""
+    ).strip()
+    error_message = str(
+        error_obj.get("message")
+        or error_obj.get("description")
+        or error_obj.get("error_description")
+        or payload.get("message")
+        or payload.get("error_description")
+        or ""
+    ).strip()
+    if error_code:
+        snapshot["error_code"] = error_code
+    if error_message:
+        snapshot["error_message"] = error_message
+
+    return snapshot
+
+
+def _session_cookie_snapshot(session: Any) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {
+        "oai_did_present": False,
+        "auth_cookie_present": False,
+        "session_token_present": False,
+        "cookie_names": [],
+        "auth_cookie_workspace_count": 0,
+    }
+    cookies = getattr(session, "cookies", None)
+    if cookies is None:
+        return snapshot
+
+    cookie_names: List[str] = []
+    jar = getattr(cookies, "jar", None)
+    if jar is not None:
+        try:
+            for item in list(jar):
+                name = str(getattr(item, "name", "") or "").strip()
+                if name:
+                    cookie_names.append(name)
+        except Exception:
+            pass
+
+    auth_cookie = str(cookies.get("oai-client-auth-session") or "").strip()
+    auth_cookie_workspaces = extract_workspaces_from_auth_cookie(auth_cookie) if auth_cookie else []
+    session_token = _extract_session_token(session)
+    oai_did = str(cookies.get("oai-did") or "").strip()
+
+    snapshot["oai_did_present"] = bool(oai_did)
+    snapshot["auth_cookie_present"] = bool(auth_cookie)
+    snapshot["session_token_present"] = bool(session_token)
+    snapshot["cookie_names"] = sorted(set(cookie_names))[:20]
+    snapshot["auth_cookie_workspace_count"] = len(auth_cookie_workspaces)
+    return snapshot
+
+
 def _build_session_refresh_token_json(
     session_token: str,
     refresh_result: Any,
@@ -258,10 +369,19 @@ def _try_workspace_and_org_selection(
         json={"workspace_id": workspace_id},
     )
     if select_resp.status_code != 200:
-        logger.warning(f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}")
+        continue_url = extract_continue_url_from_response(select_resp)
+        logger.warning(
+            f"[线程 {thread_id}] [警告] 选择 workspace 失败，状态码: {select_resp.status_code}，"
+            f"continue_url={continue_url or '(empty)'}，摘要: {response_text_preview(select_resp)}"
+        )
         continue_url = extract_continue_url_from_response(select_resp)
         if continue_url:
-            return follow_oauth_redirect_chain(session, continue_url, oauth, thread_id, proxies=proxies)
+            token_json = follow_oauth_redirect_chain(session, continue_url, oauth, thread_id, proxies=proxies)
+            if not token_json:
+                logger.warning(
+                    f"[线程 {thread_id}] [警告] workspace/select 失败后继续跟随 continue_url，但仍未获取到 token"
+                )
+            return token_json
         return None
 
     try:
@@ -293,9 +413,21 @@ def _try_workspace_and_org_selection(
             if org_resp.status_code == 200 or 300 <= org_resp.status_code < 400:
                 org_continue_url = extract_continue_url_from_response(org_resp)
                 if org_continue_url:
-                    return follow_oauth_redirect_chain(session, org_continue_url, oauth, thread_id, proxies=proxies)
+                    token_json = follow_oauth_redirect_chain(
+                        session,
+                        org_continue_url,
+                        oauth,
+                        thread_id,
+                        proxies=proxies,
+                    )
+                    if not token_json:
+                        logger.warning(
+                            f"[线程 {thread_id}] [警告] organization/select 已返回 continue_url，但跳转链仍未获取到 token"
+                        )
+                    return token_json
             logger.warning(
-                f"[线程 {thread_id}] [警告] 选择 organization 失败，状态码: {org_resp.status_code}"
+                f"[线程 {thread_id}] [警告] 选择 organization 失败，状态码: {org_resp.status_code}，"
+                f"摘要: {response_text_preview(org_resp)}"
             )
 
     continue_url = extract_continue_url_from_response(select_resp)
@@ -304,7 +436,12 @@ def _try_workspace_and_org_selection(
         return None
 
     logger.info(f"[线程 {thread_id}] [信息] 已获取 workspace，继续跟随授权跳转链")
-    return follow_oauth_redirect_chain(session, continue_url, oauth, thread_id, proxies=proxies)
+    token_json = follow_oauth_redirect_chain(session, continue_url, oauth, thread_id, proxies=proxies)
+    if not token_json:
+        logger.warning(
+            f"[线程 {thread_id}] [警告] workspace/select 已返回 continue_url，但授权跳转链未获取到 token"
+        )
+    return token_json
 
 
 # ---------------------------------------------------------------------------
@@ -320,13 +457,16 @@ def try_token_via_existing_session(
 ) -> Optional[str]:
     """尝试复用当前 session 免密获取 token。"""
     logger.info(f"[线程 {thread_id}] [信息] 尝试复用当前 session 免密获取 token")
-    return follow_oauth_redirect_chain(
+    token_json = follow_oauth_redirect_chain(
         session,
         oauth_authorize_url(oauth, prompt=None),
         oauth,
         thread_id,
         proxies=proxies, 
     )
+    if not token_json:
+        logger.warning(f"[线程 {thread_id}] [警告] 复用当前 session 的授权跳转链未获取到 token")
+    return token_json
 
 
 def try_token_via_continue_url(
@@ -353,7 +493,12 @@ def try_token_via_continue_url(
             )
         except Exception as exc:
             logger.warning(f"[线程 {thread_id}] [警告] continue_url 直接回调换 token 失败: {exc}")
-    return follow_oauth_redirect_chain(session, candidate, oauth, thread_id, proxies=proxies)
+    token_json = follow_oauth_redirect_chain(session, candidate, oauth, thread_id, proxies=proxies)
+    if not token_json:
+        logger.warning(
+            f"[线程 {thread_id}] [警告] continue_url 授权跳转链未获取到 token: {candidate}"
+        )
+    return token_json
 
 
 def try_token_via_session_cookie(
@@ -407,7 +552,12 @@ def try_token_via_workspace_select(
         f"[线程 {thread_id}] [信息] 已解析 workspace: count={len(workspaces)}, "
         f"id={workspace_id}, kind={workspace_kind}, name={workspace_name}"
     )
-    return _try_workspace_and_org_selection(session, oauth, workspace_id, thread_id, proxies=proxies)
+    token_json = _try_workspace_and_org_selection(session, oauth, workspace_id, thread_id, proxies=proxies)
+    if not token_json:
+        logger.warning(
+            f"[线程 {thread_id}] [警告] workspace 解析成功，但 workspace/select 流程最终未获取到 token"
+        )
+    return token_json
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +656,7 @@ def try_token_via_password_login(
     thread_id: int,
     get_oai_code_fn: Callable[..., str],
     get_mailbox_message_snapshot_fn: Callable[..., Set[str]],
+    debug_sink: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """使用账号密码重新登录以获取 token。"""
     account = str(email or "").strip()
@@ -517,6 +668,43 @@ def try_token_via_password_login(
     logger.info(f"[线程 {thread_id}] [信息] 当前 session 未拿到 token，尝试账号密码重新登录")
     login_session = requests.Session(proxies=proxies, impersonate=impersonate)
     ignored_codes = _normalize_code_values(used_codes)
+    debug_state = debug_sink if isinstance(debug_sink, dict) else {}
+    debug_steps = debug_state.setdefault("steps", [])
+    debug_state["proxy_url"] = proxy_url
+    debug_state["impersonate"] = impersonate
+    debug_state["mailbox_present"] = mailbox is not None
+    debug_state["used_code_count"] = len(ignored_codes)
+
+    def _record_debug(stage: str, status: str, message: str = "", **fields: Any) -> None:
+        entry: Dict[str, Any] = {"stage": stage, "status": status}
+        if message:
+            entry["message"] = message
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if value == "":
+                continue
+            if value == []:
+                continue
+            if value == {}:
+                continue
+            entry[key] = value
+        debug_steps.append(entry)
+
+    def _set_final_error(code: str, message: str = "", **fields: Any) -> None:
+        debug_state["final_error_code"] = str(code or "").strip()
+        if message:
+            debug_state["final_error_message"] = str(message or "").strip()
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if value == "":
+                continue
+            if value == []:
+                continue
+            if value == {}:
+                continue
+            debug_state[key] = value
 
     def _bootstrap_login_session() -> str:
         prime_oauth_session(
@@ -528,6 +716,20 @@ def try_token_via_password_login(
 
     try:
         did = _bootstrap_login_session()
+        _record_debug(
+            "oauth_prime",
+            "ok" if did else "error",
+            did_present=bool(did),
+            session=_session_cookie_snapshot(login_session),
+        )
+        if not did:
+            _set_final_error(
+                "login_device_id_missing",
+                "密码登录 OAuth 初始化后未获取到 oai-did",
+                session=_session_cookie_snapshot(login_session),
+            )
+            logger.warning(f"[线程 {thread_id}] [警告] 账号密码重登录未获取到 oai-did")
+            return None
         sentinel_header = request_sentinel_header(
             did=did,
             proxies=proxies,
@@ -536,6 +738,13 @@ def try_token_via_password_login(
             flow="authorize_continue",
         )
         if not sentinel_header:
+            _record_debug("authorize_continue_sentinel", "error", did_present=True)
+            _set_final_error(
+                "login_sentinel_missing",
+                "密码登录 authorize_continue 未获取到 sentinel token",
+                session=_session_cookie_snapshot(login_session),
+            )
+            logger.warning(f"[线程 {thread_id}] [警告] 账号密码重登录未获取到 authorize_continue sentinel token")
             return None
 
         continue_resp = login_session.post(
@@ -555,9 +764,34 @@ def try_token_via_password_login(
                 separators=(",", ":"),
             ),
         )
+        _record_debug(
+            "authorize_continue",
+            "ok" if continue_resp.status_code in (200, 204) else "error",
+            response=_response_debug_snapshot(continue_resp),
+            session=_session_cookie_snapshot(login_session),
+        )
         if continue_resp.status_code == 400 and "invalid_auth_step" in str(getattr(continue_resp, "text", "") or "").lower():
             logger.info(f"[线程 {thread_id}] [信息] 登录预处理遇到 invalid_auth_step，重建认证上下文后重试一次")
+            _record_debug(
+                "authorize_continue_invalid_auth_step",
+                "warn",
+                response=_response_debug_snapshot(continue_resp),
+            )
             did = _bootstrap_login_session()
+            _record_debug(
+                "oauth_prime_retry",
+                "ok" if did else "error",
+                did_present=bool(did),
+                session=_session_cookie_snapshot(login_session),
+            )
+            if not did:
+                _set_final_error(
+                    "login_device_id_missing_retry",
+                    "重试密码登录 OAuth 初始化后未获取到 oai-did",
+                    session=_session_cookie_snapshot(login_session),
+                )
+                logger.warning(f"[线程 {thread_id}] [警告] 账号密码重登录重试后仍未获取到 oai-did")
+                return None
             sentinel_header = request_sentinel_header(
                 did=did,
                 proxies=proxies,
@@ -566,6 +800,12 @@ def try_token_via_password_login(
                 flow="authorize_continue",
             )
             if not sentinel_header:
+                _set_final_error(
+                    "login_sentinel_missing_retry",
+                    "重试密码登录 authorize_continue 未获取到 sentinel token",
+                    session=_session_cookie_snapshot(login_session),
+                )
+                logger.warning(f"[线程 {thread_id}] [警告] 账号密码重登录重试后仍未获取到 authorize_continue sentinel token")
                 return None
             continue_resp = login_session.post(
                 "https://auth.openai.com/api/accounts/authorize/continue",
@@ -584,9 +824,22 @@ def try_token_via_password_login(
                     separators=(",", ":"),
                 ),
             )
+            _record_debug(
+                "authorize_continue_retry",
+                "ok" if continue_resp.status_code in (200, 204) else "error",
+                response=_response_debug_snapshot(continue_resp),
+                session=_session_cookie_snapshot(login_session),
+            )
         if continue_resp.status_code not in (200, 204):
             logger.warning(
-                f"[线程 {thread_id}] [警告] 账号密码登录预处理失败，状态码: {continue_resp.status_code}"
+                f"[线程 {thread_id}] [警告] 账号密码登录预处理失败，状态码: {continue_resp.status_code}，"
+                f"摘要: {response_text_preview(continue_resp)}"
+            )
+            _set_final_error(
+                "login_authorize_continue_failed",
+                "账号密码登录预处理失败",
+                response=_response_debug_snapshot(continue_resp),
+                session=_session_cookie_snapshot(login_session),
             )
             return None
 
@@ -607,6 +860,8 @@ def try_token_via_password_login(
         )
         if password_sentinel:
             password_headers["openai-sentinel-token"] = password_sentinel
+        else:
+            _record_debug("password_verify_sentinel", "warn", did_present=bool(did))
 
         login_resp = login_session.post(
             "https://auth.openai.com/api/accounts/password/verify",
@@ -618,7 +873,22 @@ def try_token_via_password_login(
             ),
         )
         if login_resp.status_code != 200:
-            logger.warning(f"[线程 {thread_id}] [警告] 账号密码登录失败，状态码: {login_resp.status_code}")
+            logger.warning(
+                f"[线程 {thread_id}] [警告] 账号密码登录失败，状态码: {login_resp.status_code}，"
+                f"摘要: {response_text_preview(login_resp)}"
+            )
+            _record_debug(
+                "password_verify",
+                "error",
+                response=_response_debug_snapshot(login_resp),
+                session=_session_cookie_snapshot(login_session),
+            )
+            _set_final_error(
+                "login_password_verify_failed",
+                "账号密码登录失败",
+                response=_response_debug_snapshot(login_resp),
+                session=_session_cookie_snapshot(login_session),
+            )
             return None
 
         try:
@@ -634,6 +904,15 @@ def try_token_via_password_login(
             or "email-verification" in str(continue_url or "")
             or "email-otp" in str(continue_url or "")
         )
+        _record_debug(
+            "password_verify",
+            "ok",
+            page_type=page_type or "(empty)",
+            need_oauth_otp=need_oauth_otp,
+            continue_url=continue_url or "",
+            response=_response_debug_snapshot(login_resp),
+            session=_session_cookie_snapshot(login_session),
+        )
 
         if need_oauth_otp:
             token_json = try_token_via_session_cookie(
@@ -642,11 +921,18 @@ def try_token_via_password_login(
                 proxy_url=proxy_url,
             )
             if token_json:
+                _record_debug("session_cookie_refresh", "ok", source="password_login_pre_otp")
                 return token_json
 
             if not mailbox:
                 logger.warning(
                     f"[线程 {thread_id}] [警告] 密码登录后需要邮箱验证码，但当前没有可用邮箱上下文"
+                )
+                _set_final_error(
+                    "login_email_otp_missing_mailbox",
+                    "密码登录后需要邮箱验证码，但当前没有邮箱上下文",
+                    continue_url=continue_url or "",
+                    session=_session_cookie_snapshot(login_session),
                 )
                 return None
 
@@ -662,6 +948,18 @@ def try_token_via_password_login(
                 )
                 if not login_code:
                     logger.warning(f"[线程 {thread_id}] [警告] 未能获取登录阶段邮箱验证码")
+                    _record_debug(
+                        "login_email_otp_wait",
+                        "error",
+                        attempt=otp_attempt + 1,
+                        existing_message_ids=len(existing_message_ids),
+                    )
+                    _set_final_error(
+                        "login_email_otp_missing",
+                        "未能获取登录阶段邮箱验证码",
+                        attempt=otp_attempt + 1,
+                        session=_session_cookie_snapshot(login_session),
+                    )
                     return None
 
                 login_otp_resp = post_email_otp_validate(
@@ -672,12 +970,21 @@ def try_token_via_password_login(
                 )
                 if login_otp_resp and login_otp_resp.status_code == 200:
                     continue_url = extract_continue_url_from_response(login_otp_resp)
+                    _record_debug(
+                        "login_email_otp_validate",
+                        "ok",
+                        attempt=otp_attempt + 1,
+                        response=_response_debug_snapshot(login_otp_resp),
+                        continue_url=continue_url or "",
+                        session=_session_cookie_snapshot(login_session),
+                    )
                     token_json = try_token_via_session_cookie(
                         login_session,
                         thread_id,
                         proxy_url=proxy_url,
                     )
                     if token_json:
+                        _record_debug("session_cookie_refresh", "ok", source="password_login_post_otp")
                         return token_json
                     break
 
@@ -685,31 +992,76 @@ def try_token_via_password_login(
                 if status_code not in RETRYABLE_GATEWAY_STATUSES:
                     ignored_codes.add(login_code)
                 logger.warning(
-                    f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {status_code}"
+                    f"[线程 {thread_id}] [警告] 登录阶段邮箱验证码校验失败，状态码: {status_code}，"
+                    f"摘要: {response_text_preview(login_otp_resp)}"
+                )
+                _record_debug(
+                    "login_email_otp_validate",
+                    "error",
+                    attempt=otp_attempt + 1,
+                    response=_response_debug_snapshot(login_otp_resp),
+                    session=_session_cookie_snapshot(login_session),
                 )
                 if status_code == 401 and otp_attempt == 0:
                     logger.info(f"[线程 {thread_id}] [信息] 登录验证码可能命中旧邮件，准备重新等待新验证码")
                     time.sleep(2)
                     continue
+                _set_final_error(
+                    "login_email_otp_validate_failed",
+                    "登录阶段邮箱验证码校验失败",
+                    attempt=otp_attempt + 1,
+                    response=_response_debug_snapshot(login_otp_resp),
+                    session=_session_cookie_snapshot(login_session),
+                )
                 return None
 
             if not login_otp_resp or login_otp_resp.status_code != 200:
+                _set_final_error(
+                    "login_email_otp_validate_failed",
+                    "登录阶段邮箱验证码校验未成功结束",
+                    session=_session_cookie_snapshot(login_session),
+                )
                 return None
 
         auth_cookie = str(login_session.cookies.get("oai-client-auth-session") or "").strip()
+        _record_debug(
+            "post_login_session_state",
+            "info",
+            continue_url=continue_url or "",
+            session=_session_cookie_snapshot(login_session),
+        )
         if auth_cookie:
             token_json = try_token_via_workspace_select(
                 login_session, oauth, auth_cookie, thread_id, proxies=proxies
             )
             if token_json:
+                _record_debug("workspace_select", "ok")
                 return token_json
+            _record_debug(
+                "workspace_select",
+                "warn",
+                result="no_token",
+                session=_session_cookie_snapshot(login_session),
+            )
+        else:
+            _record_debug("workspace_select", "warn", message="auth_cookie_missing")
 
         if continue_url:
             token_json = try_token_via_continue_url(
                 login_session, oauth, continue_url, thread_id, proxies=proxies
             )
             if token_json:
+                _record_debug("continue_url", "ok", continue_url=continue_url)
                 return token_json
+            _record_debug(
+                "continue_url",
+                "warn",
+                continue_url=continue_url,
+                callback_url_present=bool(_extract_callback_url(continue_url)),
+                session=_session_cookie_snapshot(login_session),
+            )
+        else:
+            _record_debug("continue_url", "warn", message="continue_url_missing")
 
         auth_cookie = str(login_session.cookies.get("oai-client-auth-session") or "").strip()
         if auth_cookie:
@@ -717,7 +1069,14 @@ def try_token_via_password_login(
                 login_session, oauth, auth_cookie, thread_id, proxies=proxies
             )
             if token_json:
+                _record_debug("workspace_select_retry", "ok")
                 return token_json
+            _record_debug(
+                "workspace_select_retry",
+                "warn",
+                result="no_token",
+                session=_session_cookie_snapshot(login_session),
+            )
 
         token_json = try_token_via_session_cookie(
             login_session,
@@ -725,9 +1084,37 @@ def try_token_via_password_login(
             proxy_url=proxy_url,
         )
         if token_json:
+            _record_debug("session_cookie_refresh", "ok", source="final_fallback")
+            return token_json
+        _record_debug(
+            "session_cookie_refresh",
+            "warn",
+            message="session_token_refresh_failed_or_missing",
+            session=_session_cookie_snapshot(login_session),
+        )
+
+        token_json = try_token_via_existing_session(login_session, oauth, thread_id, proxies=proxies)
+        if token_json:
+            _record_debug("existing_session", "ok")
             return token_json
 
-        return try_token_via_existing_session(login_session, oauth, thread_id, proxies=proxies)
+        _record_debug(
+            "existing_session",
+            "error",
+            message="all_token_strategies_failed",
+            session=_session_cookie_snapshot(login_session),
+        )
+        _set_final_error(
+            "all_token_strategies_failed",
+            "密码重登录已完成，但 workspace/select、continue_url、session cookie、existing session 均未获取到 token",
+            continue_url=continue_url or "",
+            session=_session_cookie_snapshot(login_session),
+        )
+        logger.warning(
+            f"[线程 {thread_id}] [警告] 密码重登录已完成，但所有 token 提取策略均失败；"
+            f"final_session={json.dumps(_session_cookie_snapshot(login_session), ensure_ascii=False)}"
+        )
+        return None
     except Exception as exc:
         callback_url = _extract_callback_url_from_exception(exc)
         if callback_url:
@@ -741,5 +1128,11 @@ def try_token_via_password_login(
                 )
             except Exception:
                 pass
+        _set_final_error(
+            "password_login_exception",
+            str(exc),
+            callback_url=callback_url or "",
+            session=_session_cookie_snapshot(login_session),
+        )
         logger.warning(f"[线程 {thread_id}] [警告] 账号密码登录兜底失败: {exc}")
         return None
